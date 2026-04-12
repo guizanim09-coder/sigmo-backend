@@ -164,7 +164,16 @@ app.post("/deposito", (req, res) => {
   try {
     const { userId, valor, tipoTransacao } = req.body;
 
+    if (!userId || !valor) {
+      return res.status(400).json({ error: "userId e valor são obrigatórios" });
+    }
+
     const db = readDB();
+
+    const usuario = db.usuarios.find(u => u.id === userId);
+    if (!usuario) {
+      return res.status(404).json({ error: "Usuário não encontrado" });
+    }
 
     const pedido = {
       id: "dep_" + Date.now(),
@@ -212,11 +221,28 @@ app.post("/deposito/:id/comprovante", upload.single("comprovante"), (req, res) =
 });
 
 // =========================
-// LISTAR PEDIDOS
+// LISTAR PEDIDOS (ADMIN)
 // =========================
 app.get("/depositos", requireAdmin, (req, res) => {
   const db = readDB();
   res.json(db.depositos);
+});
+
+// =========================
+// LISTAR POR USUARIO (🔥 ESSENCIAL)
+// =========================
+app.get("/depositos/user/:id", (req, res) => {
+  try {
+    const db = readDB();
+
+    const lista = db.depositos.filter(
+      (d) => d.userId === req.params.id
+    );
+
+    res.json(lista);
+  } catch {
+    res.status(500).json({ error: "Erro ao buscar depósitos do usuário" });
+  }
 });
 
 // =========================
@@ -228,12 +254,15 @@ app.post("/aprovar", requireAdmin, (req, res) => {
 
   if (!pedido) return res.status(404).json({ error: "Não encontrado" });
 
+  const user = db.usuarios.find(u => u.id === pedido.userId);
+  if (!user) {
+    return res.status(404).json({ error: "Usuário não encontrado" });
+  }
+
   // BLOQUEIO IMPORTANTE
   if (pedido.tipoTransacao !== "saida" && !pedido.comprovanteUrl) {
     return res.status(400).json({ error: "Sem comprovante" });
   }
-
-  const user = db.usuarios.find(u => u.id === pedido.userId);
 
   if (pedido.tipoTransacao === "saida") {
     user.saldo -= pedido.valor;
