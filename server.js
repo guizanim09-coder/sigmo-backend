@@ -11,6 +11,9 @@ const { Pool } = require("pg");
 
 const app = express();
 
+// CORREÇÃO RAILWAY
+app.set("trust proxy", 1);
+
 const PORT = process.env.PORT || 3000;
 const DATABASE_URL = String(process.env.DATABASE_URL || "").trim();
 const JWT_SECRET = String(process.env.JWT_SECRET || "").trim();
