@@ -16,6 +16,11 @@ const DATABASE_URL = String(process.env.DATABASE_URL || "").trim();
 const JWT_SECRET = String(process.env.JWT_SECRET || "").trim();
 const ADMIN_EMAIL = String(process.env.ADMIN_EMAIL || "").trim().toLowerCase();
 const ADMIN_PASSWORD = String(process.env.ADMIN_PASSWORD || "").trim();
+const BACKUP_ENABLED = String(process.env.BACKUP_ENABLED || "true").trim().toLowerCase() !== "false";
+const BACKUP_INTERVAL_HOURS = Number(process.env.BACKUP_INTERVAL_HOURS || 24);
+const BACKUP_RETENTION_DAYS = Number(process.env.BACKUP_RETENTION_DAYS || 7);
+const BACKUP_INITIAL_DELAY_MS = Number(process.env.BACKUP_INITIAL_DELAY_MS || 30000);
+const BACKUP_DIR = String(process.env.BACKUP_DIR || "").trim();
 
 if (!DATABASE_URL) {
   console.error("DATABASE_URL não configurada.");
@@ -34,6 +39,230 @@ const pool = new Pool({
   connectionString: DATABASE_URL,
   ssl: { rejectUnauthorized: false }
 });
+
+const BACKUPS_DIR = BACKUP_DIR ? path.resolve(BACKUP_DIR) : path.join(__dirname, "backups");
+
+if (!fs.existsSync(BACKUPS_DIR)) {
+  fs.mkdirSync(BACKUPS_DIR, { recursive: true });
+}
+
+const backupState = {
+  running: false,
+  timer: null,
+  lastRunAt: null,
+  lastSuccessAt: null,
+  lastError: null,
+  lastFile: null,
+  lastDurationMs: null
+};
+
+function isPositiveNumber(value) {
+  return Number.isFinite(value) && value > 0;
+}
+
+function sanitizeTimestamp(value) {
+  return String(value || "")
+    .replace(/[:.]/g, "-")
+    .replace(/[^0-9TZ-]/g, "");
+}
+
+function getBackupFileName(date = new Date()) {
+  return `sigmo-backup-${sanitizeTimestamp(date.toISOString())}.json`;
+}
+
+function getBackupFilePath(fileName) {
+  return path.join(BACKUPS_DIR, fileName);
+}
+
+async function listBackupFiles() {
+  const entries = await fs.promises.readdir(BACKUPS_DIR, { withFileTypes: true });
+  const files = await Promise.all(
+    entries
+      .filter((entry) => entry.isFile() && entry.name.toLowerCase().endsWith(".json"))
+      .map(async (entry) => {
+        const filePath = getBackupFilePath(entry.name);
+        const stats = await fs.promises.stat(filePath);
+
+        return {
+          fileName: entry.name,
+          size: stats.size,
+          createdAt: stats.birthtime ? stats.birthtime.toISOString() : null,
+          updatedAt: stats.mtime ? stats.mtime.toISOString() : null
+        };
+      })
+  );
+
+  return files.sort((a, b) => {
+    const timeA = new Date(a.updatedAt || 0).getTime();
+    const timeB = new Date(b.updatedAt || 0).getTime();
+    return timeB - timeA;
+  });
+}
+
+async function cleanupOldBackups() {
+  if (!isPositiveNumber(BACKUP_RETENTION_DAYS)) {
+    return { removed: 0 };
+  }
+
+  const retentionMs = BACKUP_RETENTION_DAYS * 24 * 60 * 60 * 1000;
+  const threshold = Date.now() - retentionMs;
+  const files = await listBackupFiles();
+  let removed = 0;
+
+  for (const file of files) {
+    const updatedAtMs = new Date(file.updatedAt || 0).getTime();
+    if (!updatedAtMs || updatedAtMs >= threshold) {
+      continue;
+    }
+
+    await fs.promises.unlink(getBackupFilePath(file.fileName));
+    removed += 1;
+  }
+
+  return { removed };
+}
+
+async function createDatabaseBackup(trigger = "automatic") {
+  if (backupState.running) {
+    return {
+      ok: false,
+      skipped: true,
+      error: "Backup já está em execução"
+    };
+  }
+
+  backupState.running = true;
+  backupState.lastRunAt = new Date().toISOString();
+  backupState.lastError = null;
+
+  const startedAt = Date.now();
+
+  try {
+    const client = await pool.connect();
+
+    try {
+      await client.query("BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ");
+
+      const [usuarios, depositos, admins] = await Promise.all([
+        client.query("SELECT * FROM usuarios ORDER BY criado_em ASC NULLS LAST, id ASC"),
+        client.query("SELECT * FROM depositos ORDER BY criado_em ASC NULLS LAST, id ASC"),
+        client.query("SELECT * FROM admins ORDER BY criado_em ASC NULLS LAST, id ASC")
+      ]);
+
+      await client.query("COMMIT");
+
+      const now = new Date();
+      const fileName = getBackupFileName(now);
+      const filePath = getBackupFilePath(fileName);
+      const payload = {
+        meta: {
+          generatedAt: now.toISOString(),
+          trigger,
+          version: 1,
+          tables: {
+            usuarios: usuarios.rowCount,
+            depositos: depositos.rowCount,
+            admins: admins.rowCount
+          }
+        },
+        data: {
+          usuarios: usuarios.rows,
+          depositos: depositos.rows,
+          admins: admins.rows
+        }
+      };
+
+      await fs.promises.writeFile(filePath, JSON.stringify(payload, null, 2), "utf8");
+      const cleanup = await cleanupOldBackups();
+      const durationMs = Date.now() - startedAt;
+
+      backupState.lastSuccessAt = now.toISOString();
+      backupState.lastFile = fileName;
+      backupState.lastDurationMs = durationMs;
+
+      console.log(
+        `[backup] concluído (${trigger}) arquivo=${fileName} usuarios=${usuarios.rowCount} depositos=${depositos.rowCount} admins=${admins.rowCount} removidos=${cleanup.removed}`
+      );
+
+      return {
+        ok: true,
+        fileName,
+        generatedAt: backupState.lastSuccessAt,
+        durationMs,
+        removedOldBackups: cleanup.removed,
+        counts: payload.meta.tables
+      };
+    } catch (error) {
+      await client.query("ROLLBACK");
+      throw error;
+    } finally {
+      client.release();
+    }
+  } catch (error) {
+    backupState.lastError = error.message || "Erro ao gerar backup";
+    console.error("[backup] erro:", error);
+    return {
+      ok: false,
+      error: backupState.lastError
+    };
+  } finally {
+    backupState.running = false;
+  }
+}
+
+function scheduleNextBackup(delayMs) {
+  if (!BACKUP_ENABLED || !isPositiveNumber(BACKUP_INTERVAL_HOURS)) {
+    console.log("[backup] automático desativado.");
+    return;
+  }
+
+  if (backupState.timer) {
+    clearTimeout(backupState.timer);
+  }
+
+  const safeDelayMs = Math.max(1000, delayMs);
+
+  backupState.timer = setTimeout(async () => {
+    await createDatabaseBackup("automatic");
+    scheduleNextBackup(BACKUP_INTERVAL_HOURS * 60 * 60 * 1000);
+  }, safeDelayMs);
+}
+
+function startBackupScheduler() {
+  if (!BACKUP_ENABLED) {
+    console.log("[backup] BACKUP_ENABLED=false, rotina automática não iniciada.");
+    return;
+  }
+
+  if (!isPositiveNumber(BACKUP_INTERVAL_HOURS)) {
+    console.log("[backup] intervalo inválido, rotina automática não iniciada.");
+    return;
+  }
+
+  console.log(
+    `[backup] rotina automática iniciada. Intervalo=${BACKUP_INTERVAL_HOURS}h retenção=${BACKUP_RETENTION_DAYS}d`
+  );
+  scheduleNextBackup(BACKUP_INITIAL_DELAY_MS);
+}
+
+async function getBackupStatus() {
+  const files = await listBackupFiles();
+
+  return {
+    enabled: BACKUP_ENABLED,
+    running: backupState.running,
+    intervalHours: BACKUP_INTERVAL_HOURS,
+    retentionDays: BACKUP_RETENTION_DAYS,
+    initialDelayMs: BACKUP_INITIAL_DELAY_MS,
+    lastRunAt: backupState.lastRunAt,
+    lastSuccessAt: backupState.lastSuccessAt,
+    lastDurationMs: backupState.lastDurationMs,
+    lastFile: backupState.lastFile,
+    lastError: backupState.lastError,
+    totalBackups: files.length,
+    latestBackups: files.slice(0, 10)
+  };
+}
 
 // =========================
 // INIT DB
@@ -996,11 +1225,54 @@ app.post("/admin/reset-password", authAdmin, async (req, res) => {
   }
 });
 
+app.get("/admin/backups/status", authAdmin, async (req, res) => {
+  try {
+    const status = await getBackupStatus();
+    res.json(status);
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: "Erro ao buscar status dos backups" });
+  }
+});
+
+app.get("/admin/backups", authAdmin, async (req, res) => {
+  try {
+    const backups = await listBackupFiles();
+    res.json({ backups });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: "Erro ao listar backups" });
+  }
+});
+
+app.post("/admin/backups/run", authAdmin, async (req, res) => {
+  try {
+    const result = await createDatabaseBackup("manual");
+
+    if (result.skipped) {
+      return res.status(409).json({ error: result.error });
+    }
+
+    if (!result.ok) {
+      return res.status(500).json({ error: result.error || "Erro ao executar backup" });
+    }
+
+    res.json({
+      message: "Backup executado com sucesso",
+      backup: result
+    });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: "Erro ao executar backup" });
+  }
+});
+
 // =========================
 // START
 // =========================
 initDB()
   .then(() => {
+    startBackupScheduler();
     app.listen(PORT, () => {
       console.log("Servidor rodando");
     });
