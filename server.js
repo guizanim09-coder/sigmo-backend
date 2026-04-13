@@ -4,8 +4,96 @@ const path = require("path");
 const cors = require("cors");
 const bcrypt = require("bcryptjs");
 const multer = require("multer");
+const helmet = require("helmet");
+const rateLimit = require("express-rate-limit");
+const { Pool } = require("pg");
 
 const app = express();
+
+const PORT = process.env.PORT || 3000;
+const DB_FILE = path.join(__dirname, "database.json");
+const ADMIN_KEY = String(process.env.ADMIN_KEY || "").trim();
+const DATABASE_URL = process.env.DATABASE_URL || "";
+
+// =========================
+// POSTGRES
+// =========================
+const pool = new Pool({
+  connectionString: DATABASE_URL || undefined,
+  ssl: DATABASE_URL
+    ? {
+        rejectUnauthorized: false
+      }
+    : false
+});
+
+function hasPostgres() {
+  return Boolean(DATABASE_URL);
+}
+
+async function initDB() {
+  if (!hasPostgres()) {
+    console.log("Postgres não configurado. Rodando com fallback em JSON.");
+    return;
+  }
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS usuarios (
+      id TEXT PRIMARY KEY,
+      nome TEXT,
+      email TEXT UNIQUE,
+      senha TEXT,
+      saldo NUMERIC DEFAULT 0,
+      criado_em TIMESTAMP,
+      nome_atualizado_em TIMESTAMP,
+      saldo_atualizado_em TIMESTAMP,
+      senha_atualizada_em TIMESTAMP
+    );
+  `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS depositos (
+      id TEXT PRIMARY KEY,
+      user_id TEXT,
+      valor NUMERIC,
+      chave_pix TEXT,
+      tipo_chave TEXT,
+      tipo_transacao TEXT,
+      status TEXT,
+      comprovante_url TEXT,
+      descricao TEXT,
+      criado_em TIMESTAMP,
+      aprovado_em TIMESTAMP,
+      recusado_em TIMESTAMP,
+      comprovante_enviado_em TIMESTAMP
+    );
+  `);
+
+  console.log("Banco Postgres pronto");
+}
+
+// =========================
+// SEGURANÇA
+// =========================
+app.use(helmet());
+
+const globalLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 120,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: "Muitas requisições, tente novamente." }
+});
+
+const loginLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 5,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: "Muitas tentativas de login. Aguarde 1 minuto." }
+});
+
+app.use(globalLimiter);
 
 const allowedOrigins = [
   /^https:\/\/.*\.netlify\.app$/,
@@ -15,33 +103,28 @@ const allowedOrigins = [
   "http://127.0.0.1:5173"
 ];
 
-app.use(cors({
-  origin(origin, callback) {
-    if (!origin) return callback(null, true);
+app.use(
+  cors({
+    origin(origin, callback) {
+      if (!origin) return callback(null, true);
 
-    const permitido = allowedOrigins.some((item) => {
-      if (item instanceof RegExp) return item.test(origin);
-      return item === origin;
-    });
+      const permitido = allowedOrigins.some((item) => {
+        if (item instanceof RegExp) return item.test(origin);
+        return item === origin;
+      });
 
-    if (permitido) return callback(null, true);
-
-    return callback(new Error("Origem não permitida pelo CORS"));
-  },
-  methods: ["GET", "POST", "OPTIONS"],
-  allowedHeaders: ["Content-Type", "x-admin-key"]
-}));
-
-app.options("*", cors());
+      if (permitido) return callback(null, true);
+      return callback(new Error("Origem não permitida"));
+    },
+    methods: ["GET", "POST", "OPTIONS"],
+    allowedHeaders: ["Content-Type", "x-admin-key"]
+  })
+);
 
 app.use(express.json());
 
-const PORT = process.env.PORT || 3000;
-const DB_FILE = path.join(__dirname, "database.json");
-const ADMIN_KEY = String(process.env.ADMIN_KEY || "").trim();
-
 // =========================
-// UPLOAD CONFIG
+// UPLOAD
 // =========================
 const UPLOADS_DIR = path.join(__dirname, "uploads");
 
@@ -52,10 +135,8 @@ if (!fs.existsSync(UPLOADS_DIR)) {
 app.use("/uploads", express.static(UPLOADS_DIR));
 
 const storage = multer.diskStorage({
-  destination: function (req, file, cb) {
-    cb(null, UPLOADS_DIR);
-  },
-  filename: function (req, file, cb) {
+  destination: (_, __, cb) => cb(null, UPLOADS_DIR),
+  filename: (_, file, cb) => {
     const ext = path.extname(file.originalname || "");
     cb(null, "comp_" + Date.now() + ext);
   }
@@ -63,19 +144,32 @@ const storage = multer.diskStorage({
 
 const upload = multer({
   storage,
-  limits: { fileSize: 8 * 1024 * 1024 }
+  limits: { fileSize: 5 * 1024 * 1024 },
+  fileFilter: (_, file, cb) => {
+    const allowed = ["image/png", "image/jpeg", "image/jpg", "application/pdf"];
+    if (!allowed.includes(file.mimetype)) {
+      return cb(new Error("Formato inválido"));
+    }
+    cb(null, true);
+  }
 });
 
 // =========================
-// BANCO
+// JSON FALLBACK
 // =========================
 function ensureDB() {
   if (!fs.existsSync(DB_FILE)) {
-    const initialData = {
-      usuarios: [],
-      depositos: []
-    };
-    fs.writeFileSync(DB_FILE, JSON.stringify(initialData, null, 2));
+    fs.writeFileSync(
+      DB_FILE,
+      JSON.stringify(
+        {
+          usuarios: [],
+          depositos: []
+        },
+        null,
+        2
+      )
+    );
   }
 }
 
@@ -89,12 +183,358 @@ function writeDB(data) {
 }
 
 // =========================
-// SEGURANÇA ADMIN
+// HELPERS
+// =========================
+function normalizeEmail(email) {
+  return String(email || "").trim().toLowerCase();
+}
+
+function mapPgUser(row) {
+  if (!row) return null;
+  return {
+    id: row.id,
+    nome: row.nome || row.email?.split("@")[0] || "",
+    email: row.email,
+    senha: row.senha,
+    saldo: Number(row.saldo || 0),
+    criadoEm: row.criado_em || null,
+    nomeAtualizadoEm: row.nome_atualizado_em || null,
+    saldoAtualizadoEm: row.saldo_atualizado_em || null,
+    senhaAtualizadaEm: row.senha_atualizada_em || null
+  };
+}
+
+function mapPgDeposit(row) {
+  if (!row) return null;
+  return {
+    id: row.id,
+    userId: row.user_id,
+    valor: Number(row.valor || 0),
+    chavePix: row.chave_pix || "",
+    tipoChave: row.tipo_chave || "",
+    tipoTransacao: row.tipo_transacao || "entrada",
+    status: row.status || "pendente",
+    comprovanteUrl: row.comprovante_url || "",
+    descricao: row.descricao || "",
+    criadoEm: row.criado_em || null,
+    aprovadoEm: row.aprovado_em || null,
+    recusadoEm: row.recusado_em || null,
+    comprovanteEnviadoEm: row.comprovante_enviado_em || null
+  };
+}
+
+async function pgGetUserByEmail(email) {
+  if (!hasPostgres()) return null;
+  const result = await pool.query("SELECT * FROM usuarios WHERE email = $1 LIMIT 1", [
+    normalizeEmail(email)
+  ]);
+  return mapPgUser(result.rows[0]);
+}
+
+async function pgGetUserById(id) {
+  if (!hasPostgres()) return null;
+  const result = await pool.query("SELECT * FROM usuarios WHERE id = $1 LIMIT 1", [id]);
+  return mapPgUser(result.rows[0]);
+}
+
+async function pgListUsers() {
+  if (!hasPostgres()) return [];
+  const result = await pool.query("SELECT * FROM usuarios ORDER BY criado_em DESC NULLS LAST");
+  return result.rows.map(mapPgUser);
+}
+
+async function pgUpsertUser(user) {
+  if (!hasPostgres()) return;
+  await pool.query(
+    `
+    INSERT INTO usuarios (
+      id, nome, email, senha, saldo, criado_em,
+      nome_atualizado_em, saldo_atualizado_em, senha_atualizada_em
+    )
+    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+    ON CONFLICT (id) DO UPDATE SET
+      nome = EXCLUDED.nome,
+      email = EXCLUDED.email,
+      senha = EXCLUDED.senha,
+      saldo = EXCLUDED.saldo,
+      criado_em = COALESCE(usuarios.criado_em, EXCLUDED.criado_em),
+      nome_atualizado_em = EXCLUDED.nome_atualizado_em,
+      saldo_atualizado_em = EXCLUDED.saldo_atualizado_em,
+      senha_atualizada_em = EXCLUDED.senha_atualizada_em
+  `,
+    [
+      user.id,
+      user.nome || "",
+      normalizeEmail(user.email),
+      user.senha || "",
+      Number(user.saldo || 0),
+      user.criadoEm || new Date().toISOString(),
+      user.nomeAtualizadoEm || null,
+      user.saldoAtualizadoEm || null,
+      user.senhaAtualizadaEm || null
+    ]
+  );
+}
+
+async function pgGetDepositById(id) {
+  if (!hasPostgres()) return null;
+  const result = await pool.query("SELECT * FROM depositos WHERE id = $1 LIMIT 1", [id]);
+  return mapPgDeposit(result.rows[0]);
+}
+
+async function pgListDeposits() {
+  if (!hasPostgres()) return [];
+  const result = await pool.query("SELECT * FROM depositos ORDER BY criado_em DESC NULLS LAST");
+  return result.rows.map(mapPgDeposit);
+}
+
+async function pgListDepositsByUser(userId) {
+  if (!hasPostgres()) return [];
+  const result = await pool.query(
+    "SELECT * FROM depositos WHERE user_id = $1 ORDER BY criado_em DESC NULLS LAST",
+    [userId]
+  );
+  return result.rows.map(mapPgDeposit);
+}
+
+async function pgUpsertDeposit(dep) {
+  if (!hasPostgres()) return;
+  await pool.query(
+    `
+    INSERT INTO depositos (
+      id, user_id, valor, chave_pix, tipo_chave, tipo_transacao, status,
+      comprovante_url, descricao, criado_em, aprovado_em, recusado_em, comprovante_enviado_em
+    )
+    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+    ON CONFLICT (id) DO UPDATE SET
+      user_id = EXCLUDED.user_id,
+      valor = EXCLUDED.valor,
+      chave_pix = EXCLUDED.chave_pix,
+      tipo_chave = EXCLUDED.tipo_chave,
+      tipo_transacao = EXCLUDED.tipo_transacao,
+      status = EXCLUDED.status,
+      comprovante_url = EXCLUDED.comprovante_url,
+      descricao = EXCLUDED.descricao,
+      criado_em = COALESCE(depositos.criado_em, EXCLUDED.criado_em),
+      aprovado_em = EXCLUDED.aprovado_em,
+      recusado_em = EXCLUDED.recusado_em,
+      comprovante_enviado_em = EXCLUDED.comprovante_enviado_em
+  `,
+    [
+      dep.id,
+      dep.userId,
+      Number(dep.valor || 0),
+      dep.chavePix || "",
+      dep.tipoChave || "",
+      dep.tipoTransacao || "entrada",
+      dep.status || "pendente",
+      dep.comprovanteUrl || "",
+      dep.descricao || "",
+      dep.criadoEm || new Date().toISOString(),
+      dep.aprovadoEm || null,
+      dep.recusadoEm || null,
+      dep.comprovanteEnviadoEm || null
+    ]
+  );
+}
+
+function jsonGetUserByEmail(email) {
+  const db = readDB();
+  return (
+    db.usuarios.find((u) => normalizeEmail(u.email) === normalizeEmail(email)) || null
+  );
+}
+
+function jsonGetUserById(id) {
+  const db = readDB();
+  return db.usuarios.find((u) => u.id === id) || null;
+}
+
+function jsonListUsers() {
+  const db = readDB();
+  return db.usuarios || [];
+}
+
+function jsonSaveUser(user) {
+  const db = readDB();
+  const idx = db.usuarios.findIndex((u) => u.id === user.id);
+
+  if (idx >= 0) {
+    db.usuarios[idx] = { ...db.usuarios[idx], ...user };
+  } else {
+    db.usuarios.push(user);
+  }
+
+  writeDB(db);
+}
+
+function jsonGetDepositById(id) {
+  const db = readDB();
+  return db.depositos.find((d) => d.id === id) || null;
+}
+
+function jsonListDeposits() {
+  const db = readDB();
+  return db.depositos || [];
+}
+
+function jsonListDepositsByUser(userId) {
+  const db = readDB();
+  return db.depositos.filter((d) => d.userId === userId);
+}
+
+function jsonSaveDeposit(dep) {
+  const db = readDB();
+  const idx = db.depositos.findIndex((d) => d.id === dep.id);
+
+  if (idx >= 0) {
+    db.depositos[idx] = { ...db.depositos[idx], ...dep };
+  } else {
+    db.depositos.push(dep);
+  }
+
+  writeDB(db);
+}
+
+async function getUserByEmail(email) {
+  const fromPg = await pgGetUserByEmail(email);
+  if (fromPg) return fromPg;
+
+  const fromJson = jsonGetUserByEmail(email);
+  if (fromJson) {
+    await pgUpsertUser(fromJson);
+    return {
+      ...fromJson,
+      saldo: Number(fromJson.saldo || 0)
+    };
+  }
+
+  return null;
+}
+
+async function getUserById(id) {
+  const fromPg = await pgGetUserById(id);
+  if (fromPg) return fromPg;
+
+  const fromJson = jsonGetUserById(id);
+  if (fromJson) {
+    await pgUpsertUser(fromJson);
+    return {
+      ...fromJson,
+      saldo: Number(fromJson.saldo || 0)
+    };
+  }
+
+  return null;
+}
+
+async function saveUserEverywhere(user) {
+  const safeUser = {
+    ...user,
+    email: normalizeEmail(user.email),
+    saldo: Number(user.saldo || 0)
+  };
+
+  await pgUpsertUser(safeUser);
+  jsonSaveUser(safeUser);
+}
+
+async function getDepositById(id) {
+  const fromPg = await pgGetDepositById(id);
+  if (fromPg) return fromPg;
+
+  const fromJson = jsonGetDepositById(id);
+  if (fromJson) {
+    await pgUpsertDeposit(fromJson);
+    return {
+      ...fromJson,
+      valor: Number(fromJson.valor || 0)
+    };
+  }
+
+  return null;
+}
+
+async function saveDepositEverywhere(dep) {
+  const safeDep = {
+    ...dep,
+    valor: Number(dep.valor || 0)
+  };
+
+  await pgUpsertDeposit(safeDep);
+  jsonSaveDeposit(safeDep);
+}
+
+async function listUsersMerged() {
+  const pgUsers = await pgListUsers();
+  const jsonUsers = jsonListUsers();
+
+  const map = new Map();
+
+  for (const u of pgUsers) {
+    map.set(u.id, { ...u, saldo: Number(u.saldo || 0) });
+  }
+
+  for (const u of jsonUsers) {
+    if (!map.has(u.id)) {
+      map.set(u.id, { ...u, saldo: Number(u.saldo || 0) });
+    }
+  }
+
+  return Array.from(map.values()).sort(
+    (a, b) => new Date(b.criadoEm || 0) - new Date(a.criadoEm || 0)
+  );
+}
+
+async function listDepositsMerged() {
+  const pgDeps = await pgListDeposits();
+  const jsonDeps = jsonListDeposits();
+
+  const map = new Map();
+
+  for (const d of pgDeps) {
+    map.set(d.id, { ...d, valor: Number(d.valor || 0) });
+  }
+
+  for (const d of jsonDeps) {
+    if (!map.has(d.id)) {
+      map.set(d.id, { ...d, valor: Number(d.valor || 0) });
+    }
+  }
+
+  return Array.from(map.values()).sort(
+    (a, b) => new Date(b.criadoEm || 0) - new Date(a.criadoEm || 0)
+  );
+}
+
+async function listDepositsByUserMerged(userId) {
+  const pgDeps = await pgListDepositsByUser(userId);
+  const jsonDeps = jsonListDepositsByUser(userId);
+
+  const map = new Map();
+
+  for (const d of pgDeps) {
+    map.set(d.id, { ...d, valor: Number(d.valor || 0) });
+  }
+
+  for (const d of jsonDeps) {
+    if (!map.has(d.id)) {
+      map.set(d.id, { ...d, valor: Number(d.valor || 0) });
+    }
+  }
+
+  return Array.from(map.values()).sort(
+    (a, b) => new Date(b.criadoEm || 0) - new Date(a.criadoEm || 0)
+  );
+}
+
+// =========================
+// ADMIN
 // =========================
 function requireAdmin(req, res, next) {
   const adminKey = String(req.headers["x-admin-key"] || "").trim();
 
-  if (!ADMIN_KEY || !adminKey || adminKey !== ADMIN_KEY) {
+  if (!ADMIN_KEY || adminKey !== ADMIN_KEY) {
     return res.status(401).json({ error: "Acesso não autorizado" });
   }
 
@@ -112,7 +552,7 @@ app.get("/", (req, res) => {
 });
 
 // =========================
-// REGISTRO
+// REGISTER
 // =========================
 app.post("/register", async (req, res) => {
   try {
@@ -122,12 +562,8 @@ app.post("/register", async (req, res) => {
       return res.status(400).json({ error: "Email e senha são obrigatórios" });
     }
 
-    const emailNormalizado = String(email).trim().toLowerCase();
-    const db = readDB();
-
-    const existe = db.usuarios.find(
-      (u) => String(u.email).toLowerCase() === emailNormalizado
-    );
+    const emailNormalizado = normalizeEmail(email);
+    const existe = await getUserByEmail(emailNormalizado);
 
     if (existe) {
       return res.status(400).json({ error: "Usuário já existe" });
@@ -144,8 +580,7 @@ app.post("/register", async (req, res) => {
       criadoEm: new Date().toISOString()
     };
 
-    db.usuarios.push(novoUsuario);
-    writeDB(db);
+    await saveUserEverywhere(novoUsuario);
 
     return res.status(201).json({
       id: novoUsuario.id,
@@ -155,6 +590,7 @@ app.post("/register", async (req, res) => {
       criadoEm: novoUsuario.criadoEm
     });
   } catch (error) {
+    console.error(error);
     return res.status(500).json({ error: "Erro interno no registro" });
   }
 });
@@ -162,7 +598,7 @@ app.post("/register", async (req, res) => {
 // =========================
 // LOGIN
 // =========================
-app.post("/login", async (req, res) => {
+app.post("/login", loginLimiter, async (req, res) => {
   try {
     const { email, senha } = req.body;
 
@@ -170,12 +606,8 @@ app.post("/login", async (req, res) => {
       return res.status(400).json({ error: "Email e senha são obrigatórios" });
     }
 
-    const emailNormalizado = String(email).trim().toLowerCase();
-    const db = readDB();
-
-    const user = db.usuarios.find(
-      (u) => String(u.email).toLowerCase() === emailNormalizado
-    );
+    const emailNormalizado = normalizeEmail(email);
+    const user = await getUserByEmail(emailNormalizado);
 
     if (!user) {
       return res.status(401).json({ error: "Login inválido" });
@@ -195,6 +627,7 @@ app.post("/login", async (req, res) => {
       criadoEm: user.criadoEm || null
     });
   } catch (error) {
+    console.error(error);
     return res.status(500).json({ error: "Erro no login" });
   }
 });
@@ -202,12 +635,10 @@ app.post("/login", async (req, res) => {
 // =========================
 // USUÁRIO LOGADO
 // =========================
-app.get("/usuario/:id", (req, res) => {
+app.get("/usuario/:id", async (req, res) => {
   try {
     const { id } = req.params;
-    const db = readDB();
-
-    const user = db.usuarios.find((u) => u.id === id);
+    const user = await getUserById(id);
 
     if (!user) {
       return res.status(404).json({ error: "Usuário não encontrado" });
@@ -221,6 +652,7 @@ app.get("/usuario/:id", (req, res) => {
       criadoEm: user.criadoEm || null
     });
   } catch (error) {
+    console.error(error);
     return res.status(500).json({ error: "Erro ao buscar usuário" });
   }
 });
@@ -228,7 +660,7 @@ app.get("/usuario/:id", (req, res) => {
 // =========================
 // ATUALIZAR NOME
 // =========================
-app.post("/usuario/update-nome", (req, res) => {
+app.post("/usuario/update-nome", async (req, res) => {
   try {
     const { userId, nome } = req.body;
 
@@ -242,8 +674,7 @@ app.post("/usuario/update-nome", (req, res) => {
       return res.status(400).json({ error: "Nome muito curto" });
     }
 
-    const db = readDB();
-    const user = db.usuarios.find((u) => u.id === userId);
+    const user = await getUserById(userId);
 
     if (!user) {
       return res.status(404).json({ error: "Usuário não encontrado" });
@@ -252,10 +683,11 @@ app.post("/usuario/update-nome", (req, res) => {
     user.nome = nomeLimpo;
     user.nomeAtualizadoEm = new Date().toISOString();
 
-    writeDB(db);
+    await saveUserEverywhere(user);
 
     return res.json({ message: "Nome atualizado com sucesso" });
-  } catch {
+  } catch (error) {
+    console.error(error);
     return res.status(500).json({ error: "Erro ao atualizar nome" });
   }
 });
@@ -263,15 +695,9 @@ app.post("/usuario/update-nome", (req, res) => {
 // =========================
 // CRIAR PEDIDO
 // =========================
-app.post("/deposito", (req, res) => {
+app.post("/deposito", async (req, res) => {
   try {
-    const {
-      userId,
-      valor,
-      chavePix,
-      tipoChave,
-      tipoTransacao
-    } = req.body;
+    const { userId, valor, chavePix, tipoChave, tipoTransacao } = req.body;
 
     if (!userId || valor === undefined || valor === null) {
       return res.status(400).json({ error: "userId e valor são obrigatórios" });
@@ -283,9 +709,8 @@ app.post("/deposito", (req, res) => {
       return res.status(400).json({ error: "Valor inválido" });
     }
 
-    const db = readDB();
+    const usuario = await getUserById(userId);
 
-    const usuario = db.usuarios.find((u) => u.id === userId);
     if (!usuario) {
       return res.status(404).json({ error: "Usuário não encontrado" });
     }
@@ -299,14 +724,18 @@ app.post("/deposito", (req, res) => {
       tipoTransacao: tipoTransacao || "entrada",
       status: "pendente",
       comprovanteUrl: "",
-      criadoEm: new Date().toISOString()
+      descricao: "",
+      criadoEm: new Date().toISOString(),
+      aprovadoEm: null,
+      recusadoEm: null,
+      comprovanteEnviadoEm: null
     };
 
-    db.depositos.push(pedido);
-    writeDB(db);
+    await saveDepositEverywhere(pedido);
 
     return res.status(201).json(pedido);
   } catch (error) {
+    console.error(error);
     return res.status(500).json({ error: "Erro ao criar pedido" });
   }
 });
@@ -314,10 +743,9 @@ app.post("/deposito", (req, res) => {
 // =========================
 // ANEXAR COMPROVANTE
 // =========================
-app.post("/deposito/:id/comprovante", upload.single("comprovante"), (req, res) => {
+app.post("/deposito/:id/comprovante", upload.single("comprovante"), async (req, res) => {
   try {
-    const db = readDB();
-    const pedido = db.depositos.find((d) => d.id === req.params.id);
+    const pedido = await getDepositById(req.params.id);
 
     if (!pedido) {
       return res.status(404).json({ error: "Pedido não encontrado" });
@@ -330,13 +758,14 @@ app.post("/deposito/:id/comprovante", upload.single("comprovante"), (req, res) =
     pedido.comprovanteUrl = "/uploads/" + req.file.filename;
     pedido.comprovanteEnviadoEm = new Date().toISOString();
 
-    writeDB(db);
+    await saveDepositEverywhere(pedido);
 
     return res.json({
       message: "Comprovante enviado com sucesso",
       pedido
     });
   } catch (error) {
+    console.error(error);
     return res.status(500).json({ error: "Erro upload" });
   }
 });
@@ -344,7 +773,7 @@ app.post("/deposito/:id/comprovante", upload.single("comprovante"), (req, res) =
 // =========================
 // TRANSFERÊNCIA INTERNA SIGMO
 // =========================
-app.post("/transferir-sigmo", (req, res) => {
+app.post("/transferir-sigmo", async (req, res) => {
   try {
     const { fromUserId, emailDestino, valor } = req.body;
 
@@ -358,17 +787,12 @@ app.post("/transferir-sigmo", (req, res) => {
       return res.status(400).json({ error: "Valor inválido" });
     }
 
-    const db = readDB();
-
-    const remetente = db.usuarios.find((u) => u.id === fromUserId);
+    const remetente = await getUserById(fromUserId);
     if (!remetente) {
       return res.status(404).json({ error: "Remetente não encontrado" });
     }
 
-    const destino = db.usuarios.find(
-      (u) => String(u.email).toLowerCase() === String(emailDestino).trim().toLowerCase()
-    );
-
+    const destino = await getUserByEmail(emailDestino);
     if (!destino) {
       return res.status(404).json({ error: "Usuário destino não encontrado" });
     }
@@ -383,38 +807,55 @@ app.post("/transferir-sigmo", (req, res) => {
 
     remetente.saldo = Number(remetente.saldo || 0) - valorNum;
     destino.saldo = Number(destino.saldo || 0) + valorNum;
+    remetente.saldoAtualizadoEm = new Date().toISOString();
+    destino.saldoAtualizadoEm = new Date().toISOString();
+
+    await saveUserEverywhere(remetente);
+    await saveUserEverywhere(destino);
 
     const agora = new Date().toISOString();
 
-    db.depositos.push({
+    const saida = {
       id: "dep_" + Date.now(),
       userId: remetente.id,
       valor: valorNum,
+      chavePix: "",
+      tipoChave: "",
       tipoTransacao: "saida",
       status: "aprovado",
+      comprovanteUrl: "",
       descricao: `Transferência enviada para ${destino.email}`,
       criadoEm: agora,
-      aprovadoEm: agora
-    });
+      aprovadoEm: agora,
+      recusadoEm: null,
+      comprovanteEnviadoEm: null
+    };
 
-    db.depositos.push({
+    const entrada = {
       id: "dep_" + (Date.now() + 1),
       userId: destino.id,
       valor: valorNum,
+      chavePix: "",
+      tipoChave: "",
       tipoTransacao: "entrada",
       status: "aprovado",
+      comprovanteUrl: "",
       descricao: `Transferência recebida de ${remetente.email}`,
       criadoEm: agora,
-      aprovadoEm: agora
-    });
+      aprovadoEm: agora,
+      recusadoEm: null,
+      comprovanteEnviadoEm: null
+    };
 
-    writeDB(db);
+    await saveDepositEverywhere(saida);
+    await saveDepositEverywhere(entrada);
 
     return res.json({
       message: "Transferência realizada com sucesso",
       saldoAtual: remetente.saldo
     });
-  } catch {
+  } catch (error) {
+    console.error(error);
     return res.status(500).json({ error: "Erro na transferência" });
   }
 });
@@ -422,16 +863,12 @@ app.post("/transferir-sigmo", (req, res) => {
 // =========================
 // PEDIDOS DO USUÁRIO
 // =========================
-app.get("/depositos/user/:id", (req, res) => {
+app.get("/depositos/user/:id", async (req, res) => {
   try {
-    const db = readDB();
-
-    const lista = db.depositos
-      .filter((d) => d.userId === req.params.id)
-      .sort((a, b) => new Date(b.criadoEm || 0) - new Date(a.criadoEm || 0));
-
+    const lista = await listDepositsByUserMerged(req.params.id);
     return res.json(lista);
   } catch (error) {
+    console.error(error);
     return res.status(500).json({ error: "Erro ao buscar depósitos do usuário" });
   }
 });
@@ -439,11 +876,11 @@ app.get("/depositos/user/:id", (req, res) => {
 // =========================
 // ADMIN - LISTAR USUÁRIOS
 // =========================
-app.get("/usuarios", requireAdmin, (req, res) => {
+app.get("/usuarios", requireAdmin, async (req, res) => {
   try {
-    const db = readDB();
+    const usuarios = await listUsersMerged();
 
-    const usuariosSeguros = db.usuarios.map((u) => ({
+    const usuariosSeguros = usuarios.map((u) => ({
       id: u.id,
       nome: u.nome || u.email?.split("@")[0] || "",
       email: u.email,
@@ -453,6 +890,7 @@ app.get("/usuarios", requireAdmin, (req, res) => {
 
     return res.json(usuariosSeguros);
   } catch (error) {
+    console.error(error);
     return res.status(500).json({ error: "Erro ao listar usuários" });
   }
 });
@@ -460,16 +898,12 @@ app.get("/usuarios", requireAdmin, (req, res) => {
 // =========================
 // ADMIN - LISTAR PEDIDOS
 // =========================
-app.get("/depositos", requireAdmin, (req, res) => {
+app.get("/depositos", requireAdmin, async (req, res) => {
   try {
-    const db = readDB();
-
-    const pedidos = [...db.depositos].sort(
-      (a, b) => new Date(b.criadoEm || 0) - new Date(a.criadoEm || 0)
-    );
-
+    const pedidos = await listDepositsMerged();
     return res.json(pedidos);
   } catch (error) {
+    console.error(error);
     return res.status(500).json({ error: "Erro ao listar pedidos" });
   }
 });
@@ -477,7 +911,7 @@ app.get("/depositos", requireAdmin, (req, res) => {
 // =========================
 // ADMIN - APROVAR PEDIDO
 // =========================
-app.post("/aprovar", requireAdmin, (req, res) => {
+app.post("/aprovar", requireAdmin, async (req, res) => {
   try {
     const { depositoId } = req.body;
 
@@ -485,9 +919,7 @@ app.post("/aprovar", requireAdmin, (req, res) => {
       return res.status(400).json({ error: "depositoId é obrigatório" });
     }
 
-    const db = readDB();
-
-    const pedido = db.depositos.find((d) => d.id === depositoId);
+    const pedido = await getDepositById(depositoId);
     if (!pedido) {
       return res.status(404).json({ error: "Pedido não encontrado" });
     }
@@ -500,7 +932,7 @@ app.post("/aprovar", requireAdmin, (req, res) => {
       return res.status(400).json({ error: "Pedido já recusado" });
     }
 
-    const usuario = db.usuarios.find((u) => u.id === pedido.userId);
+    const usuario = await getUserById(pedido.userId);
     if (!usuario) {
       return res.status(404).json({ error: "Usuário não encontrado" });
     }
@@ -522,10 +954,12 @@ app.post("/aprovar", requireAdmin, (req, res) => {
       usuario.saldo = saldoAtualLocal + valorPedido;
     }
 
+    usuario.saldoAtualizadoEm = new Date().toISOString();
     pedido.status = "aprovado";
     pedido.aprovadoEm = new Date().toISOString();
 
-    writeDB(db);
+    await saveUserEverywhere(usuario);
+    await saveDepositEverywhere(pedido);
 
     return res.json({
       message: "Pedido aprovado com sucesso",
@@ -533,6 +967,7 @@ app.post("/aprovar", requireAdmin, (req, res) => {
       saldoAtual: usuario.saldo
     });
   } catch (error) {
+    console.error(error);
     return res.status(500).json({ error: "Erro ao aprovar pedido" });
   }
 });
@@ -540,7 +975,7 @@ app.post("/aprovar", requireAdmin, (req, res) => {
 // =========================
 // ADMIN - RECUSAR PEDIDO
 // =========================
-app.post("/recusar", requireAdmin, (req, res) => {
+app.post("/recusar", requireAdmin, async (req, res) => {
   try {
     const { depositoId } = req.body;
 
@@ -548,8 +983,7 @@ app.post("/recusar", requireAdmin, (req, res) => {
       return res.status(400).json({ error: "depositoId é obrigatório" });
     }
 
-    const db = readDB();
-    const pedido = db.depositos.find((d) => d.id === depositoId);
+    const pedido = await getDepositById(depositoId);
 
     if (!pedido) {
       return res.status(404).json({ error: "Pedido não encontrado" });
@@ -566,13 +1000,14 @@ app.post("/recusar", requireAdmin, (req, res) => {
     pedido.status = "recusado";
     pedido.recusadoEm = new Date().toISOString();
 
-    writeDB(db);
+    await saveDepositEverywhere(pedido);
 
     return res.json({
       message: "Pedido recusado com sucesso",
       pedido
     });
   } catch (error) {
+    console.error(error);
     return res.status(500).json({ error: "Erro ao recusar pedido" });
   }
 });
@@ -580,7 +1015,7 @@ app.post("/recusar", requireAdmin, (req, res) => {
 // =========================
 // ADMIN - AJUSTAR SALDO
 // =========================
-app.post("/admin/update-balance", requireAdmin, (req, res) => {
+app.post("/admin/update-balance", requireAdmin, async (req, res) => {
   try {
     const { userId, saldo } = req.body;
 
@@ -594,8 +1029,7 @@ app.post("/admin/update-balance", requireAdmin, (req, res) => {
       return res.status(400).json({ error: "Saldo inválido" });
     }
 
-    const db = readDB();
-    const usuario = db.usuarios.find((u) => u.id === userId);
+    const usuario = await getUserById(userId);
 
     if (!usuario) {
       return res.status(404).json({ error: "Usuário não encontrado" });
@@ -604,7 +1038,7 @@ app.post("/admin/update-balance", requireAdmin, (req, res) => {
     usuario.saldo = saldoNumero;
     usuario.saldoAtualizadoEm = new Date().toISOString();
 
-    writeDB(db);
+    await saveUserEverywhere(usuario);
 
     return res.json({
       message: "Saldo atualizado com sucesso",
@@ -615,6 +1049,7 @@ app.post("/admin/update-balance", requireAdmin, (req, res) => {
       }
     });
   } catch (error) {
+    console.error(error);
     return res.status(500).json({ error: "Erro ao atualizar saldo" });
   }
 });
@@ -630,8 +1065,7 @@ app.post("/admin/reset-password", requireAdmin, async (req, res) => {
       return res.status(400).json({ error: "userId e novaSenha são obrigatórios" });
     }
 
-    const db = readDB();
-    const usuario = db.usuarios.find((u) => u.id === userId);
+    const usuario = await getUserById(userId);
 
     if (!usuario) {
       return res.status(404).json({ error: "Usuário não encontrado" });
@@ -641,16 +1075,24 @@ app.post("/admin/reset-password", requireAdmin, async (req, res) => {
     usuario.senha = senhaHash;
     usuario.senhaAtualizadaEm = new Date().toISOString();
 
-    writeDB(db);
+    await saveUserEverywhere(usuario);
 
     return res.json({
       message: "Senha redefinida com sucesso"
     });
   } catch (error) {
+    console.error(error);
     return res.status(500).json({ error: "Erro ao redefinir senha" });
   }
 });
 
-app.listen(PORT, () => {
-  console.log(`Servidor rodando na porta ${PORT}`);
-});
+initDB()
+  .then(() => {
+    app.listen(PORT, () => {
+      console.log(`Servidor rodando na porta ${PORT}`);
+    });
+  })
+  .catch((error) => {
+    console.error("Erro ao iniciar banco:", error);
+    process.exit(1);
+  });
