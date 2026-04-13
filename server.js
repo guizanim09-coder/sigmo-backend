@@ -6,6 +6,7 @@ const bcrypt = require("bcryptjs");
 const multer = require("multer");
 const helmet = require("helmet");
 const rateLimit = require("express-rate-limit");
+const jwt = require("jsonwebtoken");
 const { Pool } = require("pg");
 
 const app = express();
@@ -13,9 +14,17 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 const ADMIN_KEY = String(process.env.ADMIN_KEY || "").trim();
 const DATABASE_URL = String(process.env.DATABASE_URL || "").trim();
+const JWT_SECRET = String(process.env.JWT_SECRET || "").trim();
+const ADMIN_EMAIL = String(process.env.ADMIN_EMAIL || "").trim().toLowerCase();
+const ADMIN_PASSWORD = String(process.env.ADMIN_PASSWORD || "").trim();
 
 if (!DATABASE_URL) {
   console.error("DATABASE_URL não configurada.");
+  process.exit(1);
+}
+
+if (!JWT_SECRET) {
+  console.error("JWT_SECRET não configurada.");
   process.exit(1);
 }
 
@@ -62,7 +71,61 @@ async function initDB() {
     );
   `);
 
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS admins (
+      id TEXT PRIMARY KEY,
+      email TEXT UNIQUE NOT NULL,
+      senha TEXT NOT NULL,
+      nome TEXT DEFAULT '',
+      role TEXT DEFAULT 'admin',
+      ativo BOOLEAN DEFAULT true,
+      criado_em TIMESTAMP,
+      ultimo_login_em TIMESTAMP
+    );
+  `);
+
+  await ensurePrimaryAdmin();
+
   console.log("Banco Postgres pronto");
+}
+
+async function ensurePrimaryAdmin() {
+  if (!ADMIN_EMAIL || !ADMIN_PASSWORD) {
+    console.log("ADMIN_EMAIL ou ADMIN_PASSWORD não configurados. Admin inicial não criado.");
+    return;
+  }
+
+  const existing = await pool.query(
+    "SELECT id FROM admins WHERE email = $1 LIMIT 1",
+    [ADMIN_EMAIL]
+  );
+
+  if (existing.rows.length > 0) {
+    return;
+  }
+
+  const hash = await bcrypt.hash(ADMIN_PASSWORD, 10);
+
+  await pool.query(
+    `
+    INSERT INTO admins (
+      id, email, senha, nome, role, ativo, criado_em, ultimo_login_em
+    )
+    VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+    `,
+    [
+      "admin_" + Date.now(),
+      ADMIN_EMAIL,
+      hash,
+      "Administrador",
+      "admin",
+      true,
+      new Date().toISOString(),
+      null
+    ]
+  );
+
+  console.log("Admin inicial criado com sucesso.");
 }
 
 // =========================
@@ -84,6 +147,14 @@ const loginLimiter = rateLimit({
   standardHeaders: true,
   legacyHeaders: false,
   message: { error: "Muitas tentativas de login. Aguarde 1 minuto." }
+});
+
+const adminLoginLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 5,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: "Muitas tentativas de login admin. Aguarde 1 minuto." }
 });
 
 app.use(globalLimiter);
@@ -113,7 +184,7 @@ app.use(cors({
     return callback(new Error("Origem não permitida pelo CORS"));
   },
   methods: ["GET", "POST", "OPTIONS"],
-  allowedHeaders: ["Content-Type", "x-admin-key"]
+  allowedHeaders: ["Content-Type", "x-admin-key", "Authorization"]
 }));
 
 app.options("*", cors());
@@ -194,6 +265,21 @@ function mapDeposito(row) {
     recusadoEm: row.recusado_em || null,
     comprovanteEnviadoEm: row.comprovante_enviado_em || null
   };
+}
+
+function signAdminToken(admin) {
+  return jwt.sign(
+    {
+      sub: admin.id,
+      email: admin.email,
+      role: admin.role || "admin",
+      type: "admin"
+    },
+    JWT_SECRET,
+    {
+      expiresIn: "12h"
+    }
+  );
 }
 
 async function getUserById(id) {
@@ -314,17 +400,77 @@ async function saveDeposito(dep) {
   );
 }
 
-// =========================
-// SEGURANÇA ADMIN
-// =========================
-function requireAdmin(req, res, next) {
-  const adminKey = String(req.headers["x-admin-key"] || "").trim();
+async function getAdminByEmail(email) {
+  const result = await pool.query(
+    "SELECT * FROM admins WHERE email = $1 LIMIT 1",
+    [normalizeEmail(email)]
+  );
+  return result.rows[0] || null;
+}
 
-  if (!ADMIN_KEY || !adminKey || adminKey !== ADMIN_KEY) {
-    return res.status(401).json({ error: "Acesso não autorizado" });
+async function getAdminById(id) {
+  const result = await pool.query(
+    "SELECT * FROM admins WHERE id = $1 LIMIT 1",
+    [id]
+  );
+  return result.rows[0] || null;
+}
+
+// =========================
+// AUTH ADMIN
+// =========================
+function extractBearerToken(req) {
+  const auth = String(req.headers.authorization || "").trim();
+
+  if (!auth.startsWith("Bearer ")) {
+    return "";
   }
 
-  next();
+  return auth.slice(7).trim();
+}
+
+async function requireAdminAuth(req, res, next) {
+  try {
+    const token = extractBearerToken(req);
+
+    if (token) {
+      const payload = jwt.verify(token, JWT_SECRET);
+
+      if (payload.type !== "admin" || payload.role !== "admin") {
+        return res.status(401).json({ error: "Acesso não autorizado" });
+      }
+
+      const admin = await getAdminById(payload.sub);
+
+      if (!admin || !admin.ativo) {
+        return res.status(401).json({ error: "Acesso não autorizado" });
+      }
+
+      req.admin = {
+        id: admin.id,
+        email: admin.email,
+        role: admin.role
+      };
+
+      return next();
+    }
+
+    // Compatibilidade temporária com x-admin-key
+    const adminKey = String(req.headers["x-admin-key"] || "").trim();
+
+    if (ADMIN_KEY && adminKey && adminKey === ADMIN_KEY) {
+      req.admin = {
+        id: "legacy-admin-key",
+        email: "legacy@local",
+        role: "admin"
+      };
+      return next();
+    }
+
+    return res.status(401).json({ error: "Acesso não autorizado" });
+  } catch {
+    return res.status(401).json({ error: "Acesso não autorizado" });
+  }
 }
 
 // =========================
@@ -335,6 +481,71 @@ app.get("/", (req, res) => {
     ok: true,
     message: "Sigmo backend online"
   });
+});
+
+// =========================
+// ADMIN LOGIN SEGURO
+// =========================
+app.post("/admin/login", adminLoginLimiter, async (req, res) => {
+  try {
+    const { email, senha } = req.body;
+
+    if (!email || !senha) {
+      return res.status(400).json({ error: "Email e senha são obrigatórios" });
+    }
+
+    const admin = await getAdminByEmail(email);
+
+    if (!admin || !admin.ativo) {
+      return res.status(401).json({ error: "Login admin inválido" });
+    }
+
+    const senhaOk = await bcrypt.compare(String(senha), String(admin.senha));
+
+    if (!senhaOk) {
+      return res.status(401).json({ error: "Login admin inválido" });
+    }
+
+    await pool.query(
+      "UPDATE admins SET ultimo_login_em = $1 WHERE id = $2",
+      [new Date().toISOString(), admin.id]
+    );
+
+    const token = signAdminToken(admin);
+
+    return res.json({
+      token,
+      admin: {
+        id: admin.id,
+        nome: admin.nome || "Administrador",
+        email: admin.email,
+        role: admin.role || "admin"
+      }
+    });
+  } catch (error) {
+    console.error(error);
+    return res.status(500).json({ error: "Erro no login admin" });
+  }
+});
+
+app.get("/admin/me", requireAdminAuth, async (req, res) => {
+  try {
+    const admin = await getAdminById(req.admin.id);
+
+    if (!admin) {
+      return res.status(404).json({ error: "Admin não encontrado" });
+    }
+
+    return res.json({
+      id: admin.id,
+      nome: admin.nome || "Administrador",
+      email: admin.email,
+      role: admin.role || "admin"
+    });
+  } catch (error) {
+    console.error(error);
+    return res.status(500).json({ error: "Erro ao buscar admin" });
+  }
 });
 
 // =========================
@@ -667,7 +878,7 @@ app.get("/depositos/user/:id", async (req, res) => {
 // =========================
 // ADMIN - LISTAR USUÁRIOS
 // =========================
-app.get("/usuarios", requireAdmin, async (req, res) => {
+app.get("/usuarios", requireAdminAuth, async (req, res) => {
   try {
     const usuarios = await listUsers();
 
@@ -689,7 +900,7 @@ app.get("/usuarios", requireAdmin, async (req, res) => {
 // =========================
 // ADMIN - LISTAR PEDIDOS
 // =========================
-app.get("/depositos", requireAdmin, async (req, res) => {
+app.get("/depositos", requireAdminAuth, async (req, res) => {
   try {
     const pedidos = await listDepositos();
     return res.json(pedidos);
@@ -702,7 +913,7 @@ app.get("/depositos", requireAdmin, async (req, res) => {
 // =========================
 // ADMIN - APROVAR PEDIDO
 // =========================
-app.post("/aprovar", requireAdmin, async (req, res) => {
+app.post("/aprovar", requireAdminAuth, async (req, res) => {
   try {
     const { depositoId } = req.body;
 
@@ -766,7 +977,7 @@ app.post("/aprovar", requireAdmin, async (req, res) => {
 // =========================
 // ADMIN - RECUSAR PEDIDO
 // =========================
-app.post("/recusar", requireAdmin, async (req, res) => {
+app.post("/recusar", requireAdminAuth, async (req, res) => {
   try {
     const { depositoId } = req.body;
 
@@ -806,7 +1017,7 @@ app.post("/recusar", requireAdmin, async (req, res) => {
 // =========================
 // ADMIN - AJUSTAR SALDO
 // =========================
-app.post("/admin/update-balance", requireAdmin, async (req, res) => {
+app.post("/admin/update-balance", requireAdminAuth, async (req, res) => {
   try {
     const { userId, saldo } = req.body;
 
@@ -848,7 +1059,7 @@ app.post("/admin/update-balance", requireAdmin, async (req, res) => {
 // =========================
 // ADMIN - RESETAR SENHA
 // =========================
-app.post("/admin/reset-password", requireAdmin, async (req, res) => {
+app.post("/admin/reset-password", requireAdminAuth, async (req, res) => {
   try {
     const { userId, novaSenha } = req.body;
 
