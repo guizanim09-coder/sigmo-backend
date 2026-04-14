@@ -11,7 +11,6 @@ const { Pool } = require("pg");
 
 const app = express();
 
-// CORREÇÃO RAILWAY
 app.set("trust proxy", 1);
 
 const PORT = process.env.PORT || 3000;
@@ -19,7 +18,8 @@ const DATABASE_URL = String(process.env.DATABASE_URL || "").trim();
 const JWT_SECRET = String(process.env.JWT_SECRET || "").trim();
 const ADMIN_EMAIL = String(process.env.ADMIN_EMAIL || "").trim().toLowerCase();
 const ADMIN_PASSWORD = String(process.env.ADMIN_PASSWORD || "").trim();
-const BACKUP_ENABLED = String(process.env.BACKUP_ENABLED || "true").trim().toLowerCase() !== "false";
+const BACKUP_ENABLED =
+  String(process.env.BACKUP_ENABLED || "true").trim().toLowerCase() !== "false";
 const BACKUP_INTERVAL_HOURS = Number(process.env.BACKUP_INTERVAL_HOURS || 24);
 const BACKUP_RETENTION_DAYS = Number(process.env.BACKUP_RETENTION_DAYS || 7);
 const BACKUP_INITIAL_DELAY_MS = Number(process.env.BACKUP_INITIAL_DELAY_MS || 30000);
@@ -35,15 +35,14 @@ if (!JWT_SECRET) {
   process.exit(1);
 }
 
-// =========================
-// POSTGRES
-// =========================
 const pool = new Pool({
   connectionString: DATABASE_URL,
   ssl: { rejectUnauthorized: false }
 });
 
-const BACKUPS_DIR = BACKUP_DIR ? path.resolve(BACKUP_DIR) : path.join(__dirname, "backups");
+const BACKUPS_DIR = BACKUP_DIR
+  ? path.resolve(BACKUP_DIR)
+  : path.join(__dirname, "backups");
 
 if (!fs.existsSync(BACKUPS_DIR)) {
   fs.mkdirSync(BACKUPS_DIR, { recursive: true });
@@ -146,10 +145,22 @@ async function createDatabaseBackup(trigger = "automatic") {
     try {
       await client.query("BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ");
 
-      const [usuarios, depositos, admins] = await Promise.all([
+      const [
+        usuarios,
+        depositos,
+        admins,
+        financialTransactions,
+        ledgerEntries,
+        auditLogs
+      ] = await Promise.all([
         client.query("SELECT * FROM usuarios ORDER BY criado_em ASC NULLS LAST, id ASC"),
         client.query("SELECT * FROM depositos ORDER BY criado_em ASC NULLS LAST, id ASC"),
-        client.query("SELECT * FROM admins ORDER BY criado_em ASC NULLS LAST, id ASC")
+        client.query("SELECT * FROM admins ORDER BY criado_em ASC NULLS LAST, id ASC"),
+        client.query(
+          "SELECT * FROM financial_transactions ORDER BY created_at ASC NULLS LAST, id ASC"
+        ),
+        client.query("SELECT * FROM ledger_entries ORDER BY created_at ASC NULLS LAST, id ASC"),
+        client.query("SELECT * FROM audit_logs ORDER BY created_at ASC NULLS LAST, id ASC")
       ]);
 
       await client.query("COMMIT");
@@ -161,17 +172,23 @@ async function createDatabaseBackup(trigger = "automatic") {
         meta: {
           generatedAt: now.toISOString(),
           trigger,
-          version: 1,
+          version: 2,
           tables: {
             usuarios: usuarios.rowCount,
             depositos: depositos.rowCount,
-            admins: admins.rowCount
+            admins: admins.rowCount,
+            financial_transactions: financialTransactions.rowCount,
+            ledger_entries: ledgerEntries.rowCount,
+            audit_logs: auditLogs.rowCount
           }
         },
         data: {
           usuarios: usuarios.rows,
           depositos: depositos.rows,
-          admins: admins.rows
+          admins: admins.rows,
+          financial_transactions: financialTransactions.rows,
+          ledger_entries: ledgerEntries.rows,
+          audit_logs: auditLogs.rows
         }
       };
 
@@ -184,7 +201,7 @@ async function createDatabaseBackup(trigger = "automatic") {
       backupState.lastDurationMs = durationMs;
 
       console.log(
-        `[backup] concluído (${trigger}) arquivo=${fileName} usuarios=${usuarios.rowCount} depositos=${depositos.rowCount} admins=${admins.rowCount} removidos=${cleanup.removed}`
+        `[backup] concluído (${trigger}) arquivo=${fileName} usuarios=${usuarios.rowCount} depositos=${depositos.rowCount} admins=${admins.rowCount} tx=${financialTransactions.rowCount} ledger=${ledgerEntries.rowCount} audit=${auditLogs.rowCount} removidos=${cleanup.removed}`
       );
 
       return {
@@ -267,9 +284,49 @@ async function getBackupStatus() {
   };
 }
 
-// =========================
-// INIT DB
-// =========================
+function db(now = new Date()) {
+  return now.toISOString();
+}
+
+function normalizeEmail(email) {
+  return String(email || "").trim().toLowerCase();
+}
+
+function toMoney(value) {
+  const num = Number(value || 0);
+  if (!Number.isFinite(num)) return 0;
+  return Number(num.toFixed(2));
+}
+
+function buildId(prefix) {
+  return `${prefix}_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+}
+
+function getRequestIp(req) {
+  return (
+    req.headers["x-forwarded-for"]?.toString().split(",")[0].trim() ||
+    req.ip ||
+    req.socket?.remoteAddress ||
+    ""
+  );
+}
+
+async function runInTransaction(workFn) {
+  const client = await pool.connect();
+
+  try {
+    await client.query("BEGIN");
+    const result = await workFn(client);
+    await client.query("COMMIT");
+    return result;
+  } catch (error) {
+    await client.query("ROLLBACK");
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
 async function ensureColumn(table, column, definition) {
   const check = await pool.query(
     `
@@ -283,6 +340,22 @@ async function ensureColumn(table, column, definition) {
 
   if (check.rows.length === 0) {
     await pool.query(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
+  }
+}
+
+async function ensureIndex(indexName, sql) {
+  const check = await pool.query(
+    `
+    SELECT 1
+    FROM pg_indexes
+    WHERE schemaname = 'public' AND indexname = $1
+    LIMIT 1
+    `,
+    [indexName]
+  );
+
+  if (check.rows.length === 0) {
+    await pool.query(sql);
   }
 }
 
@@ -333,13 +406,71 @@ async function initDB() {
     );
   `);
 
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS financial_transactions (
+      id TEXT PRIMARY KEY,
+      user_id TEXT NOT NULL,
+      reference_key TEXT UNIQUE NOT NULL,
+      source_type TEXT NOT NULL,
+      source_id TEXT NOT NULL,
+      operation_type TEXT NOT NULL,
+      direction TEXT NOT NULL,
+      amount NUMERIC NOT NULL DEFAULT 0,
+      status TEXT NOT NULL DEFAULT 'completed',
+      description TEXT DEFAULT '',
+      metadata JSONB DEFAULT '{}'::jsonb,
+      created_at TIMESTAMP,
+      updated_at TIMESTAMP
+    );
+  `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS ledger_entries (
+      id TEXT PRIMARY KEY,
+      user_id TEXT NOT NULL,
+      financial_transaction_id TEXT NOT NULL,
+      entry_type TEXT NOT NULL,
+      amount NUMERIC NOT NULL DEFAULT 0,
+      balance_before NUMERIC NOT NULL DEFAULT 0,
+      balance_after NUMERIC NOT NULL DEFAULT 0,
+      description TEXT DEFAULT '',
+      metadata JSONB DEFAULT '{}'::jsonb,
+      created_at TIMESTAMP
+    );
+  `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS audit_logs (
+      id TEXT PRIMARY KEY,
+      admin_id TEXT,
+      action TEXT NOT NULL,
+      target_type TEXT NOT NULL,
+      target_id TEXT NOT NULL,
+      details JSONB DEFAULT '{}'::jsonb,
+      ip_address TEXT DEFAULT '',
+      created_at TIMESTAMP
+    );
+  `);
+
+  await ensureIndex(
+    "idx_financial_transactions_user_id",
+    "CREATE INDEX idx_financial_transactions_user_id ON financial_transactions (user_id)"
+  );
+
+  await ensureIndex(
+    "idx_ledger_entries_user_id",
+    "CREATE INDEX idx_ledger_entries_user_id ON ledger_entries (user_id)"
+  );
+
+  await ensureIndex(
+    "idx_audit_logs_admin_id",
+    "CREATE INDEX idx_audit_logs_admin_id ON audit_logs (admin_id)"
+  );
+
   await ensureAdmin();
   console.log("Banco pronto");
 }
 
-// =========================
-// ADMIN AUTO
-// =========================
 async function ensureAdmin() {
   if (!ADMIN_EMAIL || !ADMIN_PASSWORD) {
     console.log("ADMIN_EMAIL ou ADMIN_PASSWORD ausentes.");
@@ -362,13 +493,13 @@ async function ensureAdmin() {
       VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
       `,
       [
-        "admin_" + Date.now(),
+        buildId("admin"),
         ADMIN_EMAIL,
         hash,
         "Administrador",
         "admin",
         true,
-        new Date().toISOString(),
+        db(),
         null
       ]
     );
@@ -389,18 +520,17 @@ async function ensureAdmin() {
   }
 }
 
-// =========================
-// SEGURANÇA
-// =========================
 app.use(helmet());
 app.use(express.json());
 
-app.use(rateLimit({
-  windowMs: 60 * 1000,
-  max: 120,
-  standardHeaders: true,
-  legacyHeaders: false
-}));
+app.use(
+  rateLimit({
+    windowMs: 60 * 1000,
+    max: 120,
+    standardHeaders: true,
+    legacyHeaders: false
+  })
+);
 
 const loginLimiter = rateLimit({
   windowMs: 60 * 1000,
@@ -418,9 +548,6 @@ const adminLoginLimiter = rateLimit({
   message: { error: "Muitas tentativas admin. Aguarde 1 minuto." }
 });
 
-// =========================
-// CORS
-// =========================
 const allowedOrigins = [
   /^https:\/\/.*\.netlify\.app$/,
   "http://localhost:3000",
@@ -429,28 +556,27 @@ const allowedOrigins = [
   "http://127.0.0.1:5173"
 ];
 
-app.use(cors({
-  origin(origin, callback) {
-    if (!origin) return callback(null, true);
+app.use(
+  cors({
+    origin(origin, callback) {
+      if (!origin) return callback(null, true);
 
-    const permitido = allowedOrigins.some((item) => {
-      if (item instanceof RegExp) return item.test(origin);
-      return item === origin;
-    });
+      const permitido = allowedOrigins.some((item) => {
+        if (item instanceof RegExp) return item.test(origin);
+        return item === origin;
+      });
 
-    if (permitido) return callback(null, true);
+      if (permitido) return callback(null, true);
 
-    return callback(new Error("Origem não permitida pelo CORS"));
-  },
-  methods: ["GET", "POST", "OPTIONS"],
-  allowedHeaders: ["Content-Type", "Authorization"]
-}));
+      return callback(new Error("Origem não permitida pelo CORS"));
+    },
+    methods: ["GET", "POST", "OPTIONS"],
+    allowedHeaders: ["Content-Type", "Authorization"]
+  })
+);
 
 app.options("*", cors());
 
-// =========================
-// UPLOAD
-// =========================
 const UPLOADS_DIR = path.join(__dirname, "uploads");
 
 if (!fs.existsSync(UPLOADS_DIR)) {
@@ -463,7 +589,7 @@ const storage = multer.diskStorage({
   destination: (_, __, cb) => cb(null, UPLOADS_DIR),
   filename: (_, file, cb) => {
     const ext = path.extname(file.originalname || "");
-    cb(null, "comp_" + Date.now() + ext);
+    cb(null, `comp_${Date.now()}${ext}`);
   }
 });
 
@@ -478,13 +604,6 @@ const upload = multer({
     cb(null, true);
   }
 });
-
-// =========================
-// HELPERS
-// =========================
-function normalizeEmail(email) {
-  return String(email || "").trim().toLowerCase();
-}
 
 function signToken(admin) {
   return jwt.sign(
@@ -507,7 +626,7 @@ function mapUser(row) {
     nome: row.nome || row.email?.split("@")[0] || "",
     email: row.email,
     senha: row.senha,
-    saldo: Number(row.saldo || 0),
+    saldo: toMoney(row.saldo),
     criadoEm: row.criado_em || null,
     nomeAtualizadoEm: row.nome_atualizado_em || null,
     saldoAtualizadoEm: row.saldo_atualizado_em || null,
@@ -521,7 +640,7 @@ function mapDeposito(row) {
   return {
     id: row.id,
     userId: row.user_id,
-    valor: Number(row.valor || 0),
+    valor: toMoney(row.valor),
     chavePix: row.chave_pix || "",
     tipoChave: row.tipo_chave || "",
     tipoTransacao: row.tipo_transacao || "entrada",
@@ -535,16 +654,61 @@ function mapDeposito(row) {
   };
 }
 
-async function getUserById(id) {
-  const result = await pool.query(
+function mapFinancialTransaction(row) {
+  if (!row) return null;
+
+  return {
+    id: row.id,
+    userId: row.user_id,
+    referenceKey: row.reference_key,
+    sourceType: row.source_type,
+    sourceId: row.source_id,
+    operationType: row.operation_type,
+    direction: row.direction,
+    amount: toMoney(row.amount),
+    status: row.status,
+    description: row.description || "",
+    metadata: row.metadata || {},
+    createdAt: row.created_at || null,
+    updatedAt: row.updated_at || null
+  };
+}
+
+function mapLedgerEntry(row) {
+  if (!row) return null;
+
+  return {
+    id: row.id,
+    userId: row.user_id,
+    financialTransactionId: row.financial_transaction_id,
+    entryType: row.entry_type,
+    amount: toMoney(row.amount),
+    balanceBefore: toMoney(row.balance_before),
+    balanceAfter: toMoney(row.balance_after),
+    description: row.description || "",
+    metadata: row.metadata || {},
+    createdAt: row.created_at || null
+  };
+}
+
+async function getUserById(id, client = pool) {
+  const result = await client.query(
     "SELECT * FROM usuarios WHERE id = $1 LIMIT 1",
     [id]
   );
   return mapUser(result.rows[0]);
 }
 
-async function getUserByEmail(email) {
-  const result = await pool.query(
+async function getUserByIdForUpdate(id, client) {
+  const result = await client.query(
+    "SELECT * FROM usuarios WHERE id = $1 LIMIT 1 FOR UPDATE",
+    [id]
+  );
+  return mapUser(result.rows[0]);
+}
+
+async function getUserByEmail(email, client = pool) {
+  const result = await client.query(
     "SELECT * FROM usuarios WHERE email = $1 LIMIT 1",
     [normalizeEmail(email)]
   );
@@ -558,8 +722,8 @@ async function listUsers() {
   return result.rows.map(mapUser);
 }
 
-async function saveUser(user) {
-  await pool.query(
+async function saveUser(user, client = pool) {
+  await client.query(
     `
     INSERT INTO usuarios (
       id, nome, email, senha, saldo, criado_em,
@@ -581,8 +745,8 @@ async function saveUser(user) {
       user.nome || "",
       normalizeEmail(user.email),
       user.senha,
-      Number(user.saldo || 0),
-      user.criadoEm || new Date().toISOString(),
+      toMoney(user.saldo),
+      user.criadoEm || db(),
       user.nomeAtualizadoEm || null,
       user.saldoAtualizadoEm || null,
       user.senhaAtualizadaEm || null
@@ -590,9 +754,17 @@ async function saveUser(user) {
   );
 }
 
-async function getDepositoById(id) {
-  const result = await pool.query(
+async function getDepositoById(id, client = pool) {
+  const result = await client.query(
     "SELECT * FROM depositos WHERE id = $1 LIMIT 1",
+    [id]
+  );
+  return mapDeposito(result.rows[0]);
+}
+
+async function getDepositoByIdForUpdate(id, client) {
+  const result = await client.query(
+    "SELECT * FROM depositos WHERE id = $1 LIMIT 1 FOR UPDATE",
     [id]
   );
   return mapDeposito(result.rows[0]);
@@ -613,8 +785,8 @@ async function listDepositosByUser(userId) {
   return result.rows.map(mapDeposito);
 }
 
-async function saveDeposito(dep) {
-  await pool.query(
+async function saveDeposito(dep, client = pool) {
+  await client.query(
     `
     INSERT INTO depositos (
       id, user_id, valor, chave_pix, tipo_chave, tipo_transacao, status,
@@ -638,14 +810,14 @@ async function saveDeposito(dep) {
     [
       dep.id,
       dep.userId,
-      Number(dep.valor || 0),
+      toMoney(dep.valor),
       dep.chavePix || "",
       dep.tipoChave || "",
       dep.tipoTransacao || "entrada",
       dep.status || "pendente",
       dep.comprovanteUrl || "",
       dep.descricao || "",
-      dep.criadoEm || new Date().toISOString(),
+      dep.criadoEm || db(),
       dep.aprovadoEm || null,
       dep.recusadoEm || null,
       dep.comprovanteEnviadoEm || null
@@ -669,9 +841,187 @@ async function getAdminById(id) {
   return result.rows[0] || null;
 }
 
-// =========================
-// AUTH ADMIN
-// =========================
+async function listFinancialTransactionsByUser(userId) {
+  const result = await pool.query(
+    `
+    SELECT * FROM financial_transactions
+    WHERE user_id = $1
+    ORDER BY created_at DESC NULLS LAST, id DESC
+    `,
+    [userId]
+  );
+  return result.rows.map(mapFinancialTransaction);
+}
+
+async function listLedgerEntriesByUser(userId) {
+  const result = await pool.query(
+    `
+    SELECT * FROM ledger_entries
+    WHERE user_id = $1
+    ORDER BY created_at DESC NULLS LAST, id DESC
+    `,
+    [userId]
+  );
+  return result.rows.map(mapLedgerEntry);
+}
+
+async function createAuditLog(
+  client,
+  {
+    adminId = null,
+    action,
+    targetType,
+    targetId,
+    details = {},
+    ipAddress = ""
+  }
+) {
+  await client.query(
+    `
+    INSERT INTO audit_logs (
+      id, admin_id, action, target_type, target_id, details, ip_address, created_at
+    )
+    VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+    `,
+    [
+      buildId("audit"),
+      adminId,
+      action,
+      targetType,
+      targetId,
+      JSON.stringify(details || {}),
+      ipAddress || "",
+      db()
+    ]
+  );
+}
+
+async function createFinancialTransaction(
+  client,
+  {
+    userId,
+    referenceKey,
+    sourceType,
+    sourceId,
+    operationType,
+    direction,
+    amount,
+    status = "completed",
+    description = "",
+    metadata = {}
+  }
+) {
+  const existing = await client.query(
+    `
+    SELECT * FROM financial_transactions
+    WHERE reference_key = $1
+    LIMIT 1
+    `,
+    [referenceKey]
+  );
+
+  if (existing.rows.length > 0) {
+    return mapFinancialTransaction(existing.rows[0]);
+  }
+
+  const now = db();
+  const result = await client.query(
+    `
+    INSERT INTO financial_transactions (
+      id, user_id, reference_key, source_type, source_id,
+      operation_type, direction, amount, status, description, metadata,
+      created_at, updated_at
+    )
+    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+    RETURNING *
+    `,
+    [
+      buildId("ftx"),
+      userId,
+      referenceKey,
+      sourceType,
+      sourceId,
+      operationType,
+      direction,
+      toMoney(amount),
+      status,
+      description,
+      JSON.stringify(metadata || {}),
+      now,
+      now
+    ]
+  );
+
+  return mapFinancialTransaction(result.rows[0]);
+}
+
+async function applyLedgerChange(
+  client,
+  {
+    userId,
+    financialTransactionId,
+    entryType,
+    amount,
+    description = "",
+    metadata = {}
+  }
+) {
+  const user = await getUserByIdForUpdate(userId, client);
+
+  if (!user) {
+    throw new Error("Usuário não encontrado");
+  }
+
+  const value = toMoney(amount);
+
+  if (!Number.isFinite(value) || value <= 0) {
+    throw new Error("Valor inválido para ledger");
+  }
+
+  const balanceBefore = toMoney(user.saldo);
+  let balanceAfter = balanceBefore;
+
+  if (entryType === "credit") {
+    balanceAfter = toMoney(balanceBefore + value);
+  } else if (entryType === "debit") {
+    if (balanceBefore < value) {
+      throw new Error("Saldo insuficiente");
+    }
+    balanceAfter = toMoney(balanceBefore - value);
+  } else {
+    throw new Error("Tipo de lançamento inválido");
+  }
+
+  await client.query(
+    `
+    INSERT INTO ledger_entries (
+      id, user_id, financial_transaction_id, entry_type, amount,
+      balance_before, balance_after, description, metadata, created_at
+    )
+    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+    `,
+    [
+      buildId("ledger"),
+      userId,
+      financialTransactionId,
+      entryType,
+      value,
+      balanceBefore,
+      balanceAfter,
+      description,
+      JSON.stringify(metadata || {}),
+      db()
+    ]
+  );
+
+  user.saldo = balanceAfter;
+  user.saldoAtualizadoEm = db();
+
+  await saveUser(user, client);
+
+  return user;
+}
+
 function authAdmin(req, res, next) {
   try {
     const auth = String(req.headers.authorization || "").trim();
@@ -694,16 +1044,10 @@ function authAdmin(req, res, next) {
   }
 }
 
-// =========================
-// HEALTH
-// =========================
 app.get("/", (req, res) => {
   res.json({ ok: true });
 });
 
-// =========================
-// LOGIN ADMIN
-// =========================
 app.post("/admin/login", adminLoginLimiter, async (req, res) => {
   try {
     const { email, senha } = req.body;
@@ -726,7 +1070,7 @@ app.post("/admin/login", adminLoginLimiter, async (req, res) => {
 
     await pool.query(
       "UPDATE admins SET ultimo_login_em = $1 WHERE id = $2",
-      [new Date().toISOString(), admin.id]
+      [db(), admin.id]
     );
 
     const token = signToken(admin);
@@ -737,9 +1081,6 @@ app.post("/admin/login", adminLoginLimiter, async (req, res) => {
   }
 });
 
-// =========================
-// REGISTER
-// =========================
 app.post("/register", async (req, res) => {
   try {
     const { email, senha } = req.body;
@@ -762,12 +1103,12 @@ app.post("/register", async (req, res) => {
     const hash = await bcrypt.hash(String(senha), 10);
 
     const novoUsuario = {
-      id: "user_" + Date.now(),
+      id: buildId("user"),
       nome: emailNorm.split("@")[0],
       email: emailNorm,
       senha: hash,
       saldo: 0,
-      criadoEm: new Date().toISOString(),
+      criadoEm: db(),
       nomeAtualizadoEm: null,
       saldoAtualizadoEm: null,
       senhaAtualizadaEm: null
@@ -788,9 +1129,6 @@ app.post("/register", async (req, res) => {
   }
 });
 
-// =========================
-// LOGIN USUÁRIO
-// =========================
 app.post("/login", loginLimiter, async (req, res) => {
   try {
     const { email, senha } = req.body;
@@ -815,7 +1153,7 @@ app.post("/login", loginLimiter, async (req, res) => {
       id: user.id,
       nome: user.nome,
       email: user.email,
-      saldo: Number(user.saldo || 0),
+      saldo: toMoney(user.saldo),
       criadoEm: user.criadoEm || null
     });
   } catch (error) {
@@ -824,9 +1162,6 @@ app.post("/login", loginLimiter, async (req, res) => {
   }
 });
 
-// =========================
-// USUÁRIO
-// =========================
 app.get("/usuario/:id", async (req, res) => {
   try {
     const user = await getUserById(req.params.id);
@@ -839,7 +1174,7 @@ app.get("/usuario/:id", async (req, res) => {
       id: user.id,
       nome: user.nome,
       email: user.email,
-      saldo: Number(user.saldo || 0),
+      saldo: toMoney(user.saldo),
       criadoEm: user.criadoEm || null
     });
   } catch (error) {
@@ -863,7 +1198,7 @@ app.post("/usuario/update-nome", async (req, res) => {
     }
 
     user.nome = String(nome).trim();
-    user.nomeAtualizadoEm = new Date().toISOString();
+    user.nomeAtualizadoEm = db();
 
     await saveUser(user);
 
@@ -874,9 +1209,6 @@ app.post("/usuario/update-nome", async (req, res) => {
   }
 });
 
-// =========================
-// DEPÓSITOS
-// =========================
 app.post("/deposito", async (req, res) => {
   try {
     const { userId, valor, chavePix, tipoChave, tipoTransacao } = req.body;
@@ -885,7 +1217,7 @@ app.post("/deposito", async (req, res) => {
       return res.status(400).json({ error: "userId e valor são obrigatórios" });
     }
 
-    const valorNumero = Number(valor);
+    const valorNumero = toMoney(valor);
 
     if (!Number.isFinite(valorNumero) || valorNumero <= 0) {
       return res.status(400).json({ error: "Valor inválido" });
@@ -898,7 +1230,7 @@ app.post("/deposito", async (req, res) => {
     }
 
     const pedido = {
-      id: "dep_" + Date.now(),
+      id: buildId("dep"),
       userId,
       valor: valorNumero,
       chavePix: chavePix || "",
@@ -907,7 +1239,7 @@ app.post("/deposito", async (req, res) => {
       status: "pendente",
       comprovanteUrl: "",
       descricao: "",
-      criadoEm: new Date().toISOString(),
+      criadoEm: db(),
       aprovadoEm: null,
       recusadoEm: null,
       comprovanteEnviadoEm: null
@@ -935,7 +1267,7 @@ app.post("/deposito/:id/comprovante", upload.single("comprovante"), async (req, 
     }
 
     pedido.comprovanteUrl = "/uploads/" + req.file.filename;
-    pedido.comprovanteEnviadoEm = new Date().toISOString();
+    pedido.comprovanteEnviadoEm = db();
 
     await saveDeposito(pedido);
 
@@ -959,9 +1291,6 @@ app.get("/depositos/user/:id", async (req, res) => {
   }
 });
 
-// =========================
-// TRANSFERÊNCIA INTERNA
-// =========================
 app.post("/transferir-sigmo", async (req, res) => {
   try {
     const { fromUserId, emailDestino, valor } = req.body;
@@ -970,96 +1299,160 @@ app.post("/transferir-sigmo", async (req, res) => {
       return res.status(400).json({ error: "Dados obrigatórios" });
     }
 
-    const valorNum = Number(valor);
+    const valorNum = toMoney(valor);
 
     if (!Number.isFinite(valorNum) || valorNum <= 0) {
       return res.status(400).json({ error: "Valor inválido" });
     }
 
-    const remetente = await getUserById(fromUserId);
-    const destino = await getUserByEmail(emailDestino);
+    const result = await runInTransaction(async (client) => {
+      const remetente = await getUserByIdForUpdate(fromUserId, client);
+      const destino = await getUserByEmail(emailDestino, client);
 
-    if (!remetente) {
-      return res.status(404).json({ error: "Remetente não encontrado" });
-    }
+      if (!remetente) {
+        throw new Error("Remetente não encontrado");
+      }
 
-    if (!destino) {
-      return res.status(404).json({ error: "Usuário destino não encontrado" });
-    }
+      if (!destino) {
+        throw new Error("Usuário destino não encontrado");
+      }
 
-    if (remetente.id === destino.id) {
-      return res.status(400).json({ error: "Não pode transferir para si mesmo" });
-    }
+      if (remetente.id === destino.id) {
+        throw new Error("Não pode transferir para si mesmo");
+      }
 
-    if (Number(remetente.saldo || 0) < valorNum) {
-      return res.status(400).json({ error: "Saldo insuficiente" });
-    }
+      if (toMoney(remetente.saldo) < valorNum) {
+        throw new Error("Saldo insuficiente");
+      }
 
-    remetente.saldo = Number(remetente.saldo || 0) - valorNum;
-    destino.saldo = Number(destino.saldo || 0) + valorNum;
-    remetente.saldoAtualizadoEm = new Date().toISOString();
-    destino.saldoAtualizadoEm = new Date().toISOString();
+      const transferId = buildId("transfer");
+      const now = db();
 
-    await saveUser(remetente);
-    await saveUser(destino);
+      const txSaida = await createFinancialTransaction(client, {
+        userId: remetente.id,
+        referenceKey: `transfer:${transferId}:debit`,
+        sourceType: "transfer",
+        sourceId: transferId,
+        operationType: "transfer_out",
+        direction: "debit",
+        amount: valorNum,
+        status: "completed",
+        description: `Transferência enviada para ${destino.email}`,
+        metadata: {
+          fromUserId: remetente.id,
+          toUserId: destino.id,
+          toEmail: destino.email
+        }
+      });
 
-    const agora = new Date().toISOString();
+      const remetenteAtualizado = await applyLedgerChange(client, {
+        userId: remetente.id,
+        financialTransactionId: txSaida.id,
+        entryType: "debit",
+        amount: valorNum,
+        description: `Transferência enviada para ${destino.email}`,
+        metadata: {
+          transferId,
+          counterpartUserId: destino.id,
+          counterpartEmail: destino.email
+        }
+      });
 
-    await saveDeposito({
-      id: "dep_" + Date.now(),
-      userId: remetente.id,
-      valor: valorNum,
-      chavePix: "",
-      tipoChave: "",
-      tipoTransacao: "saida",
-      status: "aprovado",
-      comprovanteUrl: "",
-      descricao: `Transferência enviada para ${destino.email}`,
-      criadoEm: agora,
-      aprovadoEm: agora,
-      recusadoEm: null,
-      comprovanteEnviadoEm: null
-    });
+      const txEntrada = await createFinancialTransaction(client, {
+        userId: destino.id,
+        referenceKey: `transfer:${transferId}:credit`,
+        sourceType: "transfer",
+        sourceId: transferId,
+        operationType: "transfer_in",
+        direction: "credit",
+        amount: valorNum,
+        status: "completed",
+        description: `Transferência recebida de ${remetente.email}`,
+        metadata: {
+          fromUserId: remetente.id,
+          fromEmail: remetente.email,
+          toUserId: destino.id
+        }
+      });
 
-    await saveDeposito({
-      id: "dep_" + (Date.now() + 1),
-      userId: destino.id,
-      valor: valorNum,
-      chavePix: "",
-      tipoChave: "",
-      tipoTransacao: "entrada",
-      status: "aprovado",
-      comprovanteUrl: "",
-      descricao: `Transferência recebida de ${remetente.email}`,
-      criadoEm: agora,
-      aprovadoEm: agora,
-      recusadoEm: null,
-      comprovanteEnviadoEm: null
+      await applyLedgerChange(client, {
+        userId: destino.id,
+        financialTransactionId: txEntrada.id,
+        entryType: "credit",
+        amount: valorNum,
+        description: `Transferência recebida de ${remetente.email}`,
+        metadata: {
+          transferId,
+          counterpartUserId: remetente.id,
+          counterpartEmail: remetente.email
+        }
+      });
+
+      await saveDeposito(
+        {
+          id: buildId("dep"),
+          userId: remetente.id,
+          valor: valorNum,
+          chavePix: "",
+          tipoChave: "",
+          tipoTransacao: "saida",
+          status: "aprovado",
+          comprovanteUrl: "",
+          descricao: `Transferência enviada para ${destino.email}`,
+          criadoEm: now,
+          aprovadoEm: now,
+          recusadoEm: null,
+          comprovanteEnviadoEm: null
+        },
+        client
+      );
+
+      await saveDeposito(
+        {
+          id: buildId("dep"),
+          userId: destino.id,
+          valor: valorNum,
+          chavePix: "",
+          tipoChave: "",
+          tipoTransacao: "entrada",
+          status: "aprovado",
+          comprovanteUrl: "",
+          descricao: `Transferência recebida de ${remetente.email}`,
+          criadoEm: now,
+          aprovadoEm: now,
+          recusadoEm: null,
+          comprovanteEnviadoEm: null
+        },
+        client
+      );
+
+      return {
+        saldoAtual: toMoney(remetenteAtualizado.saldo)
+      };
     });
 
     res.json({
       message: "Transferência realizada com sucesso",
-      saldoAtual: remetente.saldo
+      saldoAtual: result.saldoAtual
     });
   } catch (error) {
     console.error(error);
-    res.status(500).json({ error: "Erro na transferência" });
+    res.status(400).json({ error: error.message || "Erro na transferência" });
   }
 });
 
-// =========================
-// ADMIN
-// =========================
 app.get("/usuarios", authAdmin, async (req, res) => {
   try {
     const result = await listUsers();
-    res.json(result.map((u) => ({
-      id: u.id,
-      nome: u.nome,
-      email: u.email,
-      saldo: Number(u.saldo || 0),
-      criadoEm: u.criadoEm || null
-    })));
+    res.json(
+      result.map((u) => ({
+        id: u.id,
+        nome: u.nome,
+        email: u.email,
+        saldo: toMoney(u.saldo),
+        criadoEm: u.criadoEm || null
+      }))
+    );
   } catch (error) {
     console.error(error);
     res.status(500).json({ error: "Erro" });
@@ -1080,54 +1473,111 @@ app.post("/aprovar", authAdmin, async (req, res) => {
   try {
     const { depositoId } = req.body;
 
-    const pedido = await getDepositoById(depositoId);
-    if (!pedido) {
-      return res.status(404).json({ error: "Pedido não encontrado" });
+    if (!depositoId) {
+      return res.status(400).json({ error: "depositoId é obrigatório" });
     }
 
-    if (pedido.status === "aprovado") {
-      return res.status(400).json({ error: "Pedido já aprovado" });
-    }
+    const result = await runInTransaction(async (client) => {
+      const pedido = await getDepositoByIdForUpdate(depositoId, client);
 
-    if (pedido.status === "recusado") {
-      return res.status(400).json({ error: "Pedido já recusado" });
-    }
-
-    const usuario = await getUserById(pedido.userId);
-    if (!usuario) {
-      return res.status(404).json({ error: "Usuário não encontrado" });
-    }
-
-    if (pedido.tipoTransacao !== "saida" && !pedido.comprovanteUrl) {
-      return res.status(400).json({ error: "Sem comprovante" });
-    }
-
-    const valorPedido = Number(pedido.valor || 0);
-
-    if (pedido.tipoTransacao === "saida") {
-      if (Number(usuario.saldo || 0) < valorPedido) {
-        return res.status(400).json({ error: "Saldo insuficiente para aprovar saída" });
+      if (!pedido) {
+        throw new Error("Pedido não encontrado");
       }
-      usuario.saldo = Number(usuario.saldo || 0) - valorPedido;
-    } else {
-      usuario.saldo = Number(usuario.saldo || 0) + valorPedido;
-    }
 
-    usuario.saldoAtualizadoEm = new Date().toISOString();
-    pedido.status = "aprovado";
-    pedido.aprovadoEm = new Date().toISOString();
+      if (pedido.status === "aprovado") {
+        throw new Error("Pedido já aprovado");
+      }
 
-    await saveUser(usuario);
-    await saveDeposito(pedido);
+      if (pedido.status === "recusado") {
+        throw new Error("Pedido já recusado");
+      }
+
+      const usuario = await getUserByIdForUpdate(pedido.userId, client);
+
+      if (!usuario) {
+        throw new Error("Usuário não encontrado");
+      }
+
+      if (pedido.tipoTransacao !== "saida" && !pedido.comprovanteUrl) {
+        throw new Error("Sem comprovante");
+      }
+
+      const valorPedido = toMoney(pedido.valor);
+
+      if (!Number.isFinite(valorPedido) || valorPedido <= 0) {
+        throw new Error("Valor do pedido inválido");
+      }
+
+      const isSaida = pedido.tipoTransacao === "saida";
+      const operationType = isSaida ? "withdrawal" : "deposit";
+      const direction = isSaida ? "debit" : "credit";
+      const description = isSaida
+        ? "Saque aprovado pelo admin"
+        : "Depósito aprovado pelo admin";
+
+      const financialTx = await createFinancialTransaction(client, {
+        userId: usuario.id,
+        referenceKey: `deposito:${pedido.id}:approval`,
+        sourceType: "deposito",
+        sourceId: pedido.id,
+        operationType,
+        direction,
+        amount: valorPedido,
+        status: "completed",
+        description,
+        metadata: {
+          pedidoId: pedido.id,
+          tipoTransacao: pedido.tipoTransacao,
+          adminId: req.admin.sub
+        }
+      });
+
+      const usuarioAtualizado = await applyLedgerChange(client, {
+        userId: usuario.id,
+        financialTransactionId: financialTx.id,
+        entryType: isSaida ? "debit" : "credit",
+        amount: valorPedido,
+        description,
+        metadata: {
+          pedidoId: pedido.id,
+          tipoTransacao: pedido.tipoTransacao,
+          adminId: req.admin.sub
+        }
+      });
+
+      pedido.status = "aprovado";
+      pedido.aprovadoEm = db();
+
+      await saveDeposito(pedido, client);
+
+      await createAuditLog(client, {
+        adminId: req.admin.sub,
+        action: "approve_order",
+        targetType: "deposito",
+        targetId: pedido.id,
+        details: {
+          userId: usuario.id,
+          valor: valorPedido,
+          tipoTransacao: pedido.tipoTransacao,
+          saldoFinal: toMoney(usuarioAtualizado.saldo)
+        },
+        ipAddress: getRequestIp(req)
+      });
+
+      return {
+        pedido,
+        saldoAtual: toMoney(usuarioAtualizado.saldo)
+      };
+    });
 
     res.json({
       message: "Pedido aprovado com sucesso",
-      pedido,
-      saldoAtual: usuario.saldo
+      pedido: result.pedido,
+      saldoAtual: result.saldoAtual
     });
   } catch (error) {
     console.error(error);
-    res.status(500).json({ error: "Erro ao aprovar pedido" });
+    res.status(400).json({ error: error.message || "Erro ao aprovar pedido" });
   }
 });
 
@@ -1135,31 +1585,53 @@ app.post("/recusar", authAdmin, async (req, res) => {
   try {
     const { depositoId } = req.body;
 
-    const pedido = await getDepositoById(depositoId);
-    if (!pedido) {
-      return res.status(404).json({ error: "Pedido não encontrado" });
+    if (!depositoId) {
+      return res.status(400).json({ error: "depositoId é obrigatório" });
     }
 
-    if (pedido.status === "aprovado") {
-      return res.status(400).json({ error: "Pedido já aprovado, não pode recusar" });
-    }
+    const result = await runInTransaction(async (client) => {
+      const pedido = await getDepositoByIdForUpdate(depositoId, client);
 
-    if (pedido.status === "recusado") {
-      return res.status(400).json({ error: "Pedido já recusado" });
-    }
+      if (!pedido) {
+        throw new Error("Pedido não encontrado");
+      }
 
-    pedido.status = "recusado";
-    pedido.recusadoEm = new Date().toISOString();
+      if (pedido.status === "aprovado") {
+        throw new Error("Pedido já aprovado, não pode recusar");
+      }
 
-    await saveDeposito(pedido);
+      if (pedido.status === "recusado") {
+        throw new Error("Pedido já recusado");
+      }
+
+      pedido.status = "recusado";
+      pedido.recusadoEm = db();
+
+      await saveDeposito(pedido, client);
+
+      await createAuditLog(client, {
+        adminId: req.admin.sub,
+        action: "reject_order",
+        targetType: "deposito",
+        targetId: pedido.id,
+        details: {
+          userId: pedido.userId,
+          valor: toMoney(pedido.valor),
+          tipoTransacao: pedido.tipoTransacao
+        },
+        ipAddress: getRequestIp(req)
+      });
+
+      return { pedido };
+    });
 
     res.json({
       message: "Pedido recusado com sucesso",
-      pedido
+      pedido: result.pedido
     });
   } catch (error) {
     console.error(error);
-    res.status(500).json({ error: "Erro ao recusar pedido" });
+    res.status(400).json({ error: error.message || "Erro ao recusar pedido" });
   }
 });
 
@@ -1171,34 +1643,100 @@ app.post("/admin/update-balance", authAdmin, async (req, res) => {
       return res.status(400).json({ error: "userId e saldo são obrigatórios" });
     }
 
-    const usuario = await getUserById(userId);
-
-    if (!usuario) {
-      return res.status(404).json({ error: "Usuário não encontrado" });
-    }
-
-    const saldoNumero = Number(saldo);
+    const saldoNumero = toMoney(saldo);
 
     if (!Number.isFinite(saldoNumero) || saldoNumero < 0) {
       return res.status(400).json({ error: "Saldo inválido" });
     }
 
-    usuario.saldo = saldoNumero;
-    usuario.saldoAtualizadoEm = new Date().toISOString();
+    const result = await runInTransaction(async (client) => {
+      const usuario = await getUserByIdForUpdate(userId, client);
 
-    await saveUser(usuario);
+      if (!usuario) {
+        throw new Error("Usuário não encontrado");
+      }
+
+      const saldoAtual = toMoney(usuario.saldo);
+      const diferenca = toMoney(saldoNumero - saldoAtual);
+
+      if (diferenca === 0) {
+        return {
+          user: usuario,
+          changed: false
+        };
+      }
+
+      const isCredit = diferenca > 0;
+      const amount = Math.abs(diferenca);
+
+      const financialTx = await createFinancialTransaction(client, {
+        userId: usuario.id,
+        referenceKey: `manual-balance:${usuario.id}:${Date.now()}`,
+        sourceType: "admin_adjustment",
+        sourceId: usuario.id,
+        operationType: "manual_balance_adjustment",
+        direction: isCredit ? "credit" : "debit",
+        amount,
+        status: "completed",
+        description: `Ajuste manual de saldo por admin para ${saldoNumero.toFixed(2)}`,
+        metadata: {
+          oldBalance: saldoAtual,
+          newBalance: saldoNumero,
+          adminId: req.admin.sub
+        }
+      });
+
+      const usuarioAtualizado = await applyLedgerChange(client, {
+        userId: usuario.id,
+        financialTransactionId: financialTx.id,
+        entryType: isCredit ? "credit" : "debit",
+        amount,
+        description: `Ajuste manual de saldo por admin para ${saldoNumero.toFixed(2)}`,
+        metadata: {
+          oldBalance: saldoAtual,
+          newBalance: saldoNumero,
+          adminId: req.admin.sub
+        }
+      });
+
+      if (toMoney(usuarioAtualizado.saldo) !== saldoNumero) {
+        usuarioAtualizado.saldo = saldoNumero;
+        usuarioAtualizado.saldoAtualizadoEm = db();
+        await saveUser(usuarioAtualizado, client);
+      }
+
+      await createAuditLog(client, {
+        adminId: req.admin.sub,
+        action: "manual_balance_update",
+        targetType: "usuario",
+        targetId: usuario.id,
+        details: {
+          oldBalance: saldoAtual,
+          newBalance: saldoNumero,
+          difference: diferenca
+        },
+        ipAddress: getRequestIp(req)
+      });
+
+      return {
+        user: usuarioAtualizado,
+        changed: true
+      };
+    });
 
     res.json({
-      message: "Saldo atualizado com sucesso",
+      message: result.changed
+        ? "Saldo atualizado com sucesso"
+        : "Saldo já estava com este valor",
       user: {
-        id: usuario.id,
-        email: usuario.email,
-        saldo: usuario.saldo
+        id: result.user.id,
+        email: result.user.email,
+        saldo: toMoney(result.user.saldo)
       }
     });
   } catch (error) {
     console.error(error);
-    res.status(500).json({ error: "Erro ao atualizar saldo" });
+    res.status(400).json({ error: error.message || "Erro ao atualizar saldo" });
   }
 });
 
@@ -1217,9 +1755,22 @@ app.post("/admin/reset-password", authAdmin, async (req, res) => {
     }
 
     usuario.senha = await bcrypt.hash(String(novaSenha), 10);
-    usuario.senhaAtualizadaEm = new Date().toISOString();
+    usuario.senhaAtualizadaEm = db();
 
     await saveUser(usuario);
+
+    await runInTransaction(async (client) => {
+      await createAuditLog(client, {
+        adminId: req.admin.sub,
+        action: "reset_user_password",
+        targetType: "usuario",
+        targetId: usuario.id,
+        details: {
+          email: usuario.email
+        },
+        ipAddress: getRequestIp(req)
+      });
+    });
 
     res.json({ message: "Senha redefinida com sucesso" });
   } catch (error) {
@@ -1270,14 +1821,39 @@ app.post("/admin/backups/run", authAdmin, async (req, res) => {
   }
 });
 
-// =========================
-// START
-// =========================
+app.get("/admin/user/:id/ledger", authAdmin, async (req, res) => {
+  try {
+    const user = await getUserById(req.params.id);
+
+    if (!user) {
+      return res.status(404).json({ error: "Usuário não encontrado" });
+    }
+
+    const [transactions, ledger] = await Promise.all([
+      listFinancialTransactionsByUser(user.id),
+      listLedgerEntriesByUser(user.id)
+    ]);
+
+    res.json({
+      user: {
+        id: user.id,
+        email: user.email,
+        saldo: toMoney(user.saldo)
+      },
+      transactions,
+      ledger
+    });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: "Erro ao buscar ledger do usuário" });
+  }
+});
+
 initDB()
   .then(() => {
     startBackupScheduler();
     app.listen(PORT, () => {
-      console.log("Servidor rodando");
+      console.log(`Servidor rodando na porta ${PORT}`);
     });
   })
   .catch((error) => {
