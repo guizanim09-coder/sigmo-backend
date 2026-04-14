@@ -1849,6 +1849,91 @@ app.get("/admin/user/:id/ledger", authAdmin, async (req, res) => {
   }
 });
 
+// =========================
+// 🔥 COMPATIBILIDADE COM ADMIN.JS (MODAL USUÁRIO)
+// =========================
+
+// ALTERAR SALDO
+app.post("/admin/alterar-saldo", authAdmin, async (req, res) => {
+  try {
+    const { userId, valor } = req.body;
+
+    if (!userId || valor === undefined || valor === null) {
+      return res.status(400).json({ error: "userId e valor são obrigatórios" });
+    }
+
+    req.body = { userId, saldo: valor };
+
+    return app._router.handle(
+      { ...req, url: "/admin/update-balance", method: "POST" },
+      res
+    );
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: "Erro ao alterar saldo" });
+  }
+});
+
+// ALTERAR SENHA
+app.post("/admin/alterar-senha", authAdmin, async (req, res) => {
+  try {
+    const { userId, senha } = req.body;
+
+    if (!userId || !senha) {
+      return res.status(400).json({ error: "userId e senha são obrigatórios" });
+    }
+
+    req.body = { userId, novaSenha: senha };
+
+    return app._router.handle(
+      { ...req, url: "/admin/reset-password", method: "POST" },
+      res
+    );
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: "Erro ao alterar senha" });
+  }
+});
+
+// DELETAR USUÁRIO
+app.post("/admin/deletar-usuario", authAdmin, async (req, res) => {
+  try {
+    const { userId } = req.body;
+
+    if (!userId) {
+      return res.status(400).json({ error: "userId obrigatório" });
+    }
+
+    await runInTransaction(async (client) => {
+      const user = await getUserByIdForUpdate(userId, client);
+
+      if (!user) {
+        throw new Error("Usuário não encontrado");
+      }
+
+      await client.query("DELETE FROM usuarios WHERE id = $1", [userId]);
+
+      await createAuditLog(client, {
+        adminId: req.admin.sub,
+        action: "delete_user",
+        targetType: "usuario",
+        targetId: userId,
+        details: {
+          email: user.email
+        },
+        ipAddress: getRequestIp(req)
+      });
+    });
+
+    res.json({ message: "Usuário deletado com sucesso" });
+  } catch (error) {
+    console.error(error);
+    res.status(400).json({
+      error: error.message || "Erro ao deletar usuário"
+    });
+  }
+});
+
 initDB()
   .then(() => {
     startBackupScheduler();
