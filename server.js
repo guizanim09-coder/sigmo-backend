@@ -1366,15 +1366,6 @@ app.post("/deposito", async (req, res) => {
   }
 });
 
-    await saveDeposito(pedido);
-
-    res.status(201).json(pedido);
-  } catch (error) {
-    console.error(error);
-    res.status(500).json({ error: "Erro ao criar pedido" });
-  }
-});
-
 app.post("/deposito/:id/comprovante", upload.single("comprovante"), async (req, res) => {
   try {
     const pedido = await getDepositoById(req.params.id);
