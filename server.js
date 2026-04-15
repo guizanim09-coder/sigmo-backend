@@ -432,6 +432,7 @@ async function initDB() {
   await ensureColumn("depositos", "chave_pix", "TEXT DEFAULT ''");
   await ensureColumn("depositos", "tipo_chave", "TEXT DEFAULT ''");
   await ensureColumn("depositos", "descricao", "TEXT DEFAULT ''");
+await ensureColumn("depositos", "metadata", "JSONB DEFAULT '{}'::jsonb");
   await ensureColumn("depositos", "aprovado_em", "TIMESTAMP");
   await ensureColumn("depositos", "recusado_em", "TIMESTAMP");
   await ensureColumn("depositos", "comprovante_enviado_em", "TIMESTAMP");
@@ -690,6 +691,7 @@ function mapDeposito(row) {
     status: row.status || "pendente",
     comprovanteUrl: row.comprovante_url || "",
     descricao: row.descricao || "",
+    metadata: row.metadata || {},
     criadoEm: row.criado_em || null,
     aprovadoEm: row.aprovado_em || null,
     recusadoEm: row.recusado_em || null,
@@ -833,9 +835,9 @@ async function saveDeposito(dep, client = pool) {
     `
     INSERT INTO depositos (
       id, user_id, valor, chave_pix, tipo_chave, tipo_transacao, status,
-      comprovante_url, descricao, criado_em, aprovado_em, recusado_em, comprovante_enviado_em
+      comprovante_url, descricao, metadata, criado_em, aprovado_em, recusado_em, comprovante_enviado_em
     )
-    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
     ON CONFLICT (id) DO UPDATE SET
       user_id = EXCLUDED.user_id,
       valor = EXCLUDED.valor,
@@ -845,6 +847,7 @@ async function saveDeposito(dep, client = pool) {
       status = EXCLUDED.status,
       comprovante_url = EXCLUDED.comprovante_url,
       descricao = EXCLUDED.descricao,
+      metadata = EXCLUDED.metadata,
       criado_em = COALESCE(depositos.criado_em, EXCLUDED.criado_em),
       aprovado_em = EXCLUDED.aprovado_em,
       recusado_em = EXCLUDED.recusado_em,
@@ -860,6 +863,7 @@ async function saveDeposito(dep, client = pool) {
       dep.status || "pendente",
       dep.comprovanteUrl || "",
       dep.descricao || "",
+      JSON.stringify(dep.metadata || {}),
       dep.criadoEm || db(),
       dep.aprovadoEm || null,
       dep.recusadoEm || null,
@@ -1293,13 +1297,25 @@ app.post("/usuario/delete", async (req, res) => {
 
 app.post("/deposito", async (req, res) => {
   try {
-    const { userId, valor, chavePix, tipoChave, tipoTransacao } = req.body;
+    const { userId, valor, chavePix, tipoChave, tipoTransacao, repassarTaxa } = req.body;
 
     if (!userId || valor === undefined || valor === null) {
       return res.status(400).json({ error: "userId e valor são obrigatórios" });
     }
 
     const valorNumero = toMoney(valor);
+
+let valorFinal = valorNumero;
+
+if (tipoTransacao === "saida") {
+  if (repassarTaxa) {
+    // usuário paga 100 → destino recebe 91
+    valorFinal = toMoney(valorNumero * 0.91);
+  } else {
+    // usuário quer enviar 100 → saldo precisa de 109
+    valorFinal = valorNumero; // valor que vai pro destino
+  }
+}
 
     if (!Number.isFinite(valorNumero) || valorNumero <= 0) {
       return res.status(400).json({ error: "Valor inválido" });
@@ -1314,7 +1330,7 @@ app.post("/deposito", async (req, res) => {
     const pedido = {
       id: buildId("dep"),
       userId,
-      valor: valorNumero,
+      valor: valorFinal,
       chavePix: chavePix || "",
       tipoChave: tipoChave || "",
       tipoTransacao: tipoTransacao || "entrada",
@@ -1324,8 +1340,21 @@ app.post("/deposito", async (req, res) => {
       criadoEm: db(),
       aprovadoEm: null,
       recusadoEm: null,
-      comprovanteEnviadoEm: null
-    };
+      comprovanteEnviadoEm: null,
+
+metadata: {
+  valorOriginal: valorNumero,
+  descontoSaldo:
+    tipoTransacao === "saida"
+      ? (repassarTaxa ? valorNumero : toMoney(valorNumero * 1.09))
+      : valorNumero,
+  taxa:
+    tipoTransacao === "saida"
+      ? toMoney(valorNumero * 0.09)
+      : 0,
+  repassarTaxa: !!repassarTaxa
+}
+};
 
     await saveDeposito(pedido);
 
@@ -1585,7 +1614,12 @@ app.post("/aprovar", authAdmin, async (req, res) => {
       }
 
       const valorPedido = toMoney(pedido.valor);
-const valorFinal = calcularCreditoSigmo(valorPedido);
+
+let valorFinal = valorPedido;
+
+if (pedido.tipoTransacao === "entrada") {
+  valorFinal = calcularCreditoSigmo(valorPedido);
+}
 
       if (!Number.isFinite(valorPedido) || valorPedido <= 0) {
         throw new Error("Valor do pedido inválido");
@@ -1615,11 +1649,18 @@ const valorFinal = calcularCreditoSigmo(valorPedido);
         }
       });
 
-      const usuarioAtualizado = await applyLedgerChange(client, {
-        userId: usuario.id,
-        financialTransactionId: financialTx.id,
-        entryType: isSaida ? "debit" : "credit",
-        amount: valorFinal,
+      let valorMovimento = valorFinal;
+
+if (isSaida) {
+  const meta = pedido.metadata || {};
+  valorMovimento = meta.descontoSaldo || valorFinal;
+}
+
+const usuarioAtualizado = await applyLedgerChange(client, {
+  userId: usuario.id,
+  financialTransactionId: financialTx.id,
+  entryType: isSaida ? "debit" : "credit",
+  amount: valorMovimento,
         description,
         metadata: {
           pedidoId: pedido.id,
