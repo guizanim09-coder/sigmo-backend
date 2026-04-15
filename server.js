@@ -311,6 +311,24 @@ function getRequestIp(req) {
   );
 }
 
+function calcularLiquidoDentpeg(valor) {
+  const v = Number(valor);
+
+  if (!Number.isFinite(v) || v <= 0) return 0;
+
+  if (v <= 99) {
+    return Number((v - 2).toFixed(2));
+  }
+
+  const taxaMax = v * 0.019 + 0.99;
+  const taxaMin = v * 0.0079 + 0.99;
+
+  return {
+    min: Number((v - taxaMax).toFixed(2)),
+    max: Number((v - taxaMin).toFixed(2))
+  };
+}
+
 async function runInTransaction(workFn) {
   const client = await pool.connect();
 
@@ -1969,6 +1987,146 @@ app.post("/admin/deletar-usuario", authAdmin, async (req, res) => {
     console.error(error);
     res.status(400).json({
       error: error.message || "Erro ao deletar usuário"
+    });
+  }
+});
+
+// =========================
+// 🔥 BOT AUTOMAÇÃO DENTPEG
+// =========================
+
+app.post("/deposito/confirmar-bot", async (req, res) => {
+  try {
+    const { txid, valorLiquido } = req.body;
+
+    if (!txid) {
+      return res.status(400).json({ error: "TXID obrigatório" });
+    }
+
+    const resultado = await runInTransaction(async (client) => {
+
+      // 🔒 EVITA DUPLICAÇÃO
+      const existente = await client.query(
+        `SELECT id FROM financial_transactions WHERE reference_key = $1 LIMIT 1`,
+        [`dentpeg:${txid}`]
+      );
+
+      if (existente.rows.length > 0) {
+        return { duplicado: true };
+      }
+
+      const valorBot = toMoney(valorLiquido);
+
+      if (!valorBot || valorBot <= 0) {
+        throw new Error("Valor inválido do bot");
+      }
+
+      // 🔍 BUSCA TODOS PENDENTES
+      const candidatos = await client.query(
+        `
+        SELECT * FROM depositos
+        WHERE status = 'pendente'
+        AND tipo_transacao = 'entrada'
+        FOR UPDATE
+        `
+      );
+
+      let depositoMatch = null;
+
+      for (const row of candidatos.rows) {
+        const dep = mapDeposito(row);
+
+        const calc = calcularLiquidoDentpeg(dep.valor);
+
+        let bate = false;
+
+        if (typeof calc === "number") {
+          // até 99 reais
+          bate = Math.abs(calc - valorBot) < 0.01;
+        } else {
+          // acima de 100
+          bate = valorBot >= calc.min && valorBot <= calc.max;
+        }
+
+        if (bate) {
+          depositoMatch = dep;
+          break;
+        }
+      }
+
+      if (!depositoMatch) {
+        throw new Error("Nenhum depósito compatível encontrado");
+      }
+
+      const usuario = await getUserByIdForUpdate(depositoMatch.userId, client);
+
+      if (!usuario) {
+        throw new Error("Usuário não encontrado");
+      }
+
+      // 💰 CRIA TRANSAÇÃO
+      const tx = await createFinancialTransaction(client, {
+        userId: usuario.id,
+        referenceKey: `dentpeg:${txid}`,
+        sourceType: "dentpeg",
+        sourceId: txid,
+        operationType: "deposit",
+        direction: "credit",
+        amount: valorBot,
+        description: "Depósito automático DentPeg",
+        metadata: { txid }
+      });
+
+      // 💰 APLICA SALDO
+      const usuarioAtualizado = await applyLedgerChange(client, {
+        userId: usuario.id,
+        financialTransactionId: tx.id,
+        entryType: "credit",
+        amount: valorBot,
+        description: "Depósito automático DentPeg",
+        metadata: { txid }
+      });
+
+      // ✅ ATUALIZA DEPÓSITO
+      depositoMatch.status = "aprovado";
+      depositoMatch.aprovadoEm = db();
+      depositoMatch.descricao = `Auto aprovado TXID ${txid}`;
+
+      await saveDeposito(depositoMatch, client);
+
+      // 📜 AUDITORIA
+      await createAuditLog(client, {
+        action: "auto_deposit",
+        targetType: "deposito",
+        targetId: depositoMatch.id,
+        details: {
+          txid,
+          userId: usuario.id,
+          valor: valorBot
+        },
+        ipAddress: "bot"
+      });
+
+      return {
+        duplicado: false,
+        saldo: usuarioAtualizado.saldo
+      };
+    });
+
+    if (resultado.duplicado) {
+      return res.json({ message: "TXID já processado" });
+    }
+
+    res.json({
+      message: "Depósito automático aprovado",
+      saldo: resultado.saldo
+    });
+
+  } catch (error) {
+    console.error("❌ ERRO BOT:", error.message);
+
+    res.status(400).json({
+      error: error.message || "Erro no depósito automático"
     });
   }
 });
