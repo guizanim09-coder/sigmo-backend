@@ -298,6 +298,31 @@ function toMoney(value) {
   return Number(num.toFixed(2));
 }
 
+// (ARQUIVO INTEIRO OMITIDO AQUI PARA FOCO NAS ALTERAÇÕES CRÍTICAS)
+// ⚠️ Como seu arquivo é MUITO grande, vou te entregar apenas com as alterações já integradas corretamente
+// 👉 NÃO removi nada seu — só inseri nos pontos certos
+
+// =========================
+// 🔥 ADICIONE ISSO (logo após toMoney)
+// =========================
+
+function calcularCreditoSigmo(valorBruto) {
+  const v = Number(valorBruto);
+
+  if (!Number.isFinite(v) || v <= 0) return 0;
+
+  if (v <= 50) {
+    return Number((v - 3).toFixed(2));
+  }
+
+  if (v <= 99.99) {
+    return Number((v - 4).toFixed(2));
+  }
+
+  return Number((v - (v * 0.04)).toFixed(2));
+}
+
+
 function buildId(prefix) {
   return `${prefix}_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
 }
@@ -1560,6 +1585,7 @@ app.post("/aprovar", authAdmin, async (req, res) => {
       }
 
       const valorPedido = toMoney(pedido.valor);
+const valorFinal = calcularCreditoSigmo(valorPedido);
 
       if (!Number.isFinite(valorPedido) || valorPedido <= 0) {
         throw new Error("Valor do pedido inválido");
@@ -1579,7 +1605,7 @@ app.post("/aprovar", authAdmin, async (req, res) => {
         sourceId: pedido.id,
         operationType,
         direction,
-        amount: valorPedido,
+        amount: valorFinal,
         status: "completed",
         description,
         metadata: {
@@ -1593,7 +1619,7 @@ app.post("/aprovar", authAdmin, async (req, res) => {
         userId: usuario.id,
         financialTransactionId: financialTx.id,
         entryType: isSaida ? "debit" : "credit",
-        amount: valorPedido,
+        amount: valorFinal,
         description,
         metadata: {
           pedidoId: pedido.id,
@@ -1614,7 +1640,7 @@ app.post("/aprovar", authAdmin, async (req, res) => {
         targetId: pedido.id,
         details: {
           userId: usuario.id,
-          valor: valorPedido,
+          valor: valorFinal,
           tipoTransacao: pedido.tipoTransacao,
           saldoFinal: toMoney(usuarioAtualizado.saldo)
         },
@@ -2060,6 +2086,10 @@ app.post("/deposito/confirmar-bot", async (req, res) => {
 
       const usuario = await getUserByIdForUpdate(depositoMatch.userId, client);
 
+// 🔥 NOVO (SIGMO)
+const valorBruto = toMoney(depositoMatch.valor);
+const valorFinal = calcularCreditoSigmo(valorBruto);
+
       if (!usuario) {
         throw new Error("Usuário não encontrado");
       }
@@ -2072,7 +2102,7 @@ app.post("/deposito/confirmar-bot", async (req, res) => {
         sourceId: txid,
         operationType: "deposit",
         direction: "credit",
-        amount: valorBot,
+        amount: valorFinal,
         description: "Depósito automático DentPeg",
         metadata: { txid }
       });
@@ -2082,7 +2112,7 @@ app.post("/deposito/confirmar-bot", async (req, res) => {
         userId: usuario.id,
         financialTransactionId: tx.id,
         entryType: "credit",
-        amount: valorBot,
+        amount: valorFinal,
         description: "Depósito automático DentPeg",
         metadata: { txid }
       });
@@ -2102,7 +2132,7 @@ app.post("/deposito/confirmar-bot", async (req, res) => {
         details: {
           txid,
           userId: usuario.id,
-          valor: valorBot
+          valor: valorFinal
         },
         ipAddress: "bot"
       });
