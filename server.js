@@ -1326,6 +1326,8 @@ app.post("/deposito", async (req, res) => {
 
     const result = await runInTransaction(async (client) => {
 
+const pedidoId = buildId("dep");
+
   const user = await getUserByIdForUpdate(userId, client);
 
   if (!user) {
