@@ -1,0 +1,13 @@
+{
+  "name": "sigmo-bot",
+  "version": "1.0.0",
+  "main": "worker.js",
+  "scripts": {
+    "start": "node worker.js"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.5",
+    "node-fetch": "^2.6.7",
+    "playwright": "^1.40.0"
+  }
+}

@@ -1,0 +1,69 @@
+{
+  "cookies": [
+    {
+      "name": "depix_refresh_token",
+      "value": "0d284b0f3c0829f9f453148b465bf0cd804f10e420a544b8d721e5aec34a00a07897cd8d004b4245",
+      "domain": "api.dentpeg.com",
+      "path": "/auth/refresh",
+      "expires": 1776842210.224888,
+      "httpOnly": true,
+      "secure": true,
+      "sameSite": "Strict"
+    },
+    {
+      "name": "depix_user_token",
+      "value": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpYXQiOjE3NzYyMzc0MTEsImV4cCI6MTc3NjMyMzgxMSwic3ViIjoiOTQ3MmIzZDEtNjg4ZC00YmIzLTg2NTAtMTY0MGE5MmIxMzUwIn0.fIrJQNlBbNCRhtYCihB01kYdLUSLymF9KGgWNijWtvs",
+      "domain": ".dentpeg.com",
+      "path": "/",
+      "expires": 1778829410.228729,
+      "httpOnly": false,
+      "secure": true,
+      "sameSite": "Strict"
+    },
+    {
+      "name": "_fbp",
+      "value": "fb.1.1776237428010.471934102757566452",
+      "domain": ".dentpeg.com",
+      "path": "/",
+      "expires": 1784013431,
+      "httpOnly": false,
+      "secure": false,
+      "sameSite": "Lax"
+    }
+  ],
+  "origins": [
+    {
+      "origin": "https://app.dentpeg.com",
+      "localStorage": [
+        {
+          "name": "lastExternalReferrer",
+          "value": "other"
+        },
+        {
+          "name": "depix_seen_welcome",
+          "value": "true"
+        },
+        {
+          "name": "lastExternalReferrerTime",
+          "value": "1776237428000"
+        },
+        {
+          "name": "depix_seen_tiers_modal",
+          "value": "true"
+        },
+        {
+          "name": "dentpeg_whatsapp_group_dismissed",
+          "value": "1"
+        },
+        {
+          "name": "dentpeg_cookie_consent",
+          "value": "accepted"
+        },
+        {
+          "name": "dentpeg_deposit_delay_ack_9472b3d1-688d-4bb3-8650-1640a92b1350",
+          "value": "1"
+        }
+      ]
+    }
+  ]
+}
