@@ -1209,6 +1209,45 @@ app.post("/usuario/update-nome", async (req, res) => {
   }
 });
 
+app.post("/usuario/delete", async (req, res) => {
+  try {
+    const { userId, email, senha } = req.body;
+
+    if (!userId || !email || !senha) {
+      return res.status(400).json({ error: "Dados obrigatórios" });
+    }
+
+    const user = await getUserById(userId);
+
+    if (!user) {
+      return res.status(404).json({ error: "Usuário não encontrado" });
+    }
+
+    if (normalizeEmail(email) !== normalizeEmail(user.email)) {
+      return res.status(401).json({ error: "Email inválido" });
+    }
+
+    const senhaValida = await bcrypt.compare(String(senha), String(user.senha));
+
+    if (!senhaValida) {
+      return res.status(401).json({ error: "Senha inválida" });
+    }
+
+    await runInTransaction(async (client) => {
+      await client.query("DELETE FROM depositos WHERE user_id = $1", [userId]);
+      await client.query("DELETE FROM financial_transactions WHERE user_id = $1", [userId]);
+      await client.query("DELETE FROM ledger_entries WHERE user_id = $1", [userId]);
+      await client.query("DELETE FROM audit_logs WHERE target_id = $1", [userId]);
+      await client.query("DELETE FROM usuarios WHERE id = $1", [userId]);
+    });
+
+    res.json({ message: "Conta deletada com sucesso" });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: "Erro ao deletar conta" });
+  }
+});
+
 app.post("/deposito", async (req, res) => {
   try {
     const { userId, valor, chavePix, tipoChave, tipoTransacao } = req.body;
