@@ -1324,7 +1324,81 @@ app.post("/deposito", async (req, res) => {
       return res.status(400).json({ error: "Valor inválido" });
     }
 
-    const user = await getUserById(userId);
+    const result = await runInTransaction(async (client) => {
+
+  const user = await getUserByIdForUpdate(userId, client);
+
+  if (!user) {
+    throw new Error("Usuário não encontrado");
+  }
+
+  if (tipoTransacao === "saida") {
+    const saldoAtual = toMoney(user.saldo);
+
+    const valorNecessario = repassarTaxa
+      ? valorNumero
+      : toMoney(valorNumero + taxa);
+
+    if (saldoAtual < valorNecessario) {
+      throw new Error("Saldo insuficiente");
+    }
+
+    // 🔥 RETÉM O SALDO NA HORA
+    const tx = await createFinancialTransaction(client, {
+      userId: user.id,
+      referenceKey: `deposito:${Date.now()}:hold`,
+      sourceType: "deposito",
+      sourceId: "hold",
+      operationType: "withdrawal_hold",
+      direction: "debit",
+      amount: valorNecessario,
+      description: "Saldo reservado para saque",
+      metadata: { repassarTaxa }
+    });
+
+    await applyLedgerChange(client, {
+      userId: user.id,
+      financialTransactionId: tx.id,
+      entryType: "debit",
+      amount: valorNecessario,
+      description: "Reserva de saldo para saque",
+      metadata: { repassarTaxa }
+    });
+  }
+
+  const pedido = {
+    id: buildId("dep"),
+    userId,
+    valor: valorFinal,
+    chavePix: chavePix || "",
+    tipoChave: tipoChave || "",
+    tipoTransacao: tipoTransacao || "entrada",
+    status: "pendente",
+    comprovanteUrl: "",
+    descricao: "",
+    criadoEm: db(),
+    aprovadoEm: null,
+    recusadoEm: null,
+    comprovanteEnviadoEm: null,
+    metadata: {
+      valorOriginal: valorNumero,
+      descontoSaldo:
+        tipoTransacao === "saida"
+          ? (repassarTaxa
+              ? valorNumero
+              : toMoney(valorNumero + taxa))
+          : valorNumero,
+      taxa: tipoTransacao === "saida" ? taxa : 0,
+      repassarTaxa: !!repassarTaxa
+    }
+  };
+
+  await saveDeposito(pedido, client);
+
+  return pedido;
+});
+
+res.status(201).json(result);
 
     if (!user) {
       return res.status(404).json({ error: "Usuário não encontrado" });
@@ -1657,18 +1731,22 @@ if (isSaida) {
   valorMovimento = meta.descontoSaldo || valorFinal;
 }
 
-const usuarioAtualizado = await applyLedgerChange(client, {
-  userId: usuario.id,
-  financialTransactionId: financialTx.id,
-  entryType: isSaida ? "debit" : "credit",
-  amount: valorMovimento,
-        description,
-        metadata: {
-          pedidoId: pedido.id,
-          tipoTransacao: pedido.tipoTransacao,
-          adminId: req.admin.sub
-        }
-      });
+let usuarioAtualizado = usuario;
+
+if (!isSaida) {
+  usuarioAtualizado = await applyLedgerChange(client, {
+    userId: usuario.id,
+    financialTransactionId: financialTx.id,
+    entryType: "credit",
+    amount: valorFinal,
+    description,
+    metadata: {
+      pedidoId: pedido.id,
+      tipoTransacao: pedido.tipoTransacao,
+      adminId: req.admin.sub
+    }
+  });
+}
 
       pedido.status = "aprovado";
       pedido.aprovadoEm = db();
@@ -1730,9 +1808,33 @@ app.post("/recusar", authAdmin, async (req, res) => {
       }
 
       pedido.status = "recusado";
-      pedido.recusadoEm = db();
+pedido.recusadoEm = db();
 
-      await saveDeposito(pedido, client);
+if (pedido.tipoTransacao === "saida") {
+  const meta = pedido.metadata || {};
+  const valorDevolver = meta.descontoSaldo || pedido.valor;
+
+  const tx = await createFinancialTransaction(client, {
+    userId: pedido.userId,
+    referenceKey: `deposito:${pedido.id}:refund`,
+    sourceType: "deposito",
+    sourceId: pedido.id,
+    operationType: "refund",
+    direction: "credit",
+    amount: valorDevolver,
+    description: "Devolução de saldo - saque recusado"
+  });
+
+  await applyLedgerChange(client, {
+    userId: pedido.userId,
+    financialTransactionId: tx.id,
+    entryType: "credit",
+    amount: valorDevolver,
+    description: "Saldo devolvido (saque recusado)"
+  });
+}
+
+await saveDeposito(pedido, client);
 
       await createAuditLog(client, {
         adminId: req.admin.sub,
