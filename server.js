@@ -1343,18 +1343,17 @@ app.post("/deposito", async (req, res) => {
       throw new Error("Saldo insuficiente");
     }
 
-    // 🔥 RETÉM O SALDO NA HORA
-    const tx = await createFinancialTransaction(client, {
-      userId: user.id,
-      referenceKey: `deposito:${Date.now()}:hold`,
-      sourceType: "deposito",
-      sourceId: "hold",
-      operationType: "withdrawal_hold",
-      direction: "debit",
-      amount: valorNecessario,
-      description: "Saldo reservado para saque",
-      metadata: { repassarTaxa }
-    });
+const tx = await createFinancialTransaction(client, {
+  userId: user.id,
+  referenceKey: `deposito:${pedidoId}:hold`,
+  sourceType: "deposito",
+  sourceId: pedidoId,
+  operationType: "withdrawal_hold",
+  direction: "debit",
+  amount: valorNecessario,
+  description: "Saldo reservado para saque",
+  metadata: { repassarTaxa }
+});
 
     await applyLedgerChange(client, {
       userId: user.id,
@@ -1367,7 +1366,7 @@ app.post("/deposito", async (req, res) => {
   }
 
   const pedido = {
-    id: buildId("dep"),
+    id: pedidoId,
     userId,
     valor: valorFinal,
     chavePix: chavePix || "",
@@ -1400,40 +1399,6 @@ app.post("/deposito", async (req, res) => {
 
 res.status(201).json(result);
 
-    if (!user) {
-      return res.status(404).json({ error: "Usuário não encontrado" });
-    }
-
-    const pedido = {
-      id: buildId("dep"),
-      userId,
-      valor: valorFinal,
-      chavePix: chavePix || "",
-      tipoChave: tipoChave || "",
-      tipoTransacao: tipoTransacao || "entrada",
-      status: "pendente",
-      comprovanteUrl: "",
-      descricao: "",
-      criadoEm: db(),
-      aprovadoEm: null,
-      recusadoEm: null,
-      comprovanteEnviadoEm: null,
-      metadata: {
-        valorOriginal: valorNumero,
-        descontoSaldo:
-          tipoTransacao === "saida"
-            ? (repassarTaxa
-                ? valorNumero
-                : toMoney(valorNumero + taxa))
-            : valorNumero,
-        taxa: tipoTransacao === "saida" ? taxa : 0,
-        repassarTaxa: !!repassarTaxa
-      }
-    };
-
-    await saveDeposito(pedido);
-
-    res.status(201).json(pedido);
   } catch (error) {
     console.error(error);
     res.status(500).json({ error: "Erro ao criar pedido" });
@@ -1723,13 +1688,6 @@ if (pedido.tipoTransacao === "entrada") {
           adminId: req.admin.sub
         }
       });
-
-      let valorMovimento = valorFinal;
-
-if (isSaida) {
-  const meta = pedido.metadata || {};
-  valorMovimento = meta.descontoSaldo || valorFinal;
-}
 
 let usuarioAtualizado = usuario;
 
