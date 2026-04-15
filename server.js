@@ -1297,80 +1297,73 @@ app.post("/usuario/delete", async (req, res) => {
 
 app.post("/deposito", async (req, res) => {
   try {
-  const { userId, valor, chavePix, tipoChave, tipoTransacao, repassarTaxa } = req.body;
+    const { userId, valor, chavePix, tipoChave, tipoTransacao, repassarTaxa } = req.body;
 
-  if (!userId || valor === undefined || valor === null) {
-    return res.status(400).json({ error: "userId e valor são obrigatórios" });
-  }
-
-  const valorNumero = toMoney(valor);
-
-  // ✅ taxa (uma só!)
-  const taxa =
-    valorNumero <= 100
-      ? 9
-      : toMoney(valorNumero * 0.09);
-
-  // ✅ valor que vai pro PIX
-  let valorFinal = valorNumero;
-
-  if (tipoTransacao === "saida") {
-    if (repassarTaxa) {
-      valorFinal = toMoney(valorNumero - taxa);
-    } else {
-      valorFinal = valorNumero;
+    if (!userId || valor === undefined || valor === null) {
+      return res.status(400).json({ error: "userId e valor são obrigatórios" });
     }
-  }
 
-  if (!Number.isFinite(valorNumero) || valorNumero <= 0) {
-    return res.status(400).json({ error: "Valor inválido" });
-  }
+    const valorNumero = toMoney(valor);
 
-  const user = await getUserById(userId);
+    const taxa =
+      valorNumero <= 100
+        ? 9
+        : toMoney(valorNumero * 0.09);
 
-  if (!user) {
-    return res.status(404).json({ error: "Usuário não encontrado" });
-  }
+    let valorFinal = valorNumero;
 
-  const pedido = {
-    id: buildId("dep"),
-    userId,
-    valor: valorFinal,
-    chavePix: chavePix || "",
-    tipoChave: tipoChave || "",
-    tipoTransacao: tipoTransacao || "entrada",
-    status: "pendente",
-    comprovanteUrl: "",
-    descricao: "",
-    criadoEm: db(),
-    aprovadoEm: null,
-    recusadoEm: null,
-    comprovanteEnviadoEm: null,
-
-    metadata: {
-      valorOriginal: valorNumero,
-
-      descontoSaldo:
-        tipoTransacao === "saida"
-          ? (repassarTaxa
-              ? valorNumero
-              : toMoney(valorNumero + taxa))
-          : valorNumero,
-
-      taxa: tipoTransacao === "saida" ? taxa : 0,
-
-      repassarTaxa: !!repassarTaxa
+    if (tipoTransacao === "saida") {
+      if (repassarTaxa) {
+        valorFinal = toMoney(valorNumero - taxa);
+      } else {
+        valorFinal = valorNumero;
+      }
     }
-  };
 
-  await saveDeposito(pedido);
+    if (!Number.isFinite(valorNumero) || valorNumero <= 0) {
+      return res.status(400).json({ error: "Valor inválido" });
+    }
 
-  res.status(201).json(pedido);
+    const user = await getUserById(userId);
 
-} catch (error) {
-  console.error(error);
-  res.status(500).json({ error: "Erro ao criar pedido" });
-}
+    if (!user) {
+      return res.status(404).json({ error: "Usuário não encontrado" });
+    }
+
+    const pedido = {
+      id: buildId("dep"),
+      userId,
+      valor: valorFinal,
+      chavePix: chavePix || "",
+      tipoChave: tipoChave || "",
+      tipoTransacao: tipoTransacao || "entrada",
+      status: "pendente",
+      comprovanteUrl: "",
+      descricao: "",
+      criadoEm: db(),
+      aprovadoEm: null,
+      recusadoEm: null,
+      comprovanteEnviadoEm: null,
+      metadata: {
+        valorOriginal: valorNumero,
+        descontoSaldo:
+          tipoTransacao === "saida"
+            ? (repassarTaxa
+                ? valorNumero
+                : toMoney(valorNumero + taxa))
+            : valorNumero,
+        taxa: tipoTransacao === "saida" ? taxa : 0,
+        repassarTaxa: !!repassarTaxa
+      }
+    };
+
+    await saveDeposito(pedido);
+
+    res.status(201).json(pedido);
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: "Erro ao criar pedido" });
+  }
 });
 
     await saveDeposito(pedido);
