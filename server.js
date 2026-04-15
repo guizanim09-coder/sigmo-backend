@@ -1366,11 +1366,12 @@ app.post("/deposito", async (req, res) => {
   await saveDeposito(pedido);
 
   res.status(201).json(pedido);
+
 } catch (error) {
   console.error(error);
   res.status(500).json({ error: "Erro ao criar pedido" });
 }
-};
+});
 
     await saveDeposito(pedido);
 
