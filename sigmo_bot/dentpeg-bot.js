@@ -19,7 +19,7 @@ async function iniciarBrowser() {
 
   booting = (async () => {
     const browser = await chromium.launch({
-      headless: true, // 🔥 TRUE no Railway depois
+      headless: true,
       args: ["--no-sandbox"]
     });
 
@@ -61,7 +61,7 @@ async function resetBrowser() {
   pageRef = null;
 }
 
-// 🔥 NORMALIZAR VALOR
+// 🔥 VALOR
 function normalizarValorBR(valorTexto) {
   if (!valorTexto) return null;
 
@@ -73,12 +73,6 @@ function normalizarValorBR(valorTexto) {
   return Number.isFinite(numero) ? numero : null;
 }
 
-// 🔥 EXTRAIR TEXTO
-function extrairTexto(texto, regex) {
-  const match = String(texto || "").match(regex);
-  return match ? match[1].trim() : null;
-}
-
 // 🔥 NOME
 function extrairNome(texto) {
   const linhas = texto.split("\n").map(l => l.trim()).filter(Boolean);
@@ -88,13 +82,12 @@ function extrairNome(texto) {
 
     if (
       linha.length > 5 &&
-      !upper.includes("PIX") &&
-      !upper.includes("CONFIRMADO") &&
-      !upper.includes("TXID") &&
+      !upper.includes("DEPIX") &&
       !upper.includes("ENTRADA") &&
-      !upper.includes("SAÍDA") &&
-      !linha.match(/\d{2}\/\d{2}\/\d{4}/) &&
-      !linha.match(/^[\d\s.,\-R$#]+$/)
+      !upper.includes("EXPIRADO") &&
+      !upper.includes("QR") &&
+      !upper.includes("DINAMICO") &&
+      !linha.match(/\d{2}\/\d{2}\/\d{4}/)
     ) {
       return linha;
     }
@@ -106,55 +99,51 @@ function extrairNome(texto) {
 // 🔥 TXID
 async function capturarTxid(page, card, texto) {
   try {
-    const botao = card.locator('text=TXID').first();
-
-    if (await botao.count()) {
-      await botao.click().catch(() => {});
-      await page.waitForTimeout(200);
-
-      const txid = await page.evaluate(async () => {
-        try {
-          return await navigator.clipboard.readText();
-        } catch {
-          return "";
-        }
-      });
-
-      if (txid && txid.length > 10) return txid.trim();
-    }
+    const match = texto.match(/#\s*([a-f0-9]+)/i);
+    if (match) return match[1];
   } catch {}
 
-  const match = texto.match(/([a-f0-9]{20,})/i);
-  return match ? match[1] : null;
+  return null;
 }
 
 // 🔥 ABRIR EXTRATO
 async function abrirExtrato(page) {
-  await page.goto(APP_URL, { waitUntil: "domcontentloaded" });
-  await page.waitForTimeout(2000);
+  await page.goto(APP_URL, {
+    waitUntil: "domcontentloaded"
+  });
 
-  const botaoExtrato = page.locator("text=Extrato").first();
+  await page.waitForTimeout(3000);
 
-  if (await botaoExtrato.count()) {
-    await botaoExtrato.click();
-    await page.waitForTimeout(3000);
+  // 🔥 menu superior correto
+  const menu = page.locator("a:has-text('Extrato')");
+
+  if (await menu.count()) {
+    await menu.first().click();
+    await page.waitForTimeout(4000);
   } else {
-    throw new Error("Botão Extrato não encontrado");
+    throw new Error("Menu extrato não encontrado");
+  }
+
+  const body = await page.locator("body").innerText().catch(() => "");
+
+  if (!body.includes("DePix")) {
+    throw new Error("Extrato não carregou");
   }
 }
 
-// 🔥 CAPTURA
+// 🔥 CAPTURA REAL
 async function capturarTransacoes() {
   try {
     const { page } = await iniciarBrowser();
 
     await abrirExtrato(page);
 
+    // 🔥 pega cards reais
     const cards = page.locator("div").filter({
-  hasText: "Pix"
-});
+      hasText: "DePix"
+    });
 
-    const total = Math.min(await cards.count(), 15);
+    const total = Math.min(await cards.count(), 20);
     const transacoes = [];
 
     for (let i = 0; i < total; i++) {
@@ -164,24 +153,27 @@ async function capturarTransacoes() {
 
         if (!texto) continue;
 
-        const valorTexto = extrairTexto(texto, /([\d.,]+)/);
+        // 🔥 só entradas
+        if (!texto.includes("Entrada")) continue;
+if (texto.includes("EXPIRADO")) continue;
+
+        const valorTexto = texto.match(/DePix\s?([\d.,]+)/)?.[1];
         const valor = normalizarValorBR(valorTexto);
 
-        if (!valor) continue;
+        if (!valor || valor < 5) continue;
 
         const nomePagador = extrairNome(texto);
         const txid = await capturarTxid(page, card, texto);
 
-        const path = `./tmp_${Date.now()}_${i}.png`;
-        await card.screenshot({ path });
+        const path = null;
 
         transacoes.push({
-          valorLiquido: valor,
-          nomePagador,
-          txid,
-          imagemComprovante: path,
-          raw: texto
-        });
+  valorLiquido: valor,
+  nomePagador,
+  txid,
+  imagemComprovante: null,
+  raw: texto
+});
 
       } catch (e) {
         console.log("Erro card:", e.message);
@@ -190,11 +182,11 @@ async function capturarTransacoes() {
 
     return transacoes;
 
-  } catch (e) {
-    console.log("Erro captura:", e.message);
-    await resetBrowser();
-    return [];
-  }
+} catch (e) {
+  console.log("❌ Erro captura:", e.message);
+  console.log("⚠️ Falha leve, tentando novamente no próximo loop...");
+  return [];
+}
 }
 
 // 🔥 LOGIN
@@ -212,7 +204,7 @@ async function setupLogin() {
   await page.goto(APP_URL);
 
   console.log("👉 Faça login manualmente");
-  console.log("👉 Vá até o extrato");
+  console.log("👉 Vá até o EXTRATO");
   console.log("👉 Pressione ENTER");
 
   await new Promise(resolve => {

@@ -1,3 +1,4 @@
+// 🔥 SETUP LOGIN
 if (process.argv.includes("setup")) {
   const { setupLogin } = require("./dentpeg-bot");
   setupLogin();
@@ -9,10 +10,7 @@ const fetch = require("node-fetch");
 const fs = require("fs");
 const Tesseract = require("tesseract.js");
 
-const {
-  setupLogin,
-  capturarTransacoes
-} = require("./dentpeg-bot");
+const { capturarTransacoes } = require("./dentpeg-bot");
 
 const LOOP_INTERVAL = 4000;
 const CACHE_FILE = "./txids.json";
@@ -23,77 +21,134 @@ let ultimoLoop = Date.now();
 // 🔄 carregar cache
 if (fs.existsSync(CACHE_FILE)) {
   try {
-    txidsProcessados = new Set(JSON.parse(fs.readFileSync(CACHE_FILE)));
+    txidsProcessados = new Set(JSON.parse(fs.readFileSync(CACHE_FILE, "utf8")));
   } catch {
     txidsProcessados = new Set();
   }
 }
 
 function salvarCache() {
-  fs.writeFileSync(CACHE_FILE, JSON.stringify([...txidsProcessados]));
+  try {
+    fs.writeFileSync(CACHE_FILE, JSON.stringify([...txidsProcessados], null, 2), "utf8");
+  } catch (e) {
+    console.log("❌ Erro cache:", e.message);
+  }
 }
 
 // 🔥 OCR
 async function lerTextoImagem(url) {
   try {
     const response = await fetch(url);
-    const buffer = await response.buffer();
 
-    const path = "./tmp.png";
+    if (!response.ok) {
+      throw new Error(`Falha ao baixar comprovante: ${response.status}`);
+    }
+
+    const buffer = await response.buffer();
+    const path = `./tmp_${Date.now()}.png`;
+
     fs.writeFileSync(path, buffer);
 
     const { data: { text } } = await Tesseract.recognize(path, "por");
 
-    return text.toUpperCase();
+    fs.unlink(path, () => {});
+
+    return String(text || "").toUpperCase();
   } catch (e) {
     console.log("❌ OCR erro:", e.message);
     return "";
   }
 }
 
-// 🔥 NORMALIZA TEXTO
+// 🔥 NORMALIZA
 function normalizar(txt) {
-  return (txt || "")
+  return String(txt || "")
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
     .toUpperCase()
-    .replace(/[^A-Z0-9 ]/g, "")
+    .replace(/[^A-Z0-9 ]/g, " ")
+    .replace(/\s+/g, " ")
     .trim();
 }
 
-// 🔥 COMPARAÇÃO COM TAXA REAL
+// 🔥 COMPARAÇÃO DE VALOR (DENTPEG)
 function bateValorComTaxa(valorExtrato, valorPedido) {
-  if (!valorExtrato || !valorPedido) return false;
+  const extrato = Number(valorExtrato);
+  const pedido = Number(valorPedido);
 
-  const taxaMin = (valorPedido * 0.0079) + 0.99;
-  const taxaMax = (valorPedido * 0.019) + 0.99;
+  if (!Number.isFinite(extrato) || extrato <= 0) return false;
+  if (!Number.isFinite(pedido) || pedido <= 0) return false;
 
-  const valorMin = valorPedido - taxaMax;
-  const valorMax = valorPedido - taxaMin;
+  const taxaMin = (pedido * 0.0079) + 0.99;
+  const taxaMax = (pedido * 0.019) + 0.99;
 
-  return valorExtrato >= valorMin && valorExtrato <= valorMax;
+  const valorMin = Number((pedido - taxaMax).toFixed(2));
+  const valorMax = Number((pedido - taxaMin).toFixed(2));
+
+  return extrato >= valorMin && extrato <= valorMax;
 }
 
-// 🔥 BUSCAR PEDIDOS
+// 🔥 COMPARAÇÃO DE NOME
+function bateNome(nomeOCR, nomeExtrato) {
+  const ocr = normalizar(nomeOCR);
+  const extrato = normalizar(nomeExtrato);
+
+  if (!ocr || !extrato) return false;
+
+  return ocr.includes(extrato) || extrato.includes(ocr);
+}
+
+// 🔥 BUSCAR PENDENTES
 async function buscarPendentes() {
-  const res = await fetch(process.env.BACKEND_URL + "/deposito/pendentes");
-  return res.json();
+  try {
+    const res = await fetch(process.env.BACKEND_URL + "/deposito/pendentes");
+
+    if (!res.ok) {
+      throw new Error(`Backend respondeu ${res.status}`);
+    }
+
+    const data = await res.json();
+
+    if (!Array.isArray(data)) {
+      throw new Error("Resposta inválida de /deposito/pendentes");
+    }
+
+    return data;
+  } catch (e) {
+    console.log("❌ Erro pendentes:", e.message);
+    return [];
+  }
 }
 
 // 🔥 APROVAR
 async function aprovar(pedidoId, tx) {
-  await fetch(process.env.BACKEND_URL + "/deposito/confirmar-bot", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      pedidoId,
-      txid: tx.txid,
-      valor: tx.valorLiquido
-    })
-  });
+  try {
+    const res = await fetch(process.env.BACKEND_URL + "/deposito/confirmar-bot", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({
+        txid: tx.txid,
+        valorLiquido: tx.valorLiquido
+      })
+    });
 
-  console.log("✅ APROVADO:", pedidoId);
+    const json = await res.json().catch(() => null);
+
+    if (!res.ok) {
+      throw new Error(json?.error || `Backend respondeu ${res.status}`);
+    }
+
+    console.log("✅ APROVADO:", pedidoId, "| TXID:", tx.txid);
+    return true;
+  } catch (e) {
+    console.log("❌ Erro aprovar:", e.message);
+    return false;
+  }
 }
 
-// 🔥 LOOP PRINCIPAL
+// 🔥 LOOP
 async function loop() {
   ultimoLoop = Date.now();
 
@@ -102,42 +157,64 @@ async function loop() {
     const pedidos = await buscarPendentes();
 
     console.log("📊 Transações:", transacoes.length);
-console.log("📦 Pendentes:", pedidos.length);
+    console.log("📦 Pendentes:", pedidos.length);
 
-if (!transacoes.length || !pedidos.length) {
-  console.log("🔍 Nada para processar");
-  return;
-}
+    if (!transacoes.length || !pedidos.length) {
+      console.log("🔍 Nada para processar");
+      return;
+    }
 
     for (const tx of transacoes) {
-      if (!tx.txid || txidsProcessados.has(tx.txid)) continue;
+      console.log("TX:", tx);
+
+      if (!tx?.txid) continue;
+      if (txidsProcessados.has(tx.txid)) continue;
+
+      let aprovado = false;
 
       for (const pedido of pedidos) {
         try {
-          const url = process.env.BACKEND_URL + "/" + pedido.comprovante;
+          if (!pedido?.comprovante) continue;
+
+          const comprovante = String(pedido.comprovante).replace(/^\/+/, "");
+          const url = process.env.BACKEND_URL.replace(/\/+$/, "") + "/" + comprovante;
 
           const textoOCR = await lerTextoImagem(url);
-          const nomeOCR = textoOCR.split("\n")[0];
+          const nomeOCR = String(textoOCR || "").split("\n")[0] || "";
+          const nomeExtrato = tx.nomePagador || "";
 
-          const nomeExtrato = tx.nomePagador;
+          const matchValor = bateValorComTaxa(tx.valorLiquido, pedido.valor);
+          const matchNome = bateNome(nomeOCR, nomeExtrato);
 
-          if (
-            bateValorComTaxa(tx.valorLiquido, pedido.valor) &&
-            normalizar(nomeOCR).includes(normalizar(nomeExtrato))
-          ) {
-            await aprovar(pedido.id, tx);
+          console.log("🔎 MATCH:", {
+            pedidoId: pedido.id,
+            valorPedido: pedido.valor,
+            valorExtrato: tx.valorLiquido,
+            nomeOCR,
+            nomeExtrato,
+            matchValor,
+            matchNome
+          });
 
-            txidsProcessados.add(tx.txid);
-            salvarCache();
-            break;
+          if (matchValor && matchNome) {
+            const ok = await aprovar(pedido.id, tx);
+
+            if (ok) {
+              txidsProcessados.add(tx.txid);
+              salvarCache();
+              aprovado = true;
+              break;
+            }
           }
-
         } catch (e) {
-          console.log("Erro match:", e.message);
+          console.log("❌ Erro match:", e.message);
         }
       }
-    }
 
+      if (!aprovado) {
+        console.log("⏭️ Nenhum pedido compatível para TXID:", tx.txid);
+      }
+    }
   } catch (e) {
     console.log("❌ Erro loop:", e.message);
   }
