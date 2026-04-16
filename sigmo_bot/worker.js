@@ -1,3 +1,9 @@
+if (process.argv.includes("setup")) {
+  const { setupLogin } = require("./dentpeg-bot");
+  setupLogin();
+  return;
+}
+
 require("dotenv").config();
 const fetch = require("node-fetch");
 const fs = require("fs");
@@ -95,13 +101,13 @@ async function loop() {
     const transacoes = await capturarTransacoes();
     const pedidos = await buscarPendentes();
 
-    if (!transacoes.length || !pedidos.length) {
-      console.log("🔍 Nada para processar");
-      return;
-    }
-
     console.log("📊 Transações:", transacoes.length);
-    console.log("📦 Pendentes:", pedidos.length);
+console.log("📦 Pendentes:", pedidos.length);
+
+if (!transacoes.length || !pedidos.length) {
+  console.log("🔍 Nada para processar");
+  return;
+}
 
     for (const tx of transacoes) {
       if (!tx.txid || txidsProcessados.has(tx.txid)) continue;

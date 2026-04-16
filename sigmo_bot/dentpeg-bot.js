@@ -3,7 +3,7 @@ const fs = require("fs");
 
 const STORAGE_PATH = "./storage.json";
 const APP_URL = "https://app.dentpeg.com/";
-const STATEMENT_URL = "https://app.dentpeg.com/app/statement";
+const STATEMENT_URL = "https://app.dentpeg.com/";
 
 let browserRef = null;
 let contextRef = null;
@@ -20,7 +20,7 @@ async function iniciarBrowser() {
 
   booting = (async () => {
     const browser = await chromium.launch({
-      headless: true,
+  headless: true,
       args: ["--no-sandbox"]
     });
 
