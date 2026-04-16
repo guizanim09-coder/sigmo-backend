@@ -1,0 +1,6 @@
+.env
+storage.json
+txids.json
+*.png
+tmp*
+node_modules/

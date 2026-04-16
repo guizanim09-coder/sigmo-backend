@@ -3,7 +3,6 @@ const fs = require("fs");
 
 const STORAGE_PATH = "./storage.json";
 const APP_URL = "https://app.dentpeg.com/";
-const STATEMENT_URL = "https://app.dentpeg.com/";
 
 let browserRef = null;
 let contextRef = null;
@@ -20,7 +19,7 @@ async function iniciarBrowser() {
 
   booting = (async () => {
     const browser = await chromium.launch({
-  headless: true,
+      headless: true, // 🔥 TRUE no Railway depois
       args: ["--no-sandbox"]
     });
 
@@ -80,7 +79,7 @@ function extrairTexto(texto, regex) {
   return match ? match[1].trim() : null;
 }
 
-// 🔥 NOME MAIS INTELIGENTE
+// 🔥 NOME
 function extrairNome(texto) {
   const linhas = texto.split("\n").map(l => l.trim()).filter(Boolean);
 
@@ -131,17 +130,20 @@ async function capturarTxid(page, card, texto) {
 
 // 🔥 ABRIR EXTRATO
 async function abrirExtrato(page) {
-  await page.goto(STATEMENT_URL, { waitUntil: "domcontentloaded" });
-  await page.waitForTimeout(800);
+  await page.goto(APP_URL, { waitUntil: "domcontentloaded" });
+  await page.waitForTimeout(2000);
 
-  const body = await page.locator("body").innerText().catch(() => "");
+  const botaoExtrato = page.locator("text=Extrato").first();
 
-  if (!body || body.length < 50) {
-  throw new Error("Extrato não carregou");
+  if (await botaoExtrato.count()) {
+    await botaoExtrato.click();
+    await page.waitForTimeout(3000);
+  } else {
+    throw new Error("Botão Extrato não encontrado");
+  }
 }
-}
 
-// 🔥 CAPTURA PRINCIPAL
+// 🔥 CAPTURA
 async function capturarTransacoes() {
   try {
     const { page } = await iniciarBrowser();
@@ -149,8 +151,8 @@ async function capturarTransacoes() {
     await abrirExtrato(page);
 
     const cards = page.locator("div").filter({
-      has: page.getByText("Entrada")
-    });
+  hasText: "Pix"
+});
 
     const total = Math.min(await cards.count(), 15);
     const transacoes = [];
@@ -160,7 +162,7 @@ async function capturarTransacoes() {
         const card = cards.nth(i);
         const texto = await card.innerText();
 
-        if (!texto || !texto.includes("CONFIRMADO")) continue;
+        if (!texto) continue;
 
         const valorTexto = extrairTexto(texto, /([\d.,]+)/);
         const valor = normalizarValorBR(valorTexto);
@@ -170,9 +172,8 @@ async function capturarTransacoes() {
         const nomePagador = extrairNome(texto);
         const txid = await capturarTxid(page, card, texto);
 
-        // 🔥 screenshot para OCR
         const path = `./tmp_${Date.now()}_${i}.png`;
-        await card.screenshot({ path }).catch(() => {});
+        await card.screenshot({ path });
 
         transacoes.push({
           valorLiquido: valor,
@@ -199,7 +200,14 @@ async function capturarTransacoes() {
 // 🔥 LOGIN
 async function setupLogin() {
   await resetBrowser();
-  const { browser, context, page } = await iniciarBrowser();
+
+  const browser = await chromium.launch({
+    headless: false,
+    args: ["--no-sandbox"]
+  });
+
+  const context = await browser.newContext();
+  const page = await context.newPage();
 
   await page.goto(APP_URL);
 
@@ -207,9 +215,8 @@ async function setupLogin() {
   console.log("👉 Vá até o extrato");
   console.log("👉 Pressione ENTER");
 
-  await new Promise(r => {
-    process.stdin.resume();
-    process.stdin.once("data", r);
+  await new Promise(resolve => {
+    process.stdin.once("data", resolve);
   });
 
   await context.storageState({ path: STORAGE_PATH });
