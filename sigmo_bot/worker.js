@@ -103,11 +103,15 @@ async function processarFila() {
     const sucesso = await enviarParaBackend(tx);
 
     if (sucesso) {
-      txidsProcessados.add(tx.txid);
-      salvarCache();
-    } else {
-      fila.push(tx); // reprocessa depois
-    }
+  txidsProcessados.add(tx.txid);
+  salvarCache();
+} else {
+  console.log("❌ Ignorado após falha:", tx.txid);
+
+  // 🔥 marca como processado para não travar fila
+  txidsProcessados.add(tx.txid);
+  salvarCache();
+}
   }));
 }
 
