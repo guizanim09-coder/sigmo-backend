@@ -1,6 +1,7 @@
 require("dotenv").config();
 const fetch = require("node-fetch");
 const fs = require("fs");
+const Tesseract = require("tesseract.js");
 
 const {
   setupLogin,
@@ -9,9 +10,9 @@ const {
 } = require("./dentpeg-bot");
 
 // 🔒 CONFIG PRODUÇÃO
-const LOOP_INTERVAL = 4000; // mais rápido
-const MAX_CONCURRENCY = 3; // paralelismo controlado
-const RETRY_LIMIT = 3;
+const LOOP_INTERVAL = 4000;
+const MAX_CONCURRENCY = 3;
+const RETRY_LIMIT = 2;
 
 // 🔒 cache persistente
 const CACHE_FILE = "./txids.json";
@@ -52,16 +53,49 @@ function salvarCache() {
   }
 }
 
-// 🔥 ENVIO COM RETRY
+// 🔥 OCR PARA IMAGEM
+async function lerTextoImagem(caminho) {
+  try {
+    const { data: { text } } = await Tesseract.recognize(
+      caminho,
+      "por"
+    );
+
+    console.log("🧠 OCR EXTRAÍDO:", text.slice(0, 200));
+    return text;
+  } catch (e) {
+    console.log("❌ Erro OCR:", e.message);
+    return "";
+  }
+}
+
+// 🔥 NORMALIZAÇÃO (IMPORTANTE PRA MATCH)
+function normalizarTexto(txt) {
+  return (txt || "")
+    .toUpperCase()
+    .replace(/[^A-Z0-9 ]/g, "")
+    .trim();
+}
+
+// 🔥 ENVIO
 async function enviarParaBackend(tx, tentativa = 1) {
   try {
-    if (!tx.txid || tx.txid.length < 10) return false;
-    if (!tx.valorLiquido || tx.valorLiquido <= 0) return false;
+    if (!tx.txid || tx.txid.length < 5) return false;
+
+    let nomePagador = tx.nomePagador || null;
+
+    // 🔥 SE NÃO TEM NOME → TENTA OCR
+    if (!nomePagador && tx.imagemComprovante) {
+      const textoOCR = await lerTextoImagem(tx.imagemComprovante);
+
+      // tentativa simples de pegar nome
+      nomePagador = textoOCR.split("\n")[0] || null;
+    }
 
     const payload = {
       txid: tx.txid,
       valorLiquido: tx.valorLiquido,
-      nomePagador: tx.nomePagador || null,
+      nomePagador: normalizarTexto(nomePagador),
       dataHora: tx.dataHora || null,
       idTransacao: tx.idTransacao || null,
       raw: tx.raw || null
@@ -80,12 +114,12 @@ async function enviarParaBackend(tx, tentativa = 1) {
       throw new Error(await res.text());
     }
 
-    console.log("✅ Enviado:", tx.txid);
+    console.log("✅ Aprovado:", tx.txid);
     return true;
 
   } catch (e) {
     if (tentativa < RETRY_LIMIT) {
-      console.log("🔁 Retry:", tx.txid, "| tentativa", tentativa);
+      console.log("🔁 Retry:", tx.txid);
       await new Promise(r => setTimeout(r, 1000));
       return enviarParaBackend(tx, tentativa + 1);
     }
@@ -95,30 +129,22 @@ async function enviarParaBackend(tx, tentativa = 1) {
   }
 }
 
-// 🔥 PROCESSAMENTO PARALELO
+// 🔥 PROCESSAMENTO
 async function processarFila() {
   const chunk = fila.splice(0, MAX_CONCURRENCY);
 
   await Promise.all(chunk.map(async (tx) => {
     const sucesso = await enviarParaBackend(tx);
 
-    if (sucesso) {
-  txidsProcessados.add(tx.txid);
-  salvarCache();
-} else {
-  console.log("❌ Ignorado após falha:", tx.txid);
-
-  // 🔥 marca como processado para não travar fila
-  txidsProcessados.add(tx.txid);
-  salvarCache();
-}
+    // 🔥 SEM LOOP INFINITO
+    txidsProcessados.add(tx.txid);
+    salvarCache();
   }));
 }
 
-// 🔥 LOOP PRINCIPAL
-ultimoLoop = Date.now();
+// 🔥 LOOP
 async function loop() {
-  ultimoLoop = Date.now(); // 🔥 ESSENCIAL
+  ultimoLoop = Date.now();
 
   if (executando) return;
   executando = true;
@@ -134,10 +160,9 @@ async function loop() {
     console.log("📊 Capturadas:", transacoes.length);
 
     for (const tx of transacoes) {
-      if (!tx.txid || tx.txid.length < 10) continue;
+      if (!tx.txid) continue;
       if (txidsProcessados.has(tx.txid)) continue;
 
-      // evita duplicar na fila
       if (!fila.find(t => t.txid === tx.txid)) {
         fila.push(tx);
       }
@@ -149,28 +174,26 @@ async function loop() {
 
   } catch (e) {
     console.log("❌ Loop erro:", e.message);
-
-    // 🔥 RECUPERAÇÃO AUTOMÁTICA
-    console.log("🔄 Reiniciando processo por erro...");
-process.exit(1);
+    console.log("🔄 Reiniciando...");
+    process.exit(1);
   } finally {
     executando = false;
   }
 }
 
-// 🔥 WATCHDOG (ANTI-TRAVA)
+// 🔥 WATCHDOG
 setInterval(() => {
   const tempoParado = Date.now() - ultimoLoop;
 
-  if (tempoParado > 60000) { // 🔥 60 segundos (IDEAL)
-    console.log("💥 Bot travou de verdade, reiniciando processo...");
+  if (tempoParado > 60000) {
+    console.log("💥 Travou, reiniciando...");
     process.exit(1);
   }
 }, 30000);
 
 // 🚀 START
 async function start() {
-  console.log("🚀 BOT PRODUÇÃO INICIADO");
+  console.log("🚀 BOT INICIADO");
   console.log("🔗 Backend:", process.env.BACKEND_URL);
 
   await loop();
