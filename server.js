@@ -2269,6 +2269,27 @@ const valorFinal = calcularCreditoSigmo(valorBruto);
   }
 });
 
+app.get("/deposito/pendentes", async (req, res) => {
+  try {
+    const result = await pool.query(`
+      SELECT * FROM depositos
+      WHERE status = 'pendente'
+      AND tipo_transacao = 'entrada'
+      ORDER BY criado_em ASC
+    `);
+
+    res.json(result.rows.map(row => ({
+      id: row.id,
+      valor: Number(row.valor),
+      comprovante: row.comprovante_url
+    })));
+
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Erro ao buscar pendentes" });
+  }
+});
+
 initDB()
   .then(() => {
     startBackupScheduler();
