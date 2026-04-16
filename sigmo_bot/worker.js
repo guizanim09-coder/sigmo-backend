@@ -19,7 +19,6 @@ const CACHE_FILE = "./txids.json";
 let txidsProcessados = new Set();
 let fila = [];
 let executando = false;
-let ultimoLoop = Date.now();
 
 // 🔄 carregar cache
 if (fs.existsSync(CACHE_FILE)) {
@@ -103,23 +102,16 @@ async function processarFila() {
     const sucesso = await enviarParaBackend(tx);
 
     if (sucesso) {
-  txidsProcessados.add(tx.txid);
-  salvarCache();
-} else {
-  console.log("❌ Ignorado após falha:", tx.txid);
-
-  // 🔥 marca como processado para não travar fila
-  txidsProcessados.add(tx.txid);
-  salvarCache();
-}
+      txidsProcessados.add(tx.txid);
+      salvarCache();
+    } else {
+      fila.push(tx); // reprocessa depois
+    }
   }));
 }
 
 // 🔥 LOOP PRINCIPAL
-ultimoLoop = Date.now();
 async function loop() {
-  ultimoLoop = Date.now(); // 🔥 ESSENCIAL
-
   if (executando) return;
   executando = true;
 
@@ -151,8 +143,7 @@ async function loop() {
     console.log("❌ Loop erro:", e.message);
 
     // 🔥 RECUPERAÇÃO AUTOMÁTICA
-    console.log("🔄 Reiniciando processo por erro...");
-process.exit(1);
+    await resetBrowser();
   } finally {
     executando = false;
   }
@@ -160,12 +151,9 @@ process.exit(1);
 
 // 🔥 WATCHDOG (ANTI-TRAVA)
 setInterval(() => {
-  const tempoParado = Date.now() - ultimoLoop;
-
-  if (tempoParado > 60000) { // 🔥 60 segundos (IDEAL)
-    console.log("💥 Bot travou de verdade, reiniciando processo...");
-    process.exit(1);
-  }
+  if (!executando) return;
+  console.log("⚠️ Loop possivelmente travado, resetando browser...");
+  resetBrowser();
 }, 30000);
 
 // 🚀 START
