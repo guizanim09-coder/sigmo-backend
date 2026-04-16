@@ -2129,17 +2129,21 @@ app.post("/deposito/confirmar-bot", async (req, res) => {
   try {
     const { txid, valorLiquido } = req.body;
 
-    if (!txid) {
-      return res.status(400).json({ error: "TXID obrigatório" });
-    }
+    if (!valorLiquido || valorLiquido <= 0) {
+  return res.status(400).json({ error: "Valor obrigatório" });
+}
 
     const resultado = await runInTransaction(async (client) => {
 
       // 🔒 EVITA DUPLICAÇÃO
-      const existente = await client.query(
-        `SELECT id FROM financial_transactions WHERE reference_key = $1 LIMIT 1`,
-        [`dentpeg:${txid}`]
-      );
+      let existente = { rows: [] };
+
+if (txid) {
+  existente = await client.query(
+    `SELECT id FROM financial_transactions WHERE reference_key = $1 LIMIT 1`,
+    [`dentpeg:${txid}`]
+  );
+}
 
       if (existente.rows.length > 0) {
         return { duplicado: true };
@@ -2167,7 +2171,7 @@ app.post("/deposito/confirmar-bot", async (req, res) => {
   const dep = mapDeposito(row);
 
   // 🔒 prioridade se já tiver txid salvo
-  if (dep.metadata?.txid && dep.metadata.txid === txid) {
+  if (txid && dep.metadata?.txid && dep.metadata.txid === txid) {
     depositoMatch = dep;
     break;
   }

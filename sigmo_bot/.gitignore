@@ -1,6 +1,4 @@
-.env
+node_modules/
 storage.json
 txids.json
-*.png
-tmp*
-node_modules/
+.env
