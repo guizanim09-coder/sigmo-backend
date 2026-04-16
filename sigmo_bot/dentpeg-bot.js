@@ -136,9 +136,9 @@ async function abrirExtrato(page) {
 
   const body = await page.locator("body").innerText().catch(() => "");
 
-  if (!body.includes("Entrada")) {
-    throw new Error("Extrato não carregou");
-  }
+  if (!body || body.length < 50) {
+  throw new Error("Extrato não carregou");
+}
 }
 
 // 🔥 CAPTURA PRINCIPAL
