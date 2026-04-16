@@ -5,199 +5,151 @@ const Tesseract = require("tesseract.js");
 
 const {
   setupLogin,
-  capturarTransacoes,
-  resetBrowser
+  capturarTransacoes
 } = require("./dentpeg-bot");
 
-// 🔒 CONFIG PRODUÇÃO
 const LOOP_INTERVAL = 4000;
-const MAX_CONCURRENCY = 3;
-const RETRY_LIMIT = 2;
-
-// 🔒 cache persistente
 const CACHE_FILE = "./txids.json";
 
 let txidsProcessados = new Set();
-let fila = [];
-let executando = false;
 let ultimoLoop = Date.now();
 
 // 🔄 carregar cache
 if (fs.existsSync(CACHE_FILE)) {
   try {
-    const data = JSON.parse(fs.readFileSync(CACHE_FILE));
-    txidsProcessados = new Set(data);
+    txidsProcessados = new Set(JSON.parse(fs.readFileSync(CACHE_FILE)));
   } catch {
     txidsProcessados = new Set();
   }
 }
 
-// 🔥 LOGIN
-if (process.argv.includes("setup")) {
-  setupLogin();
-  return;
-}
-
-// 🔥 valida env
-if (!process.env.BACKEND_URL) {
-  console.log("❌ BACKEND_URL não definida");
-  process.exit(1);
-}
-
-// 💾 salvar cache
 function salvarCache() {
-  try {
-    fs.writeFileSync(CACHE_FILE, JSON.stringify([...txidsProcessados]));
-  } catch (e) {
-    console.log("⚠️ Erro cache:", e.message);
-  }
+  fs.writeFileSync(CACHE_FILE, JSON.stringify([...txidsProcessados]));
 }
 
-// 🔥 OCR PARA IMAGEM
-async function lerTextoImagem(caminho) {
+// 🔥 OCR
+async function lerTextoImagem(url) {
   try {
-    const { data: { text } } = await Tesseract.recognize(
-      caminho,
-      "por"
-    );
+    const response = await fetch(url);
+    const buffer = await response.buffer();
 
-    console.log("🧠 OCR EXTRAÍDO:", text.slice(0, 200));
-    return text;
+    const path = "./tmp.png";
+    fs.writeFileSync(path, buffer);
+
+    const { data: { text } } = await Tesseract.recognize(path, "por");
+
+    return text.toUpperCase();
   } catch (e) {
-    console.log("❌ Erro OCR:", e.message);
+    console.log("❌ OCR erro:", e.message);
     return "";
   }
 }
 
-// 🔥 NORMALIZAÇÃO (IMPORTANTE PRA MATCH)
-function normalizarTexto(txt) {
+// 🔥 NORMALIZA TEXTO
+function normalizar(txt) {
   return (txt || "")
     .toUpperCase()
     .replace(/[^A-Z0-9 ]/g, "")
     .trim();
 }
 
-// 🔥 ENVIO
-async function enviarParaBackend(tx, tentativa = 1) {
-  try {
-    if (!tx.txid || tx.txid.length < 5) return false;
+// 🔥 COMPARAÇÃO COM TAXA REAL
+function bateValorComTaxa(valorExtrato, valorPedido) {
+  if (!valorExtrato || !valorPedido) return false;
 
-    let nomePagador = tx.nomePagador || null;
+  const taxaMin = (valorPedido * 0.0079) + 0.99;
+  const taxaMax = (valorPedido * 0.019) + 0.99;
 
-    // 🔥 SE NÃO TEM NOME → TENTA OCR
-    if (!nomePagador && tx.imagemComprovante) {
-      const textoOCR = await lerTextoImagem(tx.imagemComprovante);
+  const valorMin = valorPedido - taxaMax;
+  const valorMax = valorPedido - taxaMin;
 
-      // tentativa simples de pegar nome
-      nomePagador = textoOCR.split("\n")[0] || null;
-    }
+  return valorExtrato >= valorMin && valorExtrato <= valorMax;
+}
 
-    const payload = {
+// 🔥 BUSCAR PEDIDOS
+async function buscarPendentes() {
+  const res = await fetch(process.env.BACKEND_URL + "/deposito/pendentes");
+  return res.json();
+}
+
+// 🔥 APROVAR
+async function aprovar(pedidoId, tx) {
+  await fetch(process.env.BACKEND_URL + "/deposito/confirmar-bot", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      pedidoId,
       txid: tx.txid,
-      valorLiquido: tx.valorLiquido,
-      nomePagador: normalizarTexto(nomePagador),
-      dataHora: tx.dataHora || null,
-      idTransacao: tx.idTransacao || null,
-      raw: tx.raw || null
-    };
+      valor: tx.valorLiquido
+    })
+  });
 
-    const res = await fetch(process.env.BACKEND_URL + "/deposito/confirmar-bot", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json"
-      },
-      body: JSON.stringify(payload),
-      timeout: 10000
-    });
-
-    if (!res.ok) {
-      throw new Error(await res.text());
-    }
-
-    console.log("✅ Aprovado:", tx.txid);
-    return true;
-
-  } catch (e) {
-    if (tentativa < RETRY_LIMIT) {
-      console.log("🔁 Retry:", tx.txid);
-      await new Promise(r => setTimeout(r, 1000));
-      return enviarParaBackend(tx, tentativa + 1);
-    }
-
-    console.log("❌ Falha final:", tx.txid, e.message);
-    return false;
-  }
+  console.log("✅ APROVADO:", pedidoId);
 }
 
-// 🔥 PROCESSAMENTO
-async function processarFila() {
-  const chunk = fila.splice(0, MAX_CONCURRENCY);
-
-  await Promise.all(chunk.map(async (tx) => {
-    const sucesso = await enviarParaBackend(tx);
-
-    // 🔥 SEM LOOP INFINITO
-    txidsProcessados.add(tx.txid);
-    salvarCache();
-  }));
-}
-
-// 🔥 LOOP
+// 🔥 LOOP PRINCIPAL
 async function loop() {
   ultimoLoop = Date.now();
 
-  if (executando) return;
-  executando = true;
-
   try {
     const transacoes = await capturarTransacoes();
+    const pedidos = await buscarPendentes();
 
-    if (!transacoes || transacoes.length === 0) {
-      console.log("🔍 Nenhuma transação...");
+    if (!transacoes.length || !pedidos.length) {
+      console.log("🔍 Nada para processar");
       return;
     }
 
-    console.log("📊 Capturadas:", transacoes.length);
+    console.log("📊 Transações:", transacoes.length);
+    console.log("📦 Pendentes:", pedidos.length);
 
     for (const tx of transacoes) {
-      if (!tx.txid) continue;
-      if (txidsProcessados.has(tx.txid)) continue;
+      if (!tx.txid || txidsProcessados.has(tx.txid)) continue;
 
-      if (!fila.find(t => t.txid === tx.txid)) {
-        fila.push(tx);
+      for (const pedido of pedidos) {
+        try {
+          const url = process.env.BACKEND_URL + "/" + pedido.comprovante;
+
+          const textoOCR = await lerTextoImagem(url);
+          const nomeOCR = textoOCR.split("\n")[0];
+
+          const nomeExtrato = tx.nomePagador;
+
+          if (
+            bateValorComTaxa(tx.valorLiquido, pedido.valor) &&
+            normalizar(nomeOCR).includes(normalizar(nomeExtrato))
+          ) {
+            await aprovar(pedido.id, tx);
+
+            txidsProcessados.add(tx.txid);
+            salvarCache();
+            break;
+          }
+
+        } catch (e) {
+          console.log("Erro match:", e.message);
+        }
       }
     }
 
-    console.log("📦 Fila:", fila.length);
-
-    await processarFila();
-
   } catch (e) {
-    console.log("❌ Loop erro:", e.message);
-    console.log("🔄 Reiniciando...");
-    process.exit(1);
-  } finally {
-    executando = false;
+    console.log("❌ Erro loop:", e.message);
   }
 }
 
-// 🔥 WATCHDOG
+// 🔁 WATCHDOG
 setInterval(() => {
-  const tempoParado = Date.now() - ultimoLoop;
-
-  if (tempoParado > 60000) {
+  if (Date.now() - ultimoLoop > 60000) {
     console.log("💥 Travou, reiniciando...");
     process.exit(1);
   }
 }, 30000);
 
 // 🚀 START
-async function start() {
-  console.log("🚀 BOT INICIADO");
+(async () => {
+  console.log("🚀 BOT FINAL INICIADO");
   console.log("🔗 Backend:", process.env.BACKEND_URL);
 
   await loop();
   setInterval(loop, LOOP_INTERVAL);
-}
-
-start();
+})();

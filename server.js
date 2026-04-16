@@ -2164,31 +2164,35 @@ app.post("/deposito/confirmar-bot", async (req, res) => {
       let depositoMatch = null;
 
       for (const row of candidatos.rows) {
-        const dep = mapDeposito(row);
+  const dep = mapDeposito(row);
 
-        const calc = calcularLiquidoDentpeg(dep.valor);
+  // 🔒 prioridade se já tiver txid salvo
+  if (dep.metadata?.txid && dep.metadata.txid === txid) {
+    depositoMatch = dep;
+    break;
+  }
 
-        let bate = false;
+  const calc = calcularLiquidoDentpeg(dep.valor);
 
-        if (typeof calc === "number") {
-          // até 99 reais
-          bate = Math.abs(calc - valorBot) < 0.01;
-        } else {
-          // acima de 100
-          bate = valorBot >= calc.min && valorBot <= calc.max;
-        }
+  let bate = false;
 
-        if (bate) {
-          depositoMatch = dep;
-          break;
-        }
-      }
+  if (typeof calc === "number") {
+    bate = Math.abs(calc - valorBot) < 0.01;
+  } else {
+    bate = valorBot >= calc.min && valorBot <= calc.max;
+  }
 
-      if (!depositoMatch) {
-        throw new Error("Nenhum depósito compatível encontrado");
-      }
+  if (bate) {
+    depositoMatch = dep;
+    break;
+  }
+}
 
-      const usuario = await getUserByIdForUpdate(depositoMatch.userId, client);
+if (!depositoMatch) {
+  throw new Error("Nenhum depósito compatível encontrado");
+}
+
+const usuario = await getUserByIdForUpdate(depositoMatch.userId, client);
 
 // 🔥 NOVO (SIGMO)
 const valorBruto = toMoney(depositoMatch.valor);

@@ -10,7 +10,7 @@ let contextRef = null;
 let pageRef = null;
 let booting = null;
 
-// 🔥 INICIAR BROWSER
+// 🔥 INIT
 async function iniciarBrowser() {
   if (browserRef && contextRef && pageRef) {
     return { browser: browserRef, context: contextRef, page: pageRef };
@@ -21,14 +21,10 @@ async function iniciarBrowser() {
   booting = (async () => {
     const browser = await chromium.launch({
       headless: true,
-      args: [
-        "--disable-dev-shm-usage",
-        "--no-sandbox"
-      ]
+      args: ["--no-sandbox"]
     });
 
     const contextOptions = {
-      permissions: ["clipboard-read", "clipboard-write"],
       viewport: { width: 1366, height: 900 }
     };
 
@@ -38,8 +34,6 @@ async function iniciarBrowser() {
 
     const context = await browser.newContext(contextOptions);
     const page = await context.newPage();
-
-    page.setDefaultTimeout(5000);
 
     browserRef = browser;
     contextRef = context;
@@ -68,18 +62,12 @@ async function resetBrowser() {
   pageRef = null;
 }
 
-// 🔥 SALVAR SESSÃO
-async function salvarSessao(context) {
-  await context.storageState({ path: STORAGE_PATH });
-}
-
 // 🔥 NORMALIZAR VALOR
 function normalizarValorBR(valorTexto) {
   if (!valorTexto) return null;
 
   const limpo = String(valorTexto)
-    .replace(/[^\d,.-]/g, "")
-    .replace(/\./g, "")
+    .replace(/[^\d,]/g, "")
     .replace(",", ".");
 
   const numero = Number(limpo);
@@ -87,17 +75,14 @@ function normalizarValorBR(valorTexto) {
 }
 
 // 🔥 EXTRAIR TEXTO
-function extrairTextoSeguro(texto, regex) {
+function extrairTexto(texto, regex) {
   const match = String(texto || "").match(regex);
   return match ? match[1].trim() : null;
 }
 
 // 🔥 NOME MAIS INTELIGENTE
-function extrairNomePagador(texto) {
-  const linhas = String(texto || "")
-    .split("\n")
-    .map(l => l.trim())
-    .filter(Boolean);
+function extrairNome(texto) {
+  const linhas = texto.split("\n").map(l => l.trim()).filter(Boolean);
 
   for (const linha of linhas) {
     const upper = linha.toUpperCase();
@@ -106,7 +91,6 @@ function extrairNomePagador(texto) {
       linha.length > 5 &&
       !upper.includes("PIX") &&
       !upper.includes("CONFIRMADO") &&
-      !upper.includes("BRUTO") &&
       !upper.includes("TXID") &&
       !upper.includes("ENTRADA") &&
       !upper.includes("SAÍDA") &&
@@ -120,106 +104,55 @@ function extrairNomePagador(texto) {
   return null;
 }
 
-// 🔥 LOGIN CHECK
-async function estaNaAreaLogada(page) {
-  const texto = await page.locator("body").innerText().catch(() => "");
-  const lower = String(texto || "").toLowerCase();
-
-  return !(lower.includes("sign in") || lower.includes("get started"));
-}
-
-// 🔥 FECHAR POPUPS
-async function fecharPopups(page) {
-  try {
-    const botoes = [
-      'button:has-text("Depois")',
-      'button:has-text("Later")',
-      'button:has-text("Close")',
-      'button[aria-label="Close"]'
-    ];
-
-    for (const sel of botoes) {
-      const el = page.locator(sel).first();
-      if (await el.count()) {
-        await el.click({ force: true }).catch(() => {});
-      }
-    }
-  } catch {}
-}
-
-// 🔥 ABRIR EXTRATO
-async function abrirExtratoRapido(page) {
-  await page.goto(STATEMENT_URL, { waitUntil: "domcontentloaded" }).catch(() => {});
-  await page.waitForTimeout(500);
-
-  const logado = await estaNaAreaLogada(page);
-  if (!logado) {
-    throw new Error("Sessão inválida");
-  }
-}
-
-// 🔥 LOGIN MANUAL
-async function setupLogin() {
-  await resetBrowser();
-  const { browser, context, page } = await iniciarBrowser();
-
-  await page.goto(APP_URL);
-
-  console.log("👉 Faça login e vá até o extrato");
-  console.log("👉 Pressione ENTER aqui");
-
-  await new Promise(resolve => {
-    process.stdin.resume();
-    process.stdin.once("data", resolve);
-  });
-
-  await salvarSessao(context);
-  await browser.close();
-
-  console.log("✅ Sessão salva");
-}
-
-// 🔥 CAPTURA TXID
-async function capturarTxidDoCard(page, card, textoCard) {
-  let txid = null;
-
+// 🔥 TXID
+async function capturarTxid(page, card, texto) {
   try {
     const botao = card.locator('text=TXID').first();
 
     if (await botao.count()) {
-      await botao.click({ force: true }).catch(() => {});
+      await botao.click().catch(() => {});
       await page.waitForTimeout(200);
 
-      txid = await page.evaluate(async () => {
+      const txid = await page.evaluate(async () => {
         try {
           return await navigator.clipboard.readText();
         } catch {
           return "";
         }
       });
+
+      if (txid && txid.length > 10) return txid.trim();
     }
   } catch {}
 
-  if (!txid) {
-    const match = String(textoCard).match(/([a-f0-9]{20,})/i);
-    txid = match ? match[1] : null;
-  }
-
-  return txid;
+  const match = texto.match(/([a-f0-9]{20,})/i);
+  return match ? match[1] : null;
 }
 
-// 🔥 CAPTURA PRINCIPAL (AGORA PREPARADA PRA OCR)
+// 🔥 ABRIR EXTRATO
+async function abrirExtrato(page) {
+  await page.goto(STATEMENT_URL, { waitUntil: "domcontentloaded" });
+  await page.waitForTimeout(800);
+
+  const body = await page.locator("body").innerText().catch(() => "");
+
+  if (!body.includes("Entrada")) {
+    throw new Error("Extrato não carregou");
+  }
+}
+
+// 🔥 CAPTURA PRINCIPAL
 async function capturarTransacoes() {
   try {
     const { page } = await iniciarBrowser();
 
-    await abrirExtratoRapido(page);
+    await abrirExtrato(page);
 
     const cards = page.locator("div").filter({
       has: page.getByText("Entrada")
     });
 
-    const total = Math.min(await cards.count(), 20);
+    const total = Math.min(await cards.count(), 15);
     const transacoes = [];
 
     for (let i = 0; i < total; i++) {
@@ -227,23 +160,25 @@ async function capturarTransacoes() {
         const card = cards.nth(i);
         const texto = await card.innerText();
 
-        if (!texto.includes("CONFIRMADO")) continue;
+        if (!texto || !texto.includes("CONFIRMADO")) continue;
 
-        const valorTexto = extrairTextoSeguro(texto, /([\d.,]+)/);
+        const valorTexto = extrairTexto(texto, /([\d.,]+)/);
         const valor = normalizarValorBR(valorTexto);
 
-        const nomePagador = extrairNomePagador(texto);
-        const txid = await capturarTxidDoCard(page, card, texto);
+        if (!valor) continue;
 
-        // 🔥 PRINT DO CARD (PARA OCR FUTURO)
-        const imagemPath = `./tmp_${Date.now()}_${i}.png`;
-        await card.screenshot({ path: imagemPath }).catch(() => {});
+        const nomePagador = extrairNome(texto);
+        const txid = await capturarTxid(page, card, texto);
+
+        // 🔥 screenshot para OCR
+        const path = `./tmp_${Date.now()}_${i}.png`;
+        await card.screenshot({ path }).catch(() => {});
 
         transacoes.push({
           valorLiquido: valor,
           nomePagador,
           txid,
-          imagemComprovante: imagemPath,
+          imagemComprovante: path,
           raw: texto
         });
 
@@ -255,9 +190,32 @@ async function capturarTransacoes() {
     return transacoes;
 
   } catch (e) {
+    console.log("Erro captura:", e.message);
     await resetBrowser();
     return [];
   }
+}
+
+// 🔥 LOGIN
+async function setupLogin() {
+  await resetBrowser();
+  const { browser, context, page } = await iniciarBrowser();
+
+  await page.goto(APP_URL);
+
+  console.log("👉 Faça login manualmente");
+  console.log("👉 Vá até o extrato");
+  console.log("👉 Pressione ENTER");
+
+  await new Promise(r => {
+    process.stdin.resume();
+    process.stdin.once("data", r);
+  });
+
+  await context.storageState({ path: STORAGE_PATH });
+  await browser.close();
+
+  console.log("✅ Sessão salva");
 }
 
 module.exports = {
