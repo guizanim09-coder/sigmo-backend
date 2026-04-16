@@ -432,7 +432,6 @@ async function initDB() {
   await ensureColumn("depositos", "chave_pix", "TEXT DEFAULT ''");
   await ensureColumn("depositos", "tipo_chave", "TEXT DEFAULT ''");
   await ensureColumn("depositos", "descricao", "TEXT DEFAULT ''");
-await ensureColumn("depositos", "metadata", "JSONB DEFAULT '{}'::jsonb");
   await ensureColumn("depositos", "aprovado_em", "TIMESTAMP");
   await ensureColumn("depositos", "recusado_em", "TIMESTAMP");
   await ensureColumn("depositos", "comprovante_enviado_em", "TIMESTAMP");
@@ -691,7 +690,6 @@ function mapDeposito(row) {
     status: row.status || "pendente",
     comprovanteUrl: row.comprovante_url || "",
     descricao: row.descricao || "",
-    metadata: row.metadata || {},
     criadoEm: row.criado_em || null,
     aprovadoEm: row.aprovado_em || null,
     recusadoEm: row.recusado_em || null,
@@ -835,9 +833,9 @@ async function saveDeposito(dep, client = pool) {
     `
     INSERT INTO depositos (
       id, user_id, valor, chave_pix, tipo_chave, tipo_transacao, status,
-      comprovante_url, descricao, metadata, criado_em, aprovado_em, recusado_em, comprovante_enviado_em
+      comprovante_url, descricao, criado_em, aprovado_em, recusado_em, comprovante_enviado_em
     )
-    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
     ON CONFLICT (id) DO UPDATE SET
       user_id = EXCLUDED.user_id,
       valor = EXCLUDED.valor,
@@ -847,7 +845,6 @@ async function saveDeposito(dep, client = pool) {
       status = EXCLUDED.status,
       comprovante_url = EXCLUDED.comprovante_url,
       descricao = EXCLUDED.descricao,
-      metadata = EXCLUDED.metadata,
       criado_em = COALESCE(depositos.criado_em, EXCLUDED.criado_em),
       aprovado_em = EXCLUDED.aprovado_em,
       recusado_em = EXCLUDED.recusado_em,
@@ -863,7 +860,6 @@ async function saveDeposito(dep, client = pool) {
       dep.status || "pendente",
       dep.comprovanteUrl || "",
       dep.descricao || "",
-      JSON.stringify(dep.metadata || {}),
       dep.criadoEm || db(),
       dep.aprovadoEm || null,
       dep.recusadoEm || null,
@@ -1297,7 +1293,7 @@ app.post("/usuario/delete", async (req, res) => {
 
 app.post("/deposito", async (req, res) => {
   try {
-    const { userId, valor, chavePix, tipoChave, tipoTransacao, repassarTaxa } = req.body;
+    const { userId, valor, chavePix, tipoChave, tipoTransacao } = req.body;
 
     if (!userId || valor === undefined || valor === null) {
       return res.status(400).json({ error: "userId e valor são obrigatórios" });
@@ -1305,102 +1301,35 @@ app.post("/deposito", async (req, res) => {
 
     const valorNumero = toMoney(valor);
 
-    const taxa =
-      valorNumero <= 100
-        ? 9
-        : toMoney(valorNumero * 0.09);
-
-    let valorFinal = valorNumero;
-
-    if (tipoTransacao === "saida") {
-      if (repassarTaxa) {
-        valorFinal = toMoney(valorNumero - taxa);
-      } else {
-        valorFinal = valorNumero;
-      }
-    }
-
     if (!Number.isFinite(valorNumero) || valorNumero <= 0) {
       return res.status(400).json({ error: "Valor inválido" });
     }
 
-    const result = await runInTransaction(async (client) => {
+    const user = await getUserById(userId);
 
-const pedidoId = buildId("dep");
-
-  const user = await getUserByIdForUpdate(userId, client);
-
-  if (!user) {
-    throw new Error("Usuário não encontrado");
-  }
-
-  if (tipoTransacao === "saida") {
-    const saldoAtual = toMoney(user.saldo);
-
-    const valorNecessario = repassarTaxa
-      ? valorNumero
-      : toMoney(valorNumero + taxa);
-
-    if (saldoAtual < valorNecessario) {
-      throw new Error("Saldo insuficiente");
+    if (!user) {
+      return res.status(404).json({ error: "Usuário não encontrado" });
     }
 
-const tx = await createFinancialTransaction(client, {
-  userId: user.id,
-  referenceKey: `deposito:${pedidoId}:hold`,
-  sourceType: "deposito",
-  sourceId: pedidoId,
-  operationType: "withdrawal_hold",
-  direction: "debit",
-  amount: valorNecessario,
-  description: "Saldo reservado para saque",
-  metadata: { repassarTaxa }
-});
+    const pedido = {
+      id: buildId("dep"),
+      userId,
+      valor: valorNumero,
+      chavePix: chavePix || "",
+      tipoChave: tipoChave || "",
+      tipoTransacao: tipoTransacao || "entrada",
+      status: "pendente",
+      comprovanteUrl: "",
+      descricao: "",
+      criadoEm: db(),
+      aprovadoEm: null,
+      recusadoEm: null,
+      comprovanteEnviadoEm: null
+    };
 
-    await applyLedgerChange(client, {
-      userId: user.id,
-      financialTransactionId: tx.id,
-      entryType: "debit",
-      amount: valorNecessario,
-      description: "Reserva de saldo para saque",
-      metadata: { repassarTaxa }
-    });
-  }
+    await saveDeposito(pedido);
 
-  const pedido = {
-    id: pedidoId,
-    userId,
-    valor: valorFinal,
-    chavePix: chavePix || "",
-    tipoChave: tipoChave || "",
-    tipoTransacao: tipoTransacao || "entrada",
-    status: "pendente",
-    comprovanteUrl: "",
-    descricao: "",
-    criadoEm: db(),
-    aprovadoEm: null,
-    recusadoEm: null,
-    comprovanteEnviadoEm: null,
-    metadata: {
-      valorOriginal: valorNumero,
-      descontoSaldo:
-        tipoTransacao === "saida"
-          ? (repassarTaxa
-              ? valorNumero
-              : toMoney(valorNumero + taxa))
-          : valorNumero,
-      taxa: tipoTransacao === "saida" ? taxa : 0,
-      repassarTaxa: !!repassarTaxa
-    }
-  };
-
-  await saveDeposito(pedido, client);
-
-  return pedido;
-});
-
-res.status(201).json(result);
-
+    res.status(201).json(pedido);
   } catch (error) {
     console.error(error);
     res.status(500).json({ error: "Erro ao criar pedido" });
@@ -1656,12 +1585,7 @@ app.post("/aprovar", authAdmin, async (req, res) => {
       }
 
       const valorPedido = toMoney(pedido.valor);
-
-let valorFinal = valorPedido;
-
-if (pedido.tipoTransacao === "entrada") {
-  valorFinal = calcularCreditoSigmo(valorPedido);
-}
+const valorFinal = calcularCreditoSigmo(valorPedido);
 
       if (!Number.isFinite(valorPedido) || valorPedido <= 0) {
         throw new Error("Valor do pedido inválido");
@@ -1691,22 +1615,18 @@ if (pedido.tipoTransacao === "entrada") {
         }
       });
 
-let usuarioAtualizado = usuario;
-
-if (!isSaida) {
-  usuarioAtualizado = await applyLedgerChange(client, {
-    userId: usuario.id,
-    financialTransactionId: financialTx.id,
-    entryType: "credit",
-    amount: valorFinal,
-    description,
-    metadata: {
-      pedidoId: pedido.id,
-      tipoTransacao: pedido.tipoTransacao,
-      adminId: req.admin.sub
-    }
-  });
-}
+      const usuarioAtualizado = await applyLedgerChange(client, {
+        userId: usuario.id,
+        financialTransactionId: financialTx.id,
+        entryType: isSaida ? "debit" : "credit",
+        amount: valorFinal,
+        description,
+        metadata: {
+          pedidoId: pedido.id,
+          tipoTransacao: pedido.tipoTransacao,
+          adminId: req.admin.sub
+        }
+      });
 
       pedido.status = "aprovado";
       pedido.aprovadoEm = db();
@@ -1768,33 +1688,9 @@ app.post("/recusar", authAdmin, async (req, res) => {
       }
 
       pedido.status = "recusado";
-pedido.recusadoEm = db();
+      pedido.recusadoEm = db();
 
-if (pedido.tipoTransacao === "saida") {
-  const meta = pedido.metadata || {};
-  const valorDevolver = meta.descontoSaldo || pedido.valor;
-
-  const tx = await createFinancialTransaction(client, {
-    userId: pedido.userId,
-    referenceKey: `deposito:${pedido.id}:refund`,
-    sourceType: "deposito",
-    sourceId: pedido.id,
-    operationType: "refund",
-    direction: "credit",
-    amount: valorDevolver,
-    description: "Devolução de saldo - saque recusado"
-  });
-
-  await applyLedgerChange(client, {
-    userId: pedido.userId,
-    financialTransactionId: tx.id,
-    entryType: "credit",
-    amount: valorDevolver,
-    description: "Saldo devolvido (saque recusado)"
-  });
-}
-
-await saveDeposito(pedido, client);
+      await saveDeposito(pedido, client);
 
       await createAuditLog(client, {
         adminId: req.admin.sub,
@@ -2168,35 +2064,31 @@ if (txid) {
       let depositoMatch = null;
 
       for (const row of candidatos.rows) {
-  const dep = mapDeposito(row);
+        const dep = mapDeposito(row);
 
-  // 🔒 prioridade se já tiver txid salvo
-  if (txid && dep.metadata?.txid && dep.metadata.txid === txid) {
-    depositoMatch = dep;
-    break;
-  }
+        const calc = calcularLiquidoDentpeg(dep.valor);
 
-  const calc = calcularLiquidoDentpeg(dep.valor);
+        let bate = false;
 
-  let bate = false;
+        if (typeof calc === "number") {
+          // até 99 reais
+          bate = Math.abs(calc - valorBot) < 1.0;
+        } else {
+          // acima de 100
+          bate = valorBot >= calc.min && valorBot <= calc.max;
+        }
 
-  if (typeof calc === "number") {
-    bate = Math.abs(calc - valorBot) < 0.01;
-  } else {
-    bate = valorBot >= calc.min && valorBot <= calc.max;
-  }
+        if (bate) {
+          depositoMatch = dep;
+          break;
+        }
+      }
 
-  if (bate) {
-    depositoMatch = dep;
-    break;
-  }
-}
+      if (!depositoMatch) {
+        throw new Error("Nenhum depósito compatível encontrado");
+      }
 
-if (!depositoMatch) {
-  throw new Error("Nenhum depósito compatível encontrado");
-}
-
-const usuario = await getUserByIdForUpdate(depositoMatch.userId, client);
+      const usuario = await getUserByIdForUpdate(depositoMatch.userId, client);
 
 // 🔥 NOVO (SIGMO)
 const valorBruto = toMoney(depositoMatch.valor);
@@ -2209,9 +2101,9 @@ const valorFinal = calcularCreditoSigmo(valorBruto);
       // 💰 CRIA TRANSAÇÃO
       const tx = await createFinancialTransaction(client, {
         userId: usuario.id,
-        referenceKey: `dentpeg:${txid}`,
+        referenceKey: txid ? `dentpeg:${txid}` : `dentpeg:auto:${Date.now()}`,
         sourceType: "dentpeg",
-        sourceId: txid,
+        sourceId: txid || buildId("dentpeg"),
         operationType: "deposit",
         direction: "credit",
         amount: valorFinal,
@@ -2270,27 +2162,6 @@ const valorFinal = calcularCreditoSigmo(valorBruto);
     res.status(400).json({
       error: error.message || "Erro no depósito automático"
     });
-  }
-});
-
-app.get("/deposito/pendentes", async (req, res) => {
-  try {
-    const result = await pool.query(`
-      SELECT * FROM depositos
-      WHERE status = 'pendente'
-      AND tipo_transacao = 'entrada'
-      ORDER BY criado_em ASC
-    `);
-
-    res.json(result.rows.map(row => ({
-      id: row.id,
-      valor: Number(row.valor),
-      comprovante: row.comprovante_url
-    })));
-
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: "Erro ao buscar pendentes" });
   }
 });
 
