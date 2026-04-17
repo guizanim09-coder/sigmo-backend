@@ -70,9 +70,7 @@ async function enviarParaBackend(tx, tentativa = 1) {
     const payload = {
   txid: tx.txid || null,
   valorLiquido: tx.valorLiquido,
-
-  nomePagador: tx.nomePagador || null
-
+  nomePagador: tx.nomePagador,
   dataHora: parseDataHoraBR(tx.dataHora),
   idTransacao: tx.idTransacao || null,
   raw: tx.raw || null
