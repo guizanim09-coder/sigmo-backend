@@ -2,10 +2,10 @@
   "cookies": [
     {
       "name": "depix_refresh_token",
-      "value": "8dd07a717971866cdf69efe27d6e550a2d0294459814f0fd9e4362d48189464f984c025dcab0d61b",
+      "value": "53681fce495856092d03f327f9e6fc377e6fa9b7849e6f2bc279fe686cc47409c7cc1869bf5b0f62",
       "domain": "api.dentpeg.com",
       "path": "/auth/refresh",
-      "expires": 1776946519.91318,
+      "expires": 1777050843.666476,
       "httpOnly": true,
       "secure": true,
       "sameSite": "Strict"
@@ -15,17 +15,17 @@
       "value": "fb.1.1776237428010.471934102757566452",
       "domain": ".dentpeg.com",
       "path": "/",
-      "expires": 1784117722,
+      "expires": 1784222049,
       "httpOnly": false,
       "secure": false,
       "sameSite": "Lax"
     },
     {
       "name": "depix_user_token",
-      "value": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpYXQiOjE3NzYzNDE3MTksImV4cCI6MTc3NjQyODExOSwic3ViIjoiOTQ3MmIzZDEtNjg4ZC00YmIzLTg2NTAtMTY0MGE5MmIxMzUwIn0.TUp_L-xTJgNazQcHDbrgpMoxQFDEWt-lRlVAwjeLmIY",
+      "value": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpYXQiOjE3NzY0NDYwNDQsImV4cCI6MTc3NjUzMjQ0NCwic3ViIjoiOTQ3MmIzZDEtNjg4ZC00YmIzLTg2NTAtMTY0MGE5MmIxMzUwIn0.RHf9bG36AxEMz-XE5KdxNXv-bBY6RQ63dDmMKp8dRSw",
       "domain": ".dentpeg.com",
       "path": "/",
-      "expires": 1778933719.918675,
+      "expires": 1779038043.671674,
       "httpOnly": false,
       "secure": true,
       "sameSite": "Strict"
@@ -45,7 +45,7 @@
         },
         {
           "name": "lastExternalReferrerTime",
-          "value": "1776341720031"
+          "value": "1776446043795"
         },
         {
           "name": "depix_seen_tiers_modal",

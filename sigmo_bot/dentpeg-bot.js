@@ -21,7 +21,7 @@ async function iniciarBrowser() {
 
   booting = (async () => {
     const browser = await chromium.launch({
-      headless: true,
+      headless: false,
       args: [
         "--disable-dev-shm-usage",
         "--no-sandbox",
