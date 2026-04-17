@@ -294,11 +294,23 @@ async function capturarTransacoes() {
         await fecharPopups(page);
       }
 
-      const cards = page.locator("div").filter({
+    // 🔥 EXPANDIR LISTA
+for (let i = 0; i < 5; i++) {
+  const verMais = page.locator('button:has-text("Ver mais")').first();
+
+  if (await verMais.count()) {
+    await verMais.click().catch(() => {});
+    await page.waitForTimeout(500);
+  } else {
+    break;
+  }
+}  
+
+const cards = page.locator("div").filter({
         has: page.getByText("Entrada", { exact: true })
       });
 
-      const total = Math.min(await cards.count(), 20);
+      const total = Math.min(await cards.count(), 100);
       const transacoes = [];
 
       for (let i = 0; i < total; i += 1) {
