@@ -233,19 +233,12 @@ function extrairNomePagador(texto) {
     .map((l) => l.trim())
     .filter(Boolean);
 
-  for (const linha of linhas) {
-    if (
-      linha.length > 5 &&
-      !linha.includes("DePix") &&
-      !linha.includes("CONFIRMADO") &&
-      !linha.includes("BRUTO") &&
-      !linha.includes("TXID") &&
-      !linha.includes("Entrada") &&
-      !linha.includes("Saída") &&
-      !linha.match(/\d{2}\/\d{2}\/\d{4}/) &&
-      !linha.match(/^[\d\s.,\-R$#]+$/)
-    ) {
-      return linha;
+  for (let i = 0; i < linhas.length; i++) {
+    const linha = linhas[i].toLowerCase();
+
+    if (linha === "de") {
+      const nome = (linhas[i + 1] || "") + " " + (linhas[i + 2] || "");
+      return nome.trim();
     }
   }
 

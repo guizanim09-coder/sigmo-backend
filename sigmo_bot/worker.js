@@ -61,12 +61,7 @@ async function enviarParaBackend(tx, tentativa = 1) {
   txid: tx.txid || null,
   valorLiquido: tx.valorLiquido,
 
-  nomePagador: (
-    tx.nomePagador &&
-    !tx.nomePagador.toUpperCase().includes("PIX") &&
-    !tx.nomePagador.toUpperCase().includes("RECEBIDO") &&
-    !tx.nomePagador.toUpperCase().includes("EXPIRADO")
-  ) ? tx.nomePagador : null,
+  nomePagador: tx.nomePagador || null,
 
   dataHora: tx.dataHora || null,
   idTransacao: tx.idTransacao || null,
