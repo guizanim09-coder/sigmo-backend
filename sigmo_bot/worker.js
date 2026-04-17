@@ -19,8 +19,6 @@ const CACHE_FILE = "./txids.json";
 let txidsProcessados = new Set();
 let fila = [];
 let executando = false;
-let ultimaAtividade = Date.now();
-let resetEmAndamento = false;
 
 // 🔄 carregar cache
 if (fs.existsSync(CACHE_FILE)) {
@@ -54,6 +52,16 @@ function salvarCache() {
 }
 
 // 🔥 ENVIO COM RETRY
+
+function parseDataHoraBR(data) {
+  if (!data) return null;
+
+  const [date, time] = data.split(" ");
+  const [d, m, y] = date.split("/");
+
+  return `${y}-${m}-${d}T${time}`;
+}
+
 async function enviarParaBackend(tx, tentativa = 1) {
   try {
     if (!tx.valorLiquido || tx.valorLiquido <= 0) return false;
@@ -63,9 +71,9 @@ async function enviarParaBackend(tx, tentativa = 1) {
   txid: tx.txid || null,
   valorLiquido: tx.valorLiquido,
 
-  nomePagador: tx.nomePagador || null,
+  nomePagador: tx.nomePagador || null
 
-  dataHora: tx.dataHora || null,
+  dataHora: parseDataHoraBR(tx.dataHora),
   idTransacao: tx.idTransacao || null,
   raw: tx.raw || null
 };
@@ -106,22 +114,21 @@ async function processarFila() {
     const sucesso = await enviarParaBackend(tx);
 
     if (sucesso) {
-  const chave = tx.txid || `${tx.valorLiquido}-${tx.dataHora}-${tx.nomePagador}`;
-  txidsProcessados.add(chave);
-  salvarCache();
-} else {
+      const chave = tx.txid || `${tx.valorLiquido}-${tx.dataHora}-${tx.nomePagador}`;
+txidsProcessados.add(chave);
+      salvarCache();
+    } else {
   if (fila.length < 500) {
     fila.push(tx);
   }
-}
 }
   }));
 }
 
 // 🔥 LOOP PRINCIPAL
 async function loop() {
- if (executando) return;
-executando = true;
+  if (executando) return;
+  executando = true;
 ultimaAtividade = Date.now();
 
   try {
@@ -130,17 +137,17 @@ ultimaAtividade = Date.now();
 
     if (!transacoes || transacoes.length === 0) {
       console.log("🔍 Nenhuma transação...");
-ultimaAtividade = Date.now();
-return;
+      return;
     }
 
     console.log("📊 Capturadas:", transacoes.length);
 
-let jaProcessadosSeguidos = 0;
+    let jaProcessadosSeguidos = 0;
 
 for (const tx of transacoes) {
   const chave = tx.txid || `${tx.valorLiquido}-${tx.dataHora}-${tx.nomePagador}`;
 
+  // 🔥 se já processado
   if (txidsProcessados.has(chave)) {
     jaProcessadosSeguidos++;
 
@@ -156,6 +163,7 @@ for (const tx of transacoes) {
 
   if (!tx.valorLiquido || tx.valorLiquido <= 0) continue;
 
+  // evita duplicar na fila
   if (!fila.find(t => {
     const chaveFila = t.txid || `${t.valorLiquido}-${t.dataHora}-${t.nomePagador}`;
     return chaveFila === chave;
@@ -180,9 +188,12 @@ ultimaAtividade = Date.now();
 }
 
 // 🔥 WATCHDOG (ANTI-TRAVA)
+let ultimaAtividade = Date.now();
+let resetEmAndamento = false;
+
 setInterval(async () => {
   const agora = Date.now();
-  const travado = executando && (agora - ultimaAtividade > 60000);
+  const travado = executando && (agora - ultimaAtividade > 90000);
 
   if (!travado || resetEmAndamento) return;
 

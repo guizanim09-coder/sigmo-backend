@@ -230,15 +230,32 @@ async function setupLogin() {
 function extrairNomePagador(texto) {
   const linhas = String(texto || "")
     .split("\n")
-    .map((l) => l.trim())
+    .map(l => l.trim())
     .filter(Boolean);
 
-  for (let i = 0; i < linhas.length; i++) {
-    const linha = linhas[i].toLowerCase();
+  // remove linhas irrelevantes
+  const ignorar = [
+    "depix",
+    "confirmado",
+    "bruto",
+    "txid",
+    "entrada",
+    "saída",
+    "pix",
+    "r$"
+  ];
 
-    if (linha === "de") {
-      const nome = (linhas[i + 1] || "") + " " + (linhas[i + 2] || "");
-      return nome.trim();
+  for (const linha of linhas) {
+    const lower = linha.toLowerCase();
+
+    // ignora lixo
+    if (ignorar.some(p => lower.includes(p))) continue;
+    if (lower.match(/\d{2}\/\d{2}\/\d{4}/)) continue;
+    if (lower.match(/^[\d\s.,\-#]+$/)) continue;
+
+    // 🔥 retorna primeira linha "humana"
+    if (linha.length > 5 && linha.length < 80) {
+      return linha;
     }
   }
 
@@ -294,19 +311,7 @@ async function capturarTransacoes() {
         await fecharPopups(page);
       }
 
-    // 🔥 EXPANDIR LISTA
-for (let i = 0; i < 5; i++) {
-  const verMais = page.locator('button:has-text("Ver mais")').first();
-
-  if (await verMais.count()) {
-    await verMais.click().catch(() => {});
-    await page.waitForTimeout(500);
-  } else {
-    break;
-  }
-}  
-
-const cards = page.locator("div").filter({
+      const cards = page.locator("div").filter({
         has: page.getByText("Entrada", { exact: true })
       });
 
@@ -335,24 +340,33 @@ const cards = page.locator("div").filter({
             /#\s*([a-f0-9-]{6,})/i
           );
 
-          const nomePagador = extrairNomePagador(texto);
+          const nomePagadorRaw = extrairNomePagador(texto);
 
-console.log("📄 TEXTO COMPLETO:");
-console.log(texto);
+let nomePagador = null;
 
-console.log("👤 NOME EXTRAÍDO:");
-console.log(nomePagador);
-          const txid = await capturarTxidDoCard(page, card, texto);
+if (nomePagadorRaw) {
+  nomePagador = nomePagadorRaw
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/[^a-z0-9\s]/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
 
-          transacoes.push({
-            valorLiquido: normalizarValorBR(valorLiquidoTexto),
-            valorBruto: normalizarValorBR(valorBrutoTexto),
-            nomePagador,
-            txid,
-            idTransacao,
-            dataHora,
-            raw: texto
-          });
+if (!nomePagador) continue;
+
+const txid = await capturarTxidDoCard(page, card, texto);
+
+transacoes.push({
+  valorLiquido: normalizarValorBR(valorLiquidoTexto),
+  valorBruto: normalizarValorBR(valorBrutoTexto),
+  nomePagador,
+  txid,
+  idTransacao,
+  dataHora,
+  raw: texto
+});
         } catch (e) {
           console.log("Erro card:", e.message);
         }
