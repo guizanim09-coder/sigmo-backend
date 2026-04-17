@@ -93,15 +93,25 @@ async function enviarParaBackend(tx, tentativa = 1) {
     return true;
 
   } catch (e) {
-    if (tentativa < RETRY_LIMIT) {
-      console.log("🔁 Retry:", tx.txid, "| tentativa", tentativa);
-      await new Promise(r => setTimeout(r, 1000));
-      return enviarParaBackend(tx, tentativa + 1);
-    }
 
-    console.log("❌ Falha final:", tx.txid, e.message);
+  const erroMsg = e.message || "";
+
+  // 🚫 NÃO RETENTA SE NÃO TEM DEPÓSITO
+  if (erroMsg.includes("Nenhum depósito compatível encontrado")) {
+    console.log("⏭️ Ignorado (sem depósito):", tx.txid);
     return false;
   }
+
+  // 🔁 RETRY NORMAL
+  if (tentativa < RETRY_LIMIT) {
+    console.log("🔁 Retry:", tx.txid, "| tentativa", tentativa);
+    await new Promise(r => setTimeout(r, 1000));
+    return enviarParaBackend(tx, tentativa + 1);
+  }
+
+  console.log("❌ Falha final:", tx.txid, erroMsg);
+  return false;
+}
 }
 
 // 🔥 PROCESSAMENTO PARALELO
@@ -116,8 +126,15 @@ async function processarFila() {
 txidsProcessados.add(chave);
       salvarCache();
     } else {
-  if (fila.length < 500) {
-    fila.push(tx);
+  const chave = tx.txid || `${tx.valorLiquido}-${tx.dataHora}-${tx.nomePagador}`;
+
+  // 🚫 NÃO REENFILEIRA SE NÃO TEM DEPÓSITO
+  if (!tx.erro || !tx.erro.includes("Nenhum depósito compatível encontrado")) {
+    if (fila.length < 500) {
+      fila.push(tx);
+    }
+  } else {
+    console.log("⏭️ Não reenfileirado:", chave);
   }
 }
   }));
