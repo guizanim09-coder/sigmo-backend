@@ -324,6 +324,12 @@ async function capturarTransacoes() {
           );
 
           const nomePagador = extrairNomePagador(texto);
+
+console.log("📄 TEXTO COMPLETO:");
+console.log(texto);
+
+console.log("👤 NOME EXTRAÍDO:");
+console.log(nomePagador);
           const txid = await capturarTxidDoCard(page, card, texto);
 
           transacoes.push({
