@@ -136,9 +136,6 @@ return;
 
     console.log("📊 Capturadas:", transacoes.length);
 
-for (const tx of transacoes) {
-let jaProcessadosSeguidos = 0;
-
 let jaProcessadosSeguidos = 0;
 
 for (const tx of transacoes) {
@@ -185,7 +182,7 @@ ultimaAtividade = Date.now();
 // 🔥 WATCHDOG (ANTI-TRAVA)
 setInterval(async () => {
   const agora = Date.now();
-  const travado = executando && (agora - ultimaAtividade > 90000);
+  const travado = executando && (agora - ultimaAtividade > 60000);
 
   if (!travado || resetEmAndamento) return;
 
