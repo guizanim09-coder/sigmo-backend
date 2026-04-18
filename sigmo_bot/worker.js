@@ -59,7 +59,7 @@ function parseDataHoraBR(data) {
   const [date, time] = data.split(" ");
   const [d, m, y] = date.split("/");
 
-  return `${y}-${m}-${d}T${time}`;
+  return `${y}-${m}-${d}T${time}-03:00`;
 }
 
 async function enviarParaBackend(tx, tentativa = 1) {
@@ -99,18 +99,18 @@ tx.erro = erroMsg;
 
   // 🚫 NÃO RETENTA SE NÃO TEM DEPÓSITO
   if (erroMsg.includes("Nenhum depósito compatível encontrado")) {
-    console.log("⏭️ Ignorado (sem depósito):", tx.txid);
+    console.log("⏭️ Ignorado (sem depósito):", tx.txid || tx.idTransacao);
     return false;
   }
 
   // 🔁 RETRY NORMAL
   if (tentativa < RETRY_LIMIT) {
-    console.log("🔁 Retry:", tx.txid, "| tentativa", tentativa);
+    console.log("🔁 Retry:", tx.txid || tx.idTransacao, "| tentativa", tentativa);
     await new Promise(r => setTimeout(r, 1000));
     return enviarParaBackend(tx, tentativa + 1);
   }
 
-  console.log("❌ Falha final:", tx.txid, erroMsg);
+  console.log("❌ Falha final:", tx.txid || tx.idTransacao, erroMsg);
   return false;
 }
 }

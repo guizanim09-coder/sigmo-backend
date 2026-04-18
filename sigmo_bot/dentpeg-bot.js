@@ -233,16 +233,21 @@ function extrairNomePagador(texto) {
     .map(l => l.trim())
     .filter(Boolean);
 
-  // remove linhas irrelevantes
   const ignorar = [
     "depix",
     "confirmado",
     "bruto",
     "txid",
     "entrada",
-    "saída",
+    "saida",
     "pix",
-    "r$"
+    "r$",
+    "banco",
+    "ltda",
+    "eireli",
+    "solucoes",
+    "tecnologia",
+    "pagamento"
   ];
 
   for (const linha of linhas) {
@@ -253,8 +258,10 @@ function extrairNomePagador(texto) {
     if (lower.match(/\d{2}\/\d{2}\/\d{4}/)) continue;
     if (lower.match(/^[\d\s.,\-#]+$/)) continue;
 
-    // 🔥 retorna primeira linha "humana"
-    if (linha.length > 5 && linha.length < 80) {
+    // 🔒 precisa ter pelo menos 2 palavras (nome + sobrenome)
+    const partes = linha.split(" ").filter(p => p.length > 2);
+
+    if (partes.length >= 2 && linha.length > 6 && linha.length < 80) {
       return linha;
     }
   }
@@ -280,7 +287,7 @@ async function capturarTxidDoCard(page, card, textoCard) {
         }
       });
 
-      txid = String(txid || "").trim();
+      txid = String(txid || "").trim().replace(/\s/g, "");
     }
   } catch (_) {}
 
@@ -349,7 +356,7 @@ if (nomePagadorRaw) {
     .toLowerCase()
     .normalize("NFD")
     .replace(/[\u0300-\u036f]/g, "")
-    .replace(/[^a-z0-9\s]/g, "")
+    .replace(/[^a-z\s]/g, "")
     .replace(/\s+/g, " ")
     .trim();
 }
