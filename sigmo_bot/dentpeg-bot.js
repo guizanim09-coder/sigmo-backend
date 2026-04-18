@@ -200,31 +200,19 @@ async function abrirExtratoRapido(page) {
 }
 
 // LOGIN
-async function setupLogin() {
-  await resetBrowser();
-  const { browser, context, page } = await iniciarBrowser();
+async function fazerLogin(page) {
+  await page.goto("https://app.dentpeg.com/", { waitUntil: "domcontentloaded" });
 
-  await page.goto(APP_URL, { waitUntil: "domcontentloaded" });
+  await page.waitForTimeout(2000);
 
-  console.log("👉 Faça login manualmente...");
-  console.log("👉 Vá até o EXTRATO");
-  console.log("👉 Marque 'não mostrar novamente' em qualquer popup");
-  console.log("👉 Pressione ENTER aqui no terminal");
+  await page.fill('input[type="email"]', process.env.DENTPEG_EMAIL);
+  await page.fill('input[type="password"]', process.env.DENTPEG_SENHA);
 
-  await new Promise((resolve) => {
-    process.stdin.resume();
-    process.stdin.once("data", () => resolve());
-  });
+  await page.click('button[type="submit"]');
 
-  await fecharPopups(page);
-  await salvarSessao(context);
-  await browser.close();
+  await page.waitForTimeout(5000);
 
-  browserRef = null;
-  contextRef = null;
-  pageRef = null;
-
-  console.log("✅ Sessão salva!");
+  console.log("✅ Login automático feito");
 }
 
 function extrairNomePagador(texto) {
@@ -309,7 +297,16 @@ async function capturarTransacoes() {
     try {
       const { page } = await iniciarBrowser();
 
-      await abrirExtratoRapido(page);
+// 🔥 garante login antes de tudo
+const logado = await estaNaAreaLogada(page);
+
+if (!logado) {
+  console.log("🔐 Fazendo login automático...");
+  await fazerLogin(page);
+}
+
+// agora sim abre extrato
+await abrirExtratoRapido(page);
 
       // recarrega leve para pegar últimos itens sem reconstruir tudo
       if (tentativa === 1) {
