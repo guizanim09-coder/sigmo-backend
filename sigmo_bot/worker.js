@@ -16,7 +16,9 @@ const WATCHDOG_TIMEOUT_MS = 90000;
 const WATCHDOG_INTERVAL_MS = 15000;
 const NO_MATCH_RETRY_DELAY_MS = 15000;
 const ERROR_RETRY_DELAY_MS = 5000;
-const BOT_TIMEZONE_OFFSET = String(process.env.BOT_TIMEZONE_OFFSET || "-03:00").trim();
+const APP_LOCAL_TIMEZONE = String(
+  process.env.APP_LOCAL_TIMEZONE || "America/Sao_Paulo"
+).trim();
 const CACHE_FILE = path.join(__dirname, "txids.json");
 
 let txidsProcessados = new Set();
@@ -56,45 +58,107 @@ function salvarCache() {
   }
 }
 
-function normalizarDataHoraParaIso(data) {
+function parseDataHoraLocal(data) {
   if (!data) return null;
 
   const valor = String(data).trim().replace(/\s+/g, " ");
 
   if (!valor) return null;
 
-  if (/^\d{4}-\d{2}-\d{2}T/.test(valor)) {
-    if (/[zZ]|[+\-]\d{2}:\d{2}$/.test(valor)) {
-      return valor;
-    }
+  let match = valor.match(
+    /(\d{2})\/(\d{2})\/(\d{4})\s+(\d{2}):(\d{2})(?::(\d{2}))?/
+  );
 
-    return `${valor}${BOT_TIMEZONE_OFFSET}`;
+  if (match) {
+    const [, dia, mes, ano, hora, minuto, segundoBruto] = match;
+    return {
+      ano: Number(ano),
+      mes: Number(mes),
+      dia: Number(dia),
+      hora: Number(hora),
+      minuto: Number(minuto),
+      segundo: Number(segundoBruto || "0")
+    };
   }
 
-  const match = valor.match(/(\d{2})\/(\d{2})\/(\d{4})\s+(\d{2}):(\d{2})(?::(\d{2}))?/);
+  match = valor.match(
+    /(\d{4})-(\d{2})-(\d{2})[T\s](\d{2}):(\d{2})(?::(\d{2}))?/
+  );
   if (!match) return null;
 
-  const [, dia, mes, ano, hora, minuto, segundoBruto] = match;
-  const segundo = segundoBruto || "00";
-
-  return `${ano}-${mes}-${dia}T${hora}:${minuto}:${segundo}${BOT_TIMEZONE_OFFSET}`;
+  const [, ano, mes, dia, hora, minuto, segundoBruto] = match;
+  return {
+    ano: Number(ano),
+    mes: Number(mes),
+    dia: Number(dia),
+    hora: Number(hora),
+    minuto: Number(minuto),
+    segundo: Number(segundoBruto || "0")
+  };
 }
 
-function toEpoch(data) {
-  const iso = normalizarDataHoraParaIso(data);
-  if (iso) {
-    const parsed = Date.parse(iso);
-    if (!Number.isNaN(parsed)) return parsed;
-  }
+function normalizarDataHoraLocal(data) {
+  const partes = parseDataHoraLocal(data);
+  if (!partes) return null;
 
-  const parsed = Date.parse(String(data || ""));
-  return Number.isNaN(parsed) ? NaN : parsed;
+  const pad = (numero) => String(numero).padStart(2, "0");
+
+  return `${partes.ano}-${pad(partes.mes)}-${pad(partes.dia)} ${pad(
+    partes.hora
+  )}:${pad(partes.minuto)}:${pad(partes.segundo)}`;
+}
+
+function toEpochLocal(data) {
+  const partes = parseDataHoraLocal(data);
+  if (!partes) return NaN;
+
+  return Date.UTC(
+    partes.ano,
+    partes.mes - 1,
+    partes.dia,
+    partes.hora,
+    partes.minuto,
+    partes.segundo || 0
+  );
+}
+
+function getAgoraLocalEpoch() {
+  try {
+    const formatter = new Intl.DateTimeFormat("en-CA", {
+      timeZone: APP_LOCAL_TIMEZONE,
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+      hour: "2-digit",
+      minute: "2-digit",
+      second: "2-digit",
+      hour12: false
+    });
+
+    const parts = Object.fromEntries(
+      formatter
+        .formatToParts(new Date())
+        .filter((item) => item.type !== "literal")
+        .map((item) => [item.type, item.value])
+    );
+
+    return Date.UTC(
+      Number(parts.year),
+      Number(parts.month) - 1,
+      Number(parts.day),
+      Number(parts.hour),
+      Number(parts.minute),
+      Number(parts.second)
+    );
+  } catch {
+    return Date.now();
+  }
 }
 
 function buildFallbackKey(tx) {
   const base = [
     Number(tx.valorLiquido || 0).toFixed(2),
-    normalizarDataHoraParaIso(tx.dataHora) || "",
+    normalizarDataHoraLocal(tx.dataHora) || "",
     String(tx.nomePagador || "").trim().toLowerCase(),
     String(tx.raw || "").trim()
   ].join("|");
@@ -132,9 +196,9 @@ async function enviarParaBackend(tx, tentativa = 1) {
     return { ok: false, requeue: false, reason: "invalid-value" };
   }
 
-  const dataHoraIso = tx.dataHoraIso || normalizarDataHoraParaIso(tx.dataHora);
+  const dataHoraLocal = tx.dataHoraLocal || normalizarDataHoraLocal(tx.dataHora);
 
-  if (!dataHoraIso) {
+  if (!dataHoraLocal) {
     return { ok: false, requeue: false, reason: "invalid-date" };
   }
 
@@ -143,7 +207,7 @@ async function enviarParaBackend(tx, tentativa = 1) {
     valorLiquido: tx.valorLiquido,
     valorBruto: tx.valorBruto || null,
     nomePagador: tx.nomePagador,
-    dataHora: dataHoraIso,
+    dataHora: dataHoraLocal,
     idTransacao: tx.idTransacao || null,
     fallbackKey: tx.fallbackKey || buildFallbackKey(tx),
     raw: tx.raw || null
@@ -287,17 +351,17 @@ async function loop() {
     let jaProcessadosSeguidos = 0;
 
     for (const tx of transacoes) {
-      const dataHoraIso = normalizarDataHoraParaIso(tx.dataHora);
-      const dataTxEpoch = toEpoch(dataHoraIso || tx.dataHora);
+      const dataHoraLocal = normalizarDataHoraLocal(tx.dataHora);
+      const dataTxEpoch = toEpochLocal(dataHoraLocal || tx.dataHora);
 
-      if (!dataHoraIso || Number.isNaN(dataTxEpoch)) {
+      if (!dataHoraLocal || Number.isNaN(dataTxEpoch)) {
         console.log("[worker] transacao ignorada por data invalida:", tx.dataHora || "(vazia)");
         continue;
       }
 
-      const diffHoras = Math.abs(Date.now() - dataTxEpoch) / 3600000;
+      const diffHoras = Math.abs(getAgoraLocalEpoch() - dataTxEpoch) / 3600000;
       if (diffHoras > 2) {
-        console.log("[worker] ignorada por ser antiga:", dataHoraIso);
+        console.log("[worker] ignorada por ser antiga:", dataHoraLocal);
         continue;
       }
 
@@ -308,12 +372,12 @@ async function loop() {
 
       const fallbackKey = buildFallbackKey({
         ...tx,
-        dataHora: dataHoraIso
+        dataHora: dataHoraLocal
       });
 
       const itemFila = {
         ...tx,
-        dataHoraIso,
+        dataHoraLocal,
         fallbackKey
       };
 
