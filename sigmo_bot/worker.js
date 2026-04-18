@@ -3,7 +3,6 @@ const fetch = require("node-fetch");
 const fs = require("fs");
 
 const {
-  setupLogin,
   capturarTransacoes,
   resetBrowser
 } = require("./dentpeg-bot");
@@ -20,6 +19,8 @@ let txidsProcessados = new Set();
 let fila = [];
 let executando = false;
 
+let ultimaAtividade = Date.now();
+
 // 🔄 carregar cache
 if (fs.existsSync(CACHE_FILE)) {
   try {
@@ -28,12 +29,6 @@ if (fs.existsSync(CACHE_FILE)) {
   } catch {
     txidsProcessados = new Set();
   }
-}
-
-// 🔥 LOGIN
-if (process.argv.includes("setup")) {
-  setupLogin();
-  return;
 }
 
 // 🔥 valida env
@@ -59,7 +54,7 @@ function parseDataHoraBR(data) {
   const [date, time] = data.split(" ");
   const [d, m, y] = date.split("/");
 
-  dataHora = `${dia}/${mes}/${ano} ${hora}`;
+  return `${y}-${m}-${d}T${time}`;
 }
 
 async function enviarParaBackend(tx, tentativa = 1) {
@@ -82,7 +77,6 @@ async function enviarParaBackend(tx, tentativa = 1) {
   "x-bot-token": process.env.BOT_SECRET
 },
       body: JSON.stringify(payload),
-      timeout: 10000
     });
 
     if (!res.ok) {
@@ -102,15 +96,15 @@ if (erroMsg.includes("Nenhum depósito compatível encontrado")) {
   console.log("⏳ Ainda não casou, vai tentar depois:", tx.txid || tx.idTransacao);
 }
 
-  // 🔁 RETRY NORMAL
-  if (tentativa < RETRY_LIMIT) {
-    console.log("🔁 Retry:", tx.txid || tx.idTransacao, "| tentativa", tentativa);
-    await new Promise(r => setTimeout(r, 1000));
-    return enviarParaBackend(tx, tentativa + 1);
-  }
+// 🔁 RETRY NORMAL
+if (tentativa < RETRY_LIMIT) {
+  console.log("🔁 Retry:", tx.txid || tx.idTransacao, "| tentativa", tentativa);
+  await new Promise(r => setTimeout(r, 1000));
+  return enviarParaBackend(tx, tentativa + 1);
+}
 
-  console.log("❌ Falha final:", tx.txid || tx.idTransacao, erroMsg);
-  return false;
+console.log("❌ Falha final:", tx.txid || tx.idTransacao, erroMsg);
+return false;
 }
 }
 
@@ -123,16 +117,17 @@ async function processarFila() {
 
     if (sucesso) {
       const chave = tx.txid || tx.idTransacao || `${tx.valorLiquido}-${tx.dataHora}-${tx.nomePagador}`;
-txidsProcessados.add(chave);
+      txidsProcessados.add(chave);
       salvarCache();
-    } else {
-  const chave = tx.txid || tx.idTransacao || `${tx.valorLiquido}-${tx.dataHora}-${tx.nomePagador}`;
 
- // 🔁 SEMPRE tenta de novo (com limite de fila)
-if (fila.length < 500) {
-  fila.push(tx);
-}
-}
+    } else {
+      // 🔁 retry controlado
+      tx.tentativas = (tx.tentativas || 0) + 1;
+
+      if (tx.tentativas < 10 && fila.length < 500) {
+        fila.push(tx);
+      }
+    }
   }));
 }
 

@@ -391,7 +391,6 @@ transacoes.push({
 }
 
 module.exports = {
-  setupLogin,
   capturarTransacoes,
   resetBrowser
 };
