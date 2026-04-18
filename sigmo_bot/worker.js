@@ -59,7 +59,7 @@ function parseDataHoraBR(data) {
   const [date, time] = data.split(" ");
   const [d, m, y] = date.split("/");
 
-  return `${y}-${m}-${d}T${time}-03:00`;
+  dataHora = `${dia}/${mes}/${ano} ${hora}`;
 }
 
 async function enviarParaBackend(tx, tentativa = 1) {
@@ -156,7 +156,33 @@ ultimaAtividade = Date.now();
     let jaProcessadosSeguidos = 0;
 
 for (const tx of transacoes) {
+
+  // 🔥 FILTRO DE TEMPO (ANTES DE QUALQUER COISA)
+  const dataTx = new Date(tx.dataHora);
+  const agora = new Date();
+
+  const diffHoras = Math.abs(agora - dataTx) / 3600000;
+
+  // ignora transações antigas (ajuste se quiser: 1h, 2h, etc)
+  if (diffHoras > 2) {
+    console.log("⏰ Ignorado por ser antigo:", tx.dataHora);
+    continue;
+  }
+
+  // 🔑 chave única
   const chave = tx.txid || tx.idTransacao || `${tx.valorLiquido}-${tx.dataHora}-${tx.nomePagador}`;
+
+  // evita duplicado já processado
+  if (txidsProcessados.has(chave)) continue;
+
+  // evita duplicar na fila
+  if (!fila.find(t => {
+    const chaveFila = t.txid || t.idTransacao || `${t.valorLiquido}-${t.dataHora}-${t.nomePagador}`;
+    return chaveFila === chave;
+  })) {
+    fila.push(tx);
+  }
+}
 
   // 🔥 se já processado
   if (txidsProcessados.has(chave)) {
