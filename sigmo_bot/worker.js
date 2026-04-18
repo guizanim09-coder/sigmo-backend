@@ -217,14 +217,6 @@ async function loop() {
   }
 }
 
-    console.log("📦 Fila:", fila.length);
-
-    await processarFila();
-ultimaAtividade = Date.now();
-
-  } catch (e) {
-    console.log("❌ Loop erro:", e.message);
-
     // 🔥 RECUPERAÇÃO AUTOMÁTICA
     await resetBrowser();
   } finally {
