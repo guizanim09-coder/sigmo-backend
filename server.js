@@ -2164,7 +2164,7 @@ let bateTempo = false;
 
 // 🔥 PADRÃO CORRETO (timestamp)
 const dataBotRaw = new Date(req.body.dataHora).getTime();
-const dataPedidoRaw = new Date(dep.criadoEm).getTime();
+const dataPedidoRaw = new Date(dep.criadoEm + "Z").getTime();
 
 if (!isNaN(dataBotRaw) && !isNaN(dataPedidoRaw)) {
   const diffMin = Math.abs(dataPedidoRaw - dataBotRaw) / 60000;
@@ -2176,7 +2176,7 @@ if (!isNaN(dataBotRaw) && !isNaN(dataPedidoRaw)) {
     diffMin
   });
 
-  bateTempo = diffMin <= 25;
+  bateTempo = diffMin <= 45;
 }
 
 // 🔥 DEBUG FINAL (AGORA SIM CORRETO)
