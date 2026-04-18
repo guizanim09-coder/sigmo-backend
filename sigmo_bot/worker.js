@@ -213,7 +213,6 @@ async function loop() {
 }
 
 // 🔥 WATCHDOG (ANTI-TRAVA)
-let ultimaAtividade = Date.now();
 let resetEmAndamento = false;
 
 setInterval(async () => {
