@@ -21,13 +21,9 @@ async function iniciarBrowser() {
 
   booting = (async () => {
     const browser = await chromium.launch({
-      headless: true,
-      args: [
-        "--disable-dev-shm-usage",
-        "--no-sandbox",
-        "--disable-blink-features=AutomationControlled"
-      ]
-    });
+  headless: true,
+  args: ["--no-sandbox", "--disable-setuid-sandbox"]
+});
 
     const contextOptions = {
       permissions: ["clipboard-read", "clipboard-write"],
@@ -201,18 +197,35 @@ async function abrirExtratoRapido(page) {
 
 // LOGIN
 async function fazerLogin(page) {
-  await page.goto("https://app.dentpeg.com/", { waitUntil: "domcontentloaded" });
+  console.log("🔐 Iniciando login automático...");
 
-  await page.waitForTimeout(2000);
+console.log("📧 Email:", process.env.DENTPEG_EMAIL);
+console.log("🔐 Tentando login...");
+  
+await page.goto("https://app.dentpeg.com/", { waitUntil: "domcontentloaded" });
 
-  await page.fill('input[type="email"]', process.env.DENTPEG_EMAIL);
-  await page.fill('input[type="password"]', process.env.DENTPEG_SENHA);
+  // espera carregar
+  await page.waitForTimeout(3000);
 
-  await page.click('button[type="submit"]');
+  // 🔥 tenta múltiplos seletores (evita quebrar se mudar HTML)
+  await page.fill('input[type="email"], input[name="email"]', process.env.DENTPEG_EMAIL);
+  await page.fill('input[type="password"], input[name="password"]', process.env.DENTPEG_SENHA);
 
-  await page.waitForTimeout(5000);
+  // 🔥 tenta múltiplos botões possíveis
+  await page.click('button[type="submit"], button:has-text("Entrar"), button:has-text("Login")');
 
-  console.log("✅ Login automático feito");
+  // espera login processar
+  await page.waitForTimeout(6000);
+
+  // 🔥 valida se entrou mesmo
+  const logado = await page.locator('text=Extrato, text=Saldo, text=Dashboard').first().isVisible().catch(() => false);
+
+  if (!logado) {
+    console.log("❌ Login falhou (não entrou na área logada)");
+    throw new Error("Falha no login DentPeg");
+  }
+
+  console.log("✅ Login automático feito com sucesso");
 }
 
 function extrairNomePagador(texto) {
