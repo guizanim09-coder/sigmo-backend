@@ -179,8 +179,7 @@ for (const tx of transacoes) {
 
   if (!tx.valorLiquido || tx.valorLiquido <= 0) continue;
 if (!tx.txid && !tx.idTransacao) {
-  console.log("⏭️ Ignorado sem identificador:", tx.valorLiquido);
-  continue;
+  console.log("⚠️ Sem txid/id, usando fallback");
 }
 
   // evita duplicar na fila
