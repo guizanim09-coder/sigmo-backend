@@ -54,7 +54,7 @@ function salvarCache() {
 // 🔥 ENVIO COM RETRY
 
 function parseDataHoraBR(data) {
-  if (!data) return null;
+  if (!data || !data.includes(" ")) return null;
 
   const [date, time] = data.split(" ");
   const [d, m, y] = date.split("/");
@@ -64,7 +64,6 @@ function parseDataHoraBR(data) {
 
 async function enviarParaBackend(tx, tentativa = 1) {
   try {
-    if (!tx.valorLiquido || tx.valorLiquido <= 0) return false;
     if (!tx.valorLiquido || tx.valorLiquido <= 0) return false;
 
     const payload = {
@@ -78,9 +77,10 @@ async function enviarParaBackend(tx, tentativa = 1) {
 
     const res = await fetch(process.env.BACKEND_URL + "/deposito/confirmar-bot", {
       method: "POST",
-      headers: {
-        "Content-Type": "application/json"
-      },
+      headers: { 
+  "Content-Type": "application/json",
+  "x-bot-token": process.env.BOT_SECRET
+},
       body: JSON.stringify(payload),
       timeout: 10000
     });
@@ -89,12 +89,13 @@ async function enviarParaBackend(tx, tentativa = 1) {
       throw new Error(await res.text());
     }
 
-    console.log("✅ Enviado:", tx.txid);
+    console.log("✅ Enviado:", tx.txid || tx.idTransacao);
     return true;
 
   } catch (e) {
 
   const erroMsg = e.message || "";
+tx.erro = erroMsg;
 
   // 🚫 NÃO RETENTA SE NÃO TEM DEPÓSITO
   if (erroMsg.includes("Nenhum depósito compatível encontrado")) {
@@ -122,11 +123,11 @@ async function processarFila() {
     const sucesso = await enviarParaBackend(tx);
 
     if (sucesso) {
-      const chave = tx.txid || `${tx.valorLiquido}-${tx.dataHora}-${tx.nomePagador}`;
+      const chave = tx.txid || tx.idTransacao || `${tx.valorLiquido}-${tx.dataHora}-${tx.nomePagador}`;
 txidsProcessados.add(chave);
       salvarCache();
     } else {
-  const chave = tx.txid || `${tx.valorLiquido}-${tx.dataHora}-${tx.nomePagador}`;
+  const chave = tx.txid || tx.idTransacao || `${tx.valorLiquido}-${tx.dataHora}-${tx.nomePagador}`;
 
   // 🚫 NÃO REENFILEIRA SE NÃO TEM DEPÓSITO
   if (!tx.erro || !tx.erro.includes("Nenhum depósito compatível encontrado")) {
@@ -160,7 +161,7 @@ ultimaAtividade = Date.now();
     let jaProcessadosSeguidos = 0;
 
 for (const tx of transacoes) {
-  const chave = tx.txid || `${tx.valorLiquido}-${tx.dataHora}-${tx.nomePagador}`;
+  const chave = tx.txid || tx.idTransacao || `${tx.valorLiquido}-${tx.dataHora}-${tx.nomePagador}`;
 
   // 🔥 se já processado
   if (txidsProcessados.has(chave)) {
@@ -177,10 +178,14 @@ for (const tx of transacoes) {
   jaProcessadosSeguidos = 0;
 
   if (!tx.valorLiquido || tx.valorLiquido <= 0) continue;
+if (!tx.txid && !tx.idTransacao) {
+  console.log("⏭️ Ignorado sem identificador:", tx.valorLiquido);
+  continue;
+}
 
   // evita duplicar na fila
   if (!fila.find(t => {
-    const chaveFila = t.txid || `${t.valorLiquido}-${t.dataHora}-${t.nomePagador}`;
+    const chaveFila = t.txid || t.idTransacao || `${t.valorLiquido}-${t.dataHora}-${t.nomePagador}`;
     return chaveFila === chave;
   })) {
     fila.push(tx);
