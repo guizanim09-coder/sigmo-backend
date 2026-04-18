@@ -2162,12 +2162,21 @@ if (typeof calc === "number") {
 // 🔥 MATCH TEMPO
 let bateTempo = false;
 
-const dataBotRaw = new Date(req.body.dataHora);
-const dataPedidoRaw = new Date(dep.criadoEm);
+// 🔥 PADRÃO CORRETO (timestamp)
+const dataBotRaw = new Date(req.body.dataHora).getTime();
+const dataPedidoRaw = new Date(dep.criadoEm).getTime();
 
 if (!isNaN(dataBotRaw) && !isNaN(dataPedidoRaw)) {
   const diffMin = Math.abs(dataPedidoRaw - dataBotRaw) / 60000;
-  bateTempo = diffMin <= 10;
+
+  // 🔎 DEBUG TEMPO
+  console.log("🕒 DEBUG TEMPO:", {
+    dataBot: new Date(dataBotRaw),
+    dataPedido: new Date(dataPedidoRaw),
+    diffMin
+  });
+
+  bateTempo = diffMin <= 25;
 }
 
 // 🔥 DEBUG FINAL (AGORA SIM CORRETO)
