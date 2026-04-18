@@ -22,7 +22,7 @@ async function iniciarBrowser() {
 
   booting = (async () => {
     const context = await chromium.launchPersistentContext(USER_DATA_DIR, {
-  headless: false,
+  headless: true,
   args: [
     "--disable-dev-shm-usage",
     "--no-sandbox"
