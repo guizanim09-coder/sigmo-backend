@@ -136,6 +136,10 @@ function debugDentpeg(evento, payload) {
   }
 }
 
+function contarDetalhesNoTexto(texto) {
+  return contarOcorrencias(texto, /\bdetalhes\b/gi);
+}
+
 function normalizarValorBR(valorTexto) {
   if (!valorTexto) return null;
 
@@ -201,6 +205,75 @@ async function logDiagnosticoExtrato(page, cards) {
     hasEntrada: snapshot.bodyLower.includes("entrada"),
     hasSaida: snapshot.bodyLower.includes("saida"),
     bodyPreview: resumirTextoParaLog(snapshot.bodyText, 350)
+  });
+}
+
+async function marcarCardsExtrato(page) {
+  return page.evaluate(() => {
+    const normalizar = (valor) =>
+      String(valor || "")
+        .replace(/\u00a0/g, " ")
+        .replace(/\s+/g, " ")
+        .trim();
+
+    const contar = (texto, regex) => (String(texto || "").match(regex) || []).length;
+    const detalhesButtons = Array.from(document.querySelectorAll("button")).filter((button) =>
+      /detalhes/i.test(normalizar(button.innerText))
+    );
+
+    document
+      .querySelectorAll("[data-codex-card-root]")
+      .forEach((el) => el.removeAttribute("data-codex-card-root"));
+
+    const roots = [];
+    const seen = new Set();
+
+    for (const button of detalhesButtons) {
+      let atual = button;
+      let root = null;
+
+      while (atual && atual !== document.body) {
+        const texto = normalizar(atual.innerText);
+
+        if (texto) {
+          const detalhesCount = contar(texto, /\bdetalhes\b/gi);
+          const entradaCount = contar(texto, /\bentrada\b/gi);
+          const possuiMarcadores =
+            /entrada/i.test(texto) &&
+            /confirmado/i.test(texto) &&
+            /depix/i.test(texto) &&
+            /detalhes/i.test(texto) &&
+            /txid/i.test(texto);
+
+          if (possuiMarcadores && detalhesCount === 1 && entradaCount === 1) {
+            root = atual;
+            break;
+          }
+        }
+
+        atual = atual.parentElement;
+      }
+
+      if (!root || seen.has(root)) continue;
+
+      seen.add(root);
+      roots.push(root);
+    }
+
+    roots.forEach((root, index) => {
+      root.setAttribute("data-codex-card-root", String(index));
+    });
+
+    return roots.map((root, index) => {
+      const texto = normalizar(root.innerText);
+      return {
+        index,
+        entradaCount: contar(texto, /\bentrada\b/gi),
+        detalhesCount: contar(texto, /\bdetalhes\b/gi),
+        txidCount: contar(texto, /\btxid\b/gi),
+        preview: texto.slice(0, 500)
+      };
+    });
   });
 }
 
@@ -552,11 +625,11 @@ async function capturarTransacoes() {
         await fecharPopups(page);
       }
 
-      const cards = page.locator("div").filter({
-        has: page.getByText("Entrada", { exact: true })
-      });
+      const cardsMarcados = await marcarCardsExtrato(page);
+      const cards = page.locator("[data-codex-card-root]");
 
       await logDiagnosticoExtrato(page, cards);
+      debugDentpeg("cards_marcados", cardsMarcados.slice(0, DENTPEG_DEBUG_CARD_LIMIT));
 
       const total = Math.min(await cards.count(), 100);
       const transacoes = [];
@@ -568,6 +641,7 @@ async function capturarTransacoes() {
           const textoNormalizado = normalizarEspacos(texto);
           const datasEncontradas = extrairDatasHorasVisiveis(texto);
           const entradasNoBloco = contarOcorrencias(texto, /\bentrada\b/gi);
+          const detalhesNoBloco = contarDetalhesNoTexto(texto);
 
           if (!textoNormalizado) {
             if (DENTPEG_DEBUG && i < DENTPEG_DEBUG_CARD_LIMIT) {
@@ -582,6 +656,7 @@ async function capturarTransacoes() {
                 index: i,
                 motivo: "sem_confirmado",
                 entradasNoBloco,
+                detalhesNoBloco,
                 datasEncontradas,
                 rawPreview: resumirTextoParaLog(texto)
               });
@@ -595,8 +670,23 @@ async function capturarTransacoes() {
                 index: i,
                 motivo: "sem_depix",
                 entradasNoBloco,
+                detalhesNoBloco,
                 datasEncontradas,
                 rawPreview: resumirTextoParaLog(texto)
+              });
+            }
+            continue;
+          }
+
+          if (entradasNoBloco !== 1 || detalhesNoBloco !== 1) {
+            if (DENTPEG_DEBUG && i < DENTPEG_DEBUG_CARD_LIMIT) {
+              debugDentpeg("card_ignorado", {
+                index: i,
+                motivo: "bloco_nao_unico",
+                entradasNoBloco,
+                detalhesNoBloco,
+                datasEncontradas,
+                rawPreview: resumirTextoParaLog(texto, 700)
               });
             }
             continue;
@@ -617,6 +707,7 @@ async function capturarTransacoes() {
             debugDentpeg("card_extraido", {
               index: i,
               entradasNoBloco,
+              detalhesNoBloco,
               datasEncontradas,
               dataHoraExtraida: dataHora,
               valorLiquidoTexto,
@@ -629,13 +720,18 @@ async function capturarTransacoes() {
             });
           }
 
-          if (DENTPEG_DEBUG && entradasNoBloco > 1 && i < DENTPEG_DEBUG_CARD_LIMIT) {
+          if (
+            DENTPEG_DEBUG &&
+            (entradasNoBloco > 1 || detalhesNoBloco > 1) &&
+            i < DENTPEG_DEBUG_CARD_LIMIT
+          ) {
             debugDentpeg("alerta_bloco_amplo", {
               index: i,
               entradasNoBloco,
+              detalhesNoBloco,
               datasEncontradas,
               observacao:
-                "O bloco capturado contem mais de uma ocorrencia de 'Entrada' e pode estar juntando mais de um card."
+                "O bloco capturado contem mais de uma ocorrencia de 'Entrada' ou 'Detalhes' e pode estar juntando mais de um card."
             });
           }
 
