@@ -27,6 +27,7 @@ const BACKUP_RETENTION_DAYS = Number(process.env.BACKUP_RETENTION_DAYS || 7);
 const BACKUP_INITIAL_DELAY_MS = Number(process.env.BACKUP_INITIAL_DELAY_MS || 30000);
 const BACKUP_DIR = String(process.env.BACKUP_DIR || "").trim();
 const BOT_TIMEZONE_OFFSET = String(process.env.BOT_TIMEZONE_OFFSET || "-03:00").trim();
+const MATCH_TIME_WINDOW_MINUTES = Number(process.env.MATCH_TIME_WINDOW_MINUTES || 30);
 
 if (!DATABASE_URL) {
   console.error("DATABASE_URL não configurada.");
@@ -341,6 +342,98 @@ function normalizarDataHoraBot(value) {
   }
 
   return null;
+}
+
+function parseDataHoraLocal(value) {
+  if (!value) return null;
+
+  const s = String(value).trim().replace(/\s+/g, " ");
+  if (!s) return null;
+
+  let match = s.match(
+    /(\d{2})\/(\d{2})\/(\d{4})\s*(?:[^\d]{1,20})?\s*(\d{2}):(\d{2})(?::(\d{2}))?/
+  );
+
+  if (match) {
+    const [, day, month, year, hour, minute, secondBruto] = match;
+    return {
+      year: Number(year),
+      month: Number(month),
+      day: Number(day),
+      hour: Number(hour),
+      minute: Number(minute),
+      second: Number(secondBruto || "0")
+    };
+  }
+
+  match = s.match(
+    /(\d{4})-(\d{2})-(\d{2})[T\s](\d{2}):(\d{2})(?::(\d{2}))?/
+  );
+
+  if (match) {
+    const [, year, month, day, hour, minute, secondBruto] = match;
+    return {
+      year: Number(year),
+      month: Number(month),
+      day: Number(day),
+      hour: Number(hour),
+      minute: Number(minute),
+      second: Number(secondBruto || "0")
+    };
+  }
+
+  return null;
+}
+
+function normalizarDataHoraLocal(value) {
+  const partes = parseDataHoraLocal(value);
+  if (!partes) return null;
+
+  const pad = (numero) => String(numero).padStart(2, "0");
+
+  return `${partes.year}-${pad(partes.month)}-${pad(partes.day)} ${pad(
+    partes.hour
+  )}:${pad(partes.minute)}:${pad(partes.second)}`;
+}
+
+function toEpochLocal(value) {
+  const partes =
+    value && typeof value === "object" && "year" in value
+      ? value
+      : parseDataHoraLocal(value);
+
+  if (!partes) return NaN;
+
+  return Date.UTC(
+    partes.year,
+    partes.month - 1,
+    partes.day,
+    partes.hour,
+    partes.minute,
+    partes.second || 0
+  );
+}
+
+function extrairDatasHorasDoComprovante(texto) {
+  const bruto = String(texto || "").replace(/\r/g, "\n");
+  const resultados = [];
+  const vistos = new Set();
+  const regexes = [
+    /(\d{2}\/\d{2}\/\d{4})\s*(?:[^\d]{1,20})?\s*(\d{2}:\d{2}(?::\d{2})?)/g,
+    /(\d{4}-\d{2}-\d{2})\s*(?:[^\d]{1,20})?\s*(\d{2}:\d{2}(?::\d{2})?)/g
+  ];
+
+  for (const regex of regexes) {
+    for (const match of bruto.matchAll(regex)) {
+      const normalizada = normalizarDataHoraLocal(`${match[1]} ${match[2]}`);
+      if (!normalizada || vistos.has(normalizada)) continue;
+
+      vistos.add(normalizada);
+      resultados.push(normalizada);
+    }
+  }
+
+  return resultados;
 }
 
 function toEpochLegacy(value) {
@@ -2327,7 +2420,7 @@ if (!isNaN(tBot) && !isNaN(tPed)) {
     diffMin
   });
 
-  bateTempo = diffMin <= 15;
+  bateTempo = diffMin <= MATCH_TIME_WINDOW_MINUTES;
 }
 
 // 🔥 DEBUG FINAL (AGORA SIM CORRETO)
@@ -2450,7 +2543,7 @@ app.post("/deposito/confirmar-bot", authBot, async (req, res) => {
         .replace(/[^A-Za-z0-9_-]/g, "") || null;
     const valorBot = toMoney(req.body.valorLiquido);
     const nomeExtrato = normalizarNome(req.body.nomePagador);
-    const dataHoraBot = normalizarDataHoraBot(req.body.dataHora);
+    const dataHoraBot = normalizarDataHoraLocal(req.body.dataHora);
 
     if (!txid && !idTransacao && !fallbackKey) {
       return res.status(400).json({ error: "Identificador da transacao obrigatorio" });
@@ -2504,13 +2597,20 @@ app.post("/deposito/confirmar-bot", authBot, async (req, res) => {
       );
 
       let depositoMatch = null;
+      let dataHoraComprovanteMatch = null;
 
       for (const row of candidatos.rows) {
         const dep = mapDeposito(row);
         const textoComprovante = normalizarNome(dep.comprovanteTexto);
+        const datasComprovante = extrairDatasHorasDoComprovante(dep.comprovanteTexto);
 
         if (!textoComprovante || textoComprovante.length < 5) {
           console.log("⚠️ OCR vazio ou invalido para deposito", dep.id);
+          continue;
+        }
+
+        if (datasComprovante.length === 0) {
+          console.log("⚠️ Hora nao encontrada no comprovante", dep.id);
           continue;
         }
 
@@ -2529,14 +2629,26 @@ app.post("/deposito/confirmar-bot", authBot, async (req, res) => {
           continue;
         }
 
-        const tBot = toEpoch(dataHoraBot);
-        const tPed = toEpoch(dep.criadoEm);
+        const tBot = toEpochLocal(dataHoraBot);
         let bateTempo = false;
         let diffMin = null;
+        let dataComprovanteMatch = null;
 
-        if (!Number.isNaN(tBot) && !Number.isNaN(tPed)) {
-          diffMin = Math.abs(tPed - tBot) / 60000;
-          bateTempo = diffMin <= 15;
+        if (!Number.isNaN(tBot)) {
+          for (const dataComprovante of datasComprovante) {
+            const tComprovante = toEpochLocal(dataComprovante);
+            if (Number.isNaN(tComprovante)) continue;
+
+            const diffAtual = Math.abs(tComprovante - tBot) / 60000;
+
+            if (diffMin === null || diffAtual < diffMin) {
+              diffMin = diffAtual;
+              dataComprovanteMatch = dataComprovante;
+            }
+          }
+
+          bateTempo =
+            diffMin !== null && diffMin <= MATCH_TIME_WINDOW_MINUTES;
         }
 
         console.log("🔎 MATCH RESULT:", {
@@ -2546,7 +2658,8 @@ app.post("/deposito/confirmar-bot", authBot, async (req, res) => {
           valorBot,
           valorPedido: dep.valor,
           dataBot: dataHoraBot,
-          dataPedido: dep.criadoEm,
+          dataComprovanteMatch,
+          datasComprovanteEncontradas: datasComprovante.slice(0, 3),
           diffMin,
           bateNome,
           bateValor,
@@ -2558,6 +2671,7 @@ app.post("/deposito/confirmar-bot", authBot, async (req, res) => {
         }
 
         depositoMatch = dep;
+        dataHoraComprovanteMatch = dataComprovanteMatch;
         break;
       }
 
@@ -2577,6 +2691,7 @@ app.post("/deposito/confirmar-bot", authBot, async (req, res) => {
         idTransacao,
         fallbackKey,
         dataHoraBot,
+        dataHoraComprovanteMatch,
         nomePagador: nomeExtrato,
         valorLiquidoBot: valorBot,
         raw: req.body.raw || null
@@ -2619,7 +2734,8 @@ app.post("/deposito/confirmar-bot", authBot, async (req, res) => {
           fallbackKey,
           userId: usuario.id,
           valor: valorFinal,
-          dataHoraBot
+          dataHoraBot,
+          dataHoraComprovanteMatch
         },
         ipAddress: "bot"
       });
