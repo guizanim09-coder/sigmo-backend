@@ -217,13 +217,6 @@ async function loop() {
   }
 }
 
-    // 🔥 RECUPERAÇÃO AUTOMÁTICA
-    await resetBrowser();
-  } finally {
-    executando = false;
-  }
-}
-
 // 🔥 WATCHDOG (ANTI-TRAVA)
 let ultimaAtividade = Date.now();
 let resetEmAndamento = false;
