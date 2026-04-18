@@ -26,6 +26,7 @@ const BACKUP_INTERVAL_HOURS = Number(process.env.BACKUP_INTERVAL_HOURS || 24);
 const BACKUP_RETENTION_DAYS = Number(process.env.BACKUP_RETENTION_DAYS || 7);
 const BACKUP_INITIAL_DELAY_MS = Number(process.env.BACKUP_INITIAL_DELAY_MS || 30000);
 const BACKUP_DIR = String(process.env.BACKUP_DIR || "").trim();
+const BOT_TIMEZONE_OFFSET = String(process.env.BOT_TIMEZONE_OFFSET || "-03:00").trim();
 
 if (!DATABASE_URL) {
   console.error("DATABASE_URL não configurada.");
@@ -315,7 +316,34 @@ function normalizarNome(s) {
     .trim();
 }
 
-function toEpoch(value) {
+function normalizarDataHoraBot(value) {
+  if (!value) return null;
+
+  const s = String(value).trim().replace(/\s+/g, " ");
+  if (!s) return null;
+
+  const matchBr = s.match(
+    /(\d{2})\/(\d{2})\/(\d{4})\s+(\d{2}):(\d{2})(?::(\d{2}))?/
+  );
+
+  if (matchBr) {
+    const [, d, m, y, hh, mm, ssBruto] = matchBr;
+    const ss = ssBruto || "00";
+    return `${y}-${m}-${d}T${hh}:${mm}:${ss}${BOT_TIMEZONE_OFFSET}`;
+  }
+
+  if (/^\d{4}-\d{2}-\d{2}T/.test(s)) {
+    if (/[zZ]|[+\-]\d{2}:\d{2}$/.test(s)) {
+      return s;
+    }
+
+    return `${s}${BOT_TIMEZONE_OFFSET}`;
+  }
+
+  return null;
+}
+
+function toEpochLegacy(value) {
   if (!value) return NaN;
 
   if (value instanceof Date) return value.getTime();
@@ -332,7 +360,85 @@ function toEpoch(value) {
   return Date.parse(s.replace(" ", "T") + "Z");
 }
 
-async function extrairTextoComprovante(caminho) {
+function toEpoch(value) {
+  if (!value) return NaN;
+
+  if (value instanceof Date) return value.getTime();
+  if (typeof value === "number") return value;
+
+  const normalizadoBot = normalizarDataHoraBot(value);
+  if (normalizadoBot) {
+    return Date.parse(normalizadoBot);
+  }
+
+  const s = String(value).trim();
+  return Date.parse(s.includes("T") ? s : s.replace(" ", "T"));
+}
+
+function decodificarStringPdf(valor) {
+  return String(valor || "")
+    .replace(/\\\r?\n/g, "")
+    .replace(/\\n/g, "\n")
+    .replace(/\\r/g, "\r")
+    .replace(/\\t/g, "\t")
+    .replace(/\\\(/g, "(")
+    .replace(/\\\)/g, ")")
+    .replace(/\\\\/g, "\\")
+    .replace(/\\([0-7]{3})/g, (_, octal) =>
+      String.fromCharCode(parseInt(octal, 8))
+    );
+}
+
+function extrairTextoPdfBasico(caminho) {
+  try {
+    const conteudo = fs.readFileSync(caminho, "latin1");
+    const matches = [...conteudo.matchAll(/\((?:\\.|[^\\)])*\)/g)];
+    const partes = matches
+      .map((match) => decodificarStringPdf(match[0].slice(1, -1)))
+      .map((parte) => parte.replace(/[^\x20-\x7E\u00C0-\u017F\n]/g, " ").trim())
+      .filter((parte) => parte.length >= 2);
+
+    return partes.join(" ").replace(/\s+/g, " ").trim();
+  } catch (e) {
+    console.log("❌ PDF texto erro:", e.message);
+    return "";
+  }
+}
+
+async function extrairTextoComprovante(caminho, mimetype = "") {
+  try {
+    const isPdf =
+      String(mimetype || "").toLowerCase() === "application/pdf" ||
+      path.extname(caminho).toLowerCase() === ".pdf";
+
+    if (isPdf) {
+      const textoPdf = extrairTextoPdfBasico(caminho);
+      if (textoPdf) {
+        return limparTextoComprovante(textoPdf);
+      }
+
+      console.log("⚠️ PDF sem camada de texto legivel para OCR");
+      return "";
+    }
+
+    const result = await Tesseract.recognize(caminho, "por+eng");
+    return limparTextoComprovante(result.data.text || "");
+  } catch (e) {
+    console.log("❌ OCR erro:", e.message);
+    return "";
+  }
+}
+
+function limparTextoComprovante(texto) {
+  return String(texto || "")
+    .replace(/\u0000/g, "")
+    .replace(/\r/g, "")
+    .replace(/[ \t]+\n/g, "\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
+async function extrairTextoComprovanteLegacy(caminho) {
   try {
     const result = await Tesseract.recognize(caminho, "por+eng");
     return result.data.text || "";
@@ -1398,17 +1504,20 @@ app.post("/deposito/:id/comprovante", upload.single("comprovante"), async (req, 
     pedido.comprovanteUrl = "/uploads/" + req.file.filename;
 
 // 🔥 OCR REAL
-const caminho = __dirname + "/uploads/" + req.file.filename;
-const texto = await extrairTextoComprovante(caminho);
+    const caminho = path.join(UPLOADS_DIR, req.file.filename);
+    const texto = await extrairTextoComprovante(caminho, req.file.mimetype);
 
-pedido.comprovanteTexto = texto;
-
-pedido.comprovanteEnviadoEm = db();
+    pedido.comprovanteTexto = texto;
+    pedido.comprovanteEnviadoEm = db();
 
     await saveDeposito(pedido);
 
     res.json({
       message: "Comprovante enviado com sucesso",
+      ocrExtraido: Boolean(texto),
+      ocrAviso: texto
+        ? null
+        : "Nao foi possivel extrair texto suficiente do comprovante enviado",
       pedido
     });
   } catch (error) {
@@ -2085,7 +2194,33 @@ function authBot(req, res, next) {
   next();
 }
 
-app.post("/deposito/confirmar-bot", authBot, async (req, res) => {
+function bateNomeComprovante(textoComprovante, nomeExtrato) {
+  if (!textoComprovante || !nomeExtrato) return false;
+
+  if (
+    textoComprovante.includes(nomeExtrato) ||
+    nomeExtrato.includes(textoComprovante)
+  ) {
+    return true;
+  }
+
+  const tokens = nomeExtrato.split(" ").filter((token) => token.length >= 3);
+  if (tokens.length < 2) {
+    return false;
+  }
+
+  const primeiro = tokens[0];
+  const ultimo = tokens[tokens.length - 1];
+  const coincidencias = tokens.filter((token) => textoComprovante.includes(token));
+
+  return (
+    textoComprovante.includes(primeiro) &&
+    textoComprovante.includes(ultimo) &&
+    coincidencias.length >= 2
+  );
+}
+
+app.post("/deposito/confirmar-bot-legacy", authBot, async (req, res) => {
   try {
 
     const { txid, idTransacao, valorLiquido, nomePagador, dataHora } = req.body;
@@ -2296,6 +2431,215 @@ const valorFinal = calcularCreditoSigmo(valorBruto);
       saldo: resultado.saldo
     });
 
+  } catch (error) {
+    console.error("❌ ERRO BOT:", error.message);
+
+    res.status(400).json({
+      error: error.message || "Erro no depósito automático"
+    });
+  }
+});
+
+app.post("/deposito/confirmar-bot", authBot, async (req, res) => {
+  try {
+    const txid = String(req.body.txid || "").trim() || null;
+    const idTransacao = String(req.body.idTransacao || "").trim() || null;
+    const fallbackKey =
+      String(req.body.fallbackKey || "")
+        .trim()
+        .replace(/[^A-Za-z0-9_-]/g, "") || null;
+    const valorBot = toMoney(req.body.valorLiquido);
+    const nomeExtrato = normalizarNome(req.body.nomePagador);
+    const dataHoraBot = normalizarDataHoraBot(req.body.dataHora);
+
+    if (!txid && !idTransacao && !fallbackKey) {
+      return res.status(400).json({ error: "Identificador da transacao obrigatorio" });
+    }
+
+    if (!valorBot || valorBot <= 0) {
+      return res.status(400).json({ error: "Valor obrigatorio" });
+    }
+
+    if (!nomeExtrato || !nomeExtrato.includes(" ")) {
+      return res.status(400).json({ error: "Nome do pagador invalido" });
+    }
+
+    if (!dataHoraBot) {
+      return res.status(400).json({ error: "dataHora invalida" });
+    }
+
+    const referenceKey = txid
+      ? `dentpeg:txid:${txid}`
+      : idTransacao
+        ? `dentpeg:id:${idTransacao}`
+        : `dentpeg:fallback:${fallbackKey}`;
+
+    const jaExiste = await pool.query(
+      `SELECT 1 FROM financial_transactions WHERE reference_key = $1`,
+      [referenceKey]
+    );
+
+    if (jaExiste.rowCount > 0) {
+      console.log("⛔ DUPLICADO IGNORADO:", referenceKey);
+      return res.json({ ok: true, duplicado: true });
+    }
+
+    const resultado = await runInTransaction(async (client) => {
+      const duplicadoTx = await client.query(
+        `SELECT id FROM financial_transactions WHERE reference_key = $1 LIMIT 1`,
+        [referenceKey]
+      );
+
+      if (duplicadoTx.rowCount > 0) {
+        return { duplicado: true, saldo: null, depositoId: null };
+      }
+
+      const candidatos = await client.query(
+        `
+        SELECT * FROM depositos
+        WHERE status = 'pendente'
+          AND tipo_transacao = 'entrada'
+        FOR UPDATE
+        `
+      );
+
+      let depositoMatch = null;
+
+      for (const row of candidatos.rows) {
+        const dep = mapDeposito(row);
+        const textoComprovante = normalizarNome(dep.comprovanteTexto);
+
+        if (!textoComprovante || textoComprovante.length < 5) {
+          console.log("⚠️ OCR vazio ou invalido para deposito", dep.id);
+          continue;
+        }
+
+        const bateNome = bateNomeComprovante(textoComprovante, nomeExtrato);
+        if (!bateNome) {
+          continue;
+        }
+
+        const calc = calcularLiquidoDentpeg(dep.valor);
+        const bateValor =
+          typeof calc === "number"
+            ? Math.abs(calc - valorBot) < 1
+            : valorBot >= calc.min && valorBot <= calc.max;
+
+        if (!bateValor) {
+          continue;
+        }
+
+        const tBot = toEpoch(dataHoraBot);
+        const tPed = toEpoch(dep.criadoEm);
+        let bateTempo = false;
+        let diffMin = null;
+
+        if (!Number.isNaN(tBot) && !Number.isNaN(tPed)) {
+          diffMin = Math.abs(tPed - tBot) / 60000;
+          bateTempo = diffMin <= 15;
+        }
+
+        console.log("🔎 MATCH RESULT:", {
+          depositoId: dep.id,
+          nomeExtrato,
+          textoComprovante,
+          valorBot,
+          valorPedido: dep.valor,
+          dataBot: dataHoraBot,
+          dataPedido: dep.criadoEm,
+          diffMin,
+          bateNome,
+          bateValor,
+          bateTempo
+        });
+
+        if (!bateTempo) {
+          continue;
+        }
+
+        depositoMatch = dep;
+        break;
+      }
+
+      if (!depositoMatch) {
+        throw new Error("Nenhum depósito compatível encontrado");
+      }
+
+      const usuario = await getUserByIdForUpdate(depositoMatch.userId, client);
+      if (!usuario) {
+        throw new Error("Usuário não encontrado");
+      }
+
+      const identificadorBot = txid || idTransacao || fallbackKey;
+      const valorFinal = calcularCreditoSigmo(toMoney(depositoMatch.valor));
+      const metadata = {
+        txid,
+        idTransacao,
+        fallbackKey,
+        dataHoraBot,
+        nomePagador: nomeExtrato,
+        valorLiquidoBot: valorBot,
+        raw: req.body.raw || null
+      };
+
+      const tx = await createFinancialTransaction(client, {
+        userId: usuario.id,
+        referenceKey,
+        sourceType: "dentpeg",
+        sourceId: identificadorBot || buildId("dentpeg"),
+        operationType: "deposit",
+        direction: "credit",
+        amount: valorFinal,
+        description: "Depósito automático DentPeg",
+        metadata
+      });
+
+      const usuarioAtualizado = await applyLedgerChange(client, {
+        userId: usuario.id,
+        financialTransactionId: tx.id,
+        entryType: "credit",
+        amount: valorFinal,
+        description: "Depósito automático DentPeg",
+        metadata
+      });
+
+      depositoMatch.status = "aprovado";
+      depositoMatch.aprovadoEm = db();
+      depositoMatch.descricao = `Auto aprovado DentPeg ${identificadorBot}`;
+
+      await saveDeposito(depositoMatch, client);
+
+      await createAuditLog(client, {
+        action: "auto_deposit",
+        targetType: "deposito",
+        targetId: depositoMatch.id,
+        details: {
+          txid,
+          idTransacao,
+          fallbackKey,
+          userId: usuario.id,
+          valor: valorFinal,
+          dataHoraBot
+        },
+        ipAddress: "bot"
+      });
+
+      return {
+        duplicado: false,
+        saldo: usuarioAtualizado.saldo,
+        depositoId: depositoMatch.id
+      };
+    });
+
+    if (resultado.duplicado) {
+      return res.json({ message: "Transacao ja processada", duplicado: true });
+    }
+
+    res.json({
+      message: "Depósito automático aprovado",
+      saldo: resultado.saldo,
+      depositoId: resultado.depositoId
+    });
   } catch (error) {
     console.error("❌ ERRO BOT:", error.message);
 
