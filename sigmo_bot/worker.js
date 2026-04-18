@@ -97,11 +97,10 @@ async function enviarParaBackend(tx, tentativa = 1) {
   const erroMsg = e.message || "";
 tx.erro = erroMsg;
 
-  // 🚫 NÃO RETENTA SE NÃO TEM DEPÓSITO
-  if (erroMsg.includes("Nenhum depósito compatível encontrado")) {
-    console.log("⏭️ Ignorado (sem depósito):", tx.txid || tx.idTransacao);
-    return false;
-  }
+  // 🔁 NÃO DESISTE — deixa tentar depois
+if (erroMsg.includes("Nenhum depósito compatível encontrado")) {
+  console.log("⏳ Ainda não casou, vai tentar depois:", tx.txid || tx.idTransacao);
+}
 
   // 🔁 RETRY NORMAL
   if (tentativa < RETRY_LIMIT) {
@@ -129,14 +128,10 @@ txidsProcessados.add(chave);
     } else {
   const chave = tx.txid || tx.idTransacao || `${tx.valorLiquido}-${tx.dataHora}-${tx.nomePagador}`;
 
-  // 🚫 NÃO REENFILEIRA SE NÃO TEM DEPÓSITO
-  if (!tx.erro || !tx.erro.includes("Nenhum depósito compatível encontrado")) {
-    if (fila.length < 500) {
-      fila.push(tx);
-    }
-  } else {
-    console.log("⏭️ Não reenfileirado:", chave);
-  }
+ // 🔁 SEMPRE tenta de novo (com limite de fila)
+if (fila.length < 500) {
+  fila.push(tx);
+}
 }
   }));
 }
