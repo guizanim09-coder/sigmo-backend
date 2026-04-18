@@ -26,7 +26,6 @@ const BACKUP_INTERVAL_HOURS = Number(process.env.BACKUP_INTERVAL_HOURS || 24);
 const BACKUP_RETENTION_DAYS = Number(process.env.BACKUP_RETENTION_DAYS || 7);
 const BACKUP_INITIAL_DELAY_MS = Number(process.env.BACKUP_INITIAL_DELAY_MS || 30000);
 const BACKUP_DIR = String(process.env.BACKUP_DIR || "").trim();
-const BOT_TIMEZONE_OFFSET = String(process.env.BOT_TIMEZONE_OFFSET || "-03:00").trim();
 const MATCH_TIME_WINDOW_MINUTES = Number(process.env.MATCH_TIME_WINDOW_MINUTES || 30);
 
 if (!DATABASE_URL) {
@@ -318,30 +317,7 @@ function normalizarNome(s) {
 }
 
 function normalizarDataHoraBot(value) {
-  if (!value) return null;
-
-  const s = String(value).trim().replace(/\s+/g, " ");
-  if (!s) return null;
-
-  const matchBr = s.match(
-    /(\d{2})\/(\d{2})\/(\d{4})\s+(\d{2}):(\d{2})(?::(\d{2}))?/
-  );
-
-  if (matchBr) {
-    const [, d, m, y, hh, mm, ssBruto] = matchBr;
-    const ss = ssBruto || "00";
-    return `${y}-${m}-${d}T${hh}:${mm}:${ss}${BOT_TIMEZONE_OFFSET}`;
-  }
-
-  if (/^\d{4}-\d{2}-\d{2}T/.test(s)) {
-    if (/[zZ]|[+\-]\d{2}:\d{2}$/.test(s)) {
-      return s;
-    }
-
-    return `${s}${BOT_TIMEZONE_OFFSET}`;
-  }
-
-  return null;
+  return normalizarDataHoraLocal(value);
 }
 
 function parseDataHoraLocal(value) {
@@ -461,7 +437,7 @@ function toEpoch(value) {
 
   const normalizadoBot = normalizarDataHoraBot(value);
   if (normalizadoBot) {
-    return Date.parse(normalizadoBot);
+    return toEpochLocal(normalizadoBot);
   }
 
   const s = String(value).trim();
