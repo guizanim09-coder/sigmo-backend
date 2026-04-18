@@ -4,10 +4,12 @@ const path = require("path");
 const cors = require("cors");
 const bcrypt = require("bcryptjs");
 const multer = require("multer");
+const Tesseract = require("tesseract.js");
 const helmet = require("helmet");
 const rateLimit = require("express-rate-limit");
 const jwt = require("jsonwebtoken");
 const { Pool } = require("pg");
+const BOT_SECRET = process.env.BOT_SECRET;
 
 const app = express();
 
@@ -32,6 +34,11 @@ if (!DATABASE_URL) {
 
 if (!JWT_SECRET) {
   console.error("JWT_SECRET não configurada.");
+  process.exit(1);
+}
+
+if (!BOT_SECRET) {
+  console.error("BOT_SECRET não configurado.");
   process.exit(1);
 }
 
@@ -298,9 +305,27 @@ function toMoney(value) {
   return Number(num.toFixed(2));
 }
 
-// (ARQUIVO INTEIRO OMITIDO AQUI PARA FOCO NAS ALTERAÇÕES CRÍTICAS)
-// ⚠️ Como seu arquivo é MUITO grande, vou te entregar apenas com as alterações já integradas corretamente
-// 👉 NÃO removi nada seu — só inseri nos pontos certos
+function normalizarNome(s) {
+  return String(s || "")
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/[^a-z0-9\s]/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+async function extrairTextoComprovante(caminho) {
+  try {
+    const result = await Tesseract.recognize(caminho, "por+eng");
+    return result.data.text || "";
+  } catch (e) {
+    console.log("❌ OCR erro:", e.message);
+    return "";
+  }
+}
+
+
 
 // =========================
 // 🔥 ADICIONE ISSO (logo após toMoney)
@@ -432,6 +457,7 @@ async function initDB() {
   await ensureColumn("depositos", "chave_pix", "TEXT DEFAULT ''");
   await ensureColumn("depositos", "tipo_chave", "TEXT DEFAULT ''");
   await ensureColumn("depositos", "descricao", "TEXT DEFAULT ''");
+await ensureColumn("depositos", "comprovante_texto", "TEXT DEFAULT ''");
   await ensureColumn("depositos", "aprovado_em", "TIMESTAMP");
   await ensureColumn("depositos", "recusado_em", "TIMESTAMP");
   await ensureColumn("depositos", "comprovante_enviado_em", "TIMESTAMP");
@@ -688,7 +714,8 @@ function mapDeposito(row) {
     tipoChave: row.tipo_chave || "",
     tipoTransacao: row.tipo_transacao || "entrada",
     status: row.status || "pendente",
-    comprovanteUrl: row.comprovante_url || "",
+    comprovanteTexto: row.comprovante_texto || "",
+comprovanteUrl: row.comprovante_url || "",
     descricao: row.descricao || "",
     criadoEm: row.criado_em || null,
     aprovadoEm: row.aprovado_em || null,
@@ -833,9 +860,10 @@ async function saveDeposito(dep, client = pool) {
     `
     INSERT INTO depositos (
       id, user_id, valor, chave_pix, tipo_chave, tipo_transacao, status,
-      comprovante_url, descricao, criado_em, aprovado_em, recusado_em, comprovante_enviado_em
+      comprovante_url, comprovante_texto, descricao, criado_em,
+      aprovado_em, recusado_em, comprovante_enviado_em
     )
-    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
     ON CONFLICT (id) DO UPDATE SET
       user_id = EXCLUDED.user_id,
       valor = EXCLUDED.valor,
@@ -844,6 +872,7 @@ async function saveDeposito(dep, client = pool) {
       tipo_transacao = EXCLUDED.tipo_transacao,
       status = EXCLUDED.status,
       comprovante_url = EXCLUDED.comprovante_url,
+      comprovante_texto = EXCLUDED.comprovante_texto, -- 🔥 FALTAVA ISSO
       descricao = EXCLUDED.descricao,
       criado_em = COALESCE(depositos.criado_em, EXCLUDED.criado_em),
       aprovado_em = EXCLUDED.aprovado_em,
@@ -859,6 +888,7 @@ async function saveDeposito(dep, client = pool) {
       dep.tipoTransacao || "entrada",
       dep.status || "pendente",
       dep.comprovanteUrl || "",
+      dep.comprovanteTexto || "",
       dep.descricao || "",
       dep.criadoEm || db(),
       dep.aprovadoEm || null,
@@ -1349,7 +1379,14 @@ app.post("/deposito/:id/comprovante", upload.single("comprovante"), async (req, 
     }
 
     pedido.comprovanteUrl = "/uploads/" + req.file.filename;
-    pedido.comprovanteEnviadoEm = db();
+
+// 🔥 OCR REAL
+const caminho = __dirname + "/uploads/" + req.file.filename;
+const texto = await extrairTextoComprovante(caminho);
+
+pedido.comprovanteTexto = texto;
+
+pedido.comprovanteEnviadoEm = db();
 
     await saveDeposito(pedido);
 
@@ -2021,29 +2058,51 @@ app.post("/admin/deletar-usuario", authAdmin, async (req, res) => {
 // 🔥 BOT AUTOMAÇÃO DENTPEG
 // =========================
 
-app.post("/deposito/confirmar-bot", async (req, res) => {
-  try {
-    const { txid, valorLiquido } = req.body;
+function authBot(req, res, next) {
+  const token = req.headers["x-bot-token"];
 
-    if (!valorLiquido || valorLiquido <= 0) {
-  return res.status(400).json({ error: "Valor obrigatório" });
+  if (!token || token !== BOT_SECRET) {
+    return res.status(401).json({ error: "não autorizado" });
+  }
+
+  next();
 }
+
+app.post("/deposito/confirmar-bot", authBot, async (req, res) => {
+  try {
+
+    const { txid, idTransacao, valorLiquido, nomePagador, dataHora } = req.body;
+
+if (!txid && !idTransacao) {
+  console.log("⚠️ Sem txid e sem idTransacao, ignorado");
+  return res.json({ ok: false, ignorado: true });
+}
+
+    // 🔒 CHAVE ÚNICA DO DEPÓSITO (ANTI DUPLICAÇÃO)
+    const fallbackKey = buildId("dentpeg_fallback");
+   const referenceKey = txid
+  ? `dentpeg:txid:${txid}`
+  : idTransacao
+    ? `dentpeg:id:${idTransacao}`
+    : `dentpeg:fallback:${fallbackKey}`;
+
+    // 🔒 BLOQUEIO DE DUPLICADOS
+    const jaExiste = await pool.query(
+      `SELECT 1 FROM financial_transactions WHERE reference_key = $1`,
+      [referenceKey]
+    );
+
+    if (jaExiste.rowCount > 0) {
+      console.log("⛔ DUPLICADO IGNORADO:", referenceKey);
+      return res.json({ ok: true, duplicado: true });
+    }
+
+    // ✔ validação
+    if (!valorLiquido || valorLiquido <= 0) {
+      return res.status(400).json({ error: "Valor obrigatório" });
+    }
 
     const resultado = await runInTransaction(async (client) => {
-
-      // 🔒 EVITA DUPLICAÇÃO
-      let existente = { rows: [] };
-
-if (txid) {
-  existente = await client.query(
-    `SELECT id FROM financial_transactions WHERE reference_key = $1 LIMIT 1`,
-    [`dentpeg:${txid}`]
-  );
-}
-
-      if (existente.rows.length > 0) {
-        return { duplicado: true };
-      }
 
       const valorBot = toMoney(valorLiquido);
 
@@ -2068,20 +2127,70 @@ if (txid) {
 
         const calc = calcularLiquidoDentpeg(dep.valor);
 
-        let bate = false;
+const nomeExtrato = normalizarNome(req.body.nomePagador);
+const textoComprovante = normalizarNome(dep.comprovanteTexto);
 
-        if (typeof calc === "number") {
-          // até 99 reais
-          bate = Math.abs(calc - valorBot) < 1.0;
-        } else {
-          // acima de 100
-          bate = valorBot >= calc.min && valorBot <= calc.max;
-        }
+// 🔒 valida nome
+if (!nomeExtrato) continue;
 
-        if (bate) {
-          depositoMatch = dep;
-          break;
-        }
+// 🔒 valida OCR
+if (!textoComprovante || textoComprovante.length < 5) {
+  console.log("⚠️ OCR vazio ou inválido");
+  continue;
+}
+
+// 🔒 exige nome + sobrenome
+if (!nomeExtrato.includes(" ")) continue;
+
+// 🔥 MATCH NOME
+const bateNome = textoComprovante.includes(nomeExtrato);
+
+if (!bateNome) {
+  console.log("⛔ Nome não encontrado no comprovante:", nomeExtrato);
+  continue;
+}
+
+// 🔥 MATCH VALOR
+let bateValor = false;
+
+if (typeof calc === "number") {
+  bateValor = Math.abs(calc - valorBot) < 1.0;
+} else {
+  bateValor = valorBot >= calc.min && valorBot <= calc.max;
+}
+
+// 🔥 MATCH TEMPO
+let bateTempo = false;
+
+const dataBotRaw = new Date(req.body.dataHora);
+const dataPedidoRaw = new Date(dep.criadoEm);
+
+if (!isNaN(dataBotRaw) && !isNaN(dataPedidoRaw)) {
+  const diffMin = Math.abs(dataPedidoRaw - dataBotRaw) / 60000;
+  bateTempo = diffMin <= 10;
+}
+
+// 🔥 DEBUG FINAL (AGORA SIM CORRETO)
+console.log("🔎 MATCH RESULT:", {
+  nomeExtrato,
+  textoComprovante,
+  valorBot,
+  valorPedido: dep.valor,
+  dataBot: req.body.dataHora,
+  dataPedido: dep.criadoEm,
+  bateNome,
+  bateValor,
+  bateTempo,
+  final: bateNome && bateValor && bateTempo
+});
+
+// 🔥 RESULTADO FINAL
+const bate = bateNome && bateValor && bateTempo;
+
+if (bate) {
+  depositoMatch = dep;
+  break;
+}
       }
 
       if (!depositoMatch) {
@@ -2101,14 +2210,17 @@ const valorFinal = calcularCreditoSigmo(valorBruto);
       // 💰 CRIA TRANSAÇÃO
       const tx = await createFinancialTransaction(client, {
         userId: usuario.id,
-        referenceKey: txid ? `dentpeg:${txid}` : `dentpeg:auto:${Date.now()}`,
+        referenceKey: referenceKey,
         sourceType: "dentpeg",
-        sourceId: txid || buildId("dentpeg"),
+        sourceId: txid || idTransacao || buildId("dentpeg"),
         operationType: "deposit",
         direction: "credit",
         amount: valorFinal,
         description: "Depósito automático DentPeg",
-        metadata: { txid }
+        metadata: {
+  txid: txid || null,
+  idTransacao: idTransacao || null
+}
       });
 
       // 💰 APLICA SALDO
@@ -2118,7 +2230,10 @@ const valorFinal = calcularCreditoSigmo(valorBruto);
         entryType: "credit",
         amount: valorFinal,
         description: "Depósito automático DentPeg",
-        metadata: { txid }
+        metadata: {
+  txid: txid || null,
+  idTransacao: idTransacao || null
+}
       });
 
       // ✅ ATUALIZA DEPÓSITO
