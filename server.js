@@ -328,6 +328,40 @@ function parseDataHoraLocal(value) {
   const s = String(value).trim().replace(/\s+/g, " ");
   if (!s) return null;
 
+  const normalizarMesTextoBR = (mes) =>
+    String(mes || "")
+      .toLowerCase()
+      .normalize("NFD")
+      .replace(/[\u0300-\u036f]/g, "")
+      .replace(/[^a-z]/g, "");
+
+  const mapMesTextoBR = {
+    jan: 1,
+    janeiro: 1,
+    fev: 2,
+    fevereiro: 2,
+    mar: 3,
+    marco: 3,
+    abril: 4,
+    abr: 4,
+    mai: 5,
+    maio: 5,
+    jun: 6,
+    junho: 6,
+    jul: 7,
+    julho: 7,
+    ago: 8,
+    agosto: 8,
+    set: 9,
+    setembro: 9,
+    out: 10,
+    outubro: 10,
+    nov: 11,
+    novembro: 11,
+    dez: 12,
+    dezembro: 12
+  };
+
   let match = s.match(
     /(\d{2})\/(\d{2})\/(\d{4})\s*(?:[^\d]{1,20})?\s*(\d{2}):(\d{2})(?::(\d{2}))?/
   );
@@ -342,6 +376,26 @@ function parseDataHoraLocal(value) {
       minute: Number(minute),
       second: Number(secondBruto || "0")
     };
+  }
+
+  match = s.match(
+    /(\d{1,2})[\/\-. ]([A-Za-zÀ-ÿ.]{3,15})[\/\-. ](\d{4})\s*(?:[^\d]{1,20})?\s*(\d{2}):(\d{2})(?::(\d{2}))?/i
+  );
+
+  if (match) {
+    const [, day, monthText, year, hour, minute, secondBruto] = match;
+    const month = mapMesTextoBR[normalizarMesTextoBR(monthText)];
+
+    if (month) {
+      return {
+        year: Number(year),
+        month,
+        day: Number(day),
+        hour: Number(hour),
+        minute: Number(minute),
+        second: Number(secondBruto || "0")
+      };
+    }
   }
 
   match = s.match(
@@ -406,6 +460,7 @@ function extrairDatasHorasDoComprovante(texto) {
   const vistos = new Set();
   const regexes = [
     /(\d{2}\/\d{2}\/\d{4})\s*(?:[^\d]{1,20})?\s*(\d{2}:\d{2}(?::\d{2})?)/g,
+    /(\d{1,2}[\/\-. ][A-Za-zÀ-ÿ.]{3,15}[\/\-. ]\d{4})\s*(?:[^\d]{1,20})?\s*(\d{2}:\d{2}(?::\d{2})?)/gi,
     /(\d{4}-\d{2}-\d{2})\s*(?:[^\d]{1,20})?\s*(\d{2}:\d{2}(?::\d{2})?)/g
   ];
 
@@ -428,6 +483,7 @@ function extrairDatasDoComprovante(texto) {
   const vistos = new Set();
   const regexes = [
     /(\d{2}\/\d{2}\/\d{4})/g,
+    /(\d{1,2}[\/\-. ][A-Za-zÀ-ÿ.]{3,15}[\/\-. ]\d{4})/gi,
     /(\d{4}-\d{2}-\d{2})/g
   ];
 
