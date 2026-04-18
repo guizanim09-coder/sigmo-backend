@@ -315,6 +315,23 @@ function normalizarNome(s) {
     .trim();
 }
 
+function toEpoch(value) {
+  if (!value) return NaN;
+
+  if (value instanceof Date) return value.getTime();
+  if (typeof value === "number") return value;
+
+  const s = String(value).trim();
+
+  // já tem timezone (Z ou -03:00)
+  if (/[zZ]|[+\-]\d{2}:\d{2}$/.test(s)) {
+    return Date.parse(s);
+  }
+
+  // força UTC
+  return Date.parse(s.replace(" ", "T") + "Z");
+}
+
 async function extrairTextoComprovante(caminho) {
   try {
     const result = await Tesseract.recognize(caminho, "por+eng");
@@ -2159,24 +2176,23 @@ if (typeof calc === "number") {
   bateValor = valorBot >= calc.min && valorBot <= calc.max;
 }
 
-// 🔥 MATCH TEMPO
 let bateTempo = false;
 
-// 🔥 PADRÃO CORRETO (timestamp)
-const dataBotRaw = new Date(req.body.dataHora).getTime();
-const dataPedidoRaw = new Date(dep.criadoEm + "Z").getTime();
+const tBot = toEpoch(req.body.dataHora);
+const tPed = toEpoch(dep.criadoEm);
 
-if (!isNaN(dataBotRaw) && !isNaN(dataPedidoRaw)) {
-  const diffMin = Math.abs(dataPedidoRaw - dataBotRaw) / 60000;
+if (!isNaN(tBot) && !isNaN(tPed)) {
+  const diffMin = Math.abs(tPed - tBot) / 60000;
 
-  // 🔎 DEBUG TEMPO
   console.log("🕒 DEBUG TEMPO:", {
-    dataBot: new Date(dataBotRaw),
-    dataPedido: new Date(dataPedidoRaw),
+    rawBot: req.body.dataHora,
+    rawPedido: dep.criadoEm,
+    dataBot: new Date(tBot).toISOString(),
+    dataPedido: new Date(tPed).toISOString(),
     diffMin
   });
 
-  bateTempo = diffMin <= 45;
+  bateTempo = diffMin <= 15;
 }
 
 // 🔥 DEBUG FINAL (AGORA SIM CORRETO)
