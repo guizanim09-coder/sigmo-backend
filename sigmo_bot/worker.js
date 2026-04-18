@@ -140,11 +140,11 @@ if (fila.length < 500) {
 async function loop() {
   if (executando) return;
   executando = true;
-  ultimaAtividade = Date.now();
+ultimaAtividade = Date.now();
 
   try {
     const transacoes = await capturarTransacoes();
-    ultimaAtividade = Date.now();
+ultimaAtividade = Date.now();
 
     if (!transacoes || transacoes.length === 0) {
       console.log("🔍 Nenhuma transação...");
@@ -155,65 +155,73 @@ async function loop() {
 
     let jaProcessadosSeguidos = 0;
 
-    for (const tx of transacoes) {
+for (const tx of transacoes) {
 
-      // 🔥 FILTRO DE TEMPO
-      const dataTx = new Date(tx.dataHora);
-      const agora = new Date();
-      const diffHoras = Math.abs(agora - dataTx) / 3600000;
+  // 🔥 FILTRO DE TEMPO (ANTES DE QUALQUER COISA)
+  const dataTx = new Date(tx.dataHora);
+  const agora = new Date();
 
-      if (diffHoras > 2) {
-        console.log("⏰ Ignorado por ser antigo:", tx.dataHora);
-        continue;
-      }
+  const diffHoras = Math.abs(agora - dataTx) / 3600000;
 
-      // 🔑 chave única
-      const chave = tx.txid || tx.idTransacao || `${tx.valorLiquido}-${tx.dataHora}-${tx.nomePagador}`;
+  // ignora transações antigas (ajuste se quiser: 1h, 2h, etc)
+  if (diffHoras > 2) {
+    console.log("⏰ Ignorado por ser antigo:", tx.dataHora);
+    continue;
+  }
 
-      // 🔥 já processado
-      if (txidsProcessados.has(chave)) {
-        jaProcessadosSeguidos++;
+  // 🔑 chave única
+  const chave = tx.txid || tx.idTransacao || `${tx.valorLiquido}-${tx.dataHora}-${tx.nomePagador}`;
 
-        if (jaProcessadosSeguidos >= 5) {
-          console.log("⛔ 5 já processados seguidos, parando varredura");
-          break; // ✔ válido aqui
-        }
+  // evita duplicado já processado
+  if (txidsProcessados.has(chave)) continue;
 
-        continue;
-      }
+  // evita duplicar na fila
+  if (!fila.find(t => {
+    const chaveFila = t.txid || t.idTransacao || `${t.valorLiquido}-${t.dataHora}-${t.nomePagador}`;
+    return chaveFila === chave;
+  })) {
+    fila.push(tx);
+  }
+}
 
-      jaProcessadosSeguidos = 0;
+  // 🔥 se já processado
+  if (txidsProcessados.has(chave)) {
+    jaProcessadosSeguidos++;
 
-      // 🔒 valida valor
-      if (!tx.valorLiquido || tx.valorLiquido <= 0) continue;
-
-      if (!tx.txid && !tx.idTransacao) {
-        console.log("⚠️ Sem txid/id, usando fallback");
-      }
-
-      // 🔥 evita duplicar na fila
-      const jaNaFila = fila.find(t => {
-        const chaveFila = t.txid || t.idTransacao || `${t.valorLiquido}-${t.dataHora}-${t.nomePagador}`;
-        return chaveFila === chave;
-      });
-
-      if (!jaNaFila) {
-        fila.push(tx);
-      }
+    if (jaProcessadosSeguidos >= 5) {
+      console.log("⛔ 5 já processados seguidos, parando varredura");
+      break;
     }
+
+    continue;
+  }
+
+  jaProcessadosSeguidos = 0;
+
+  if (!tx.valorLiquido || tx.valorLiquido <= 0) continue;
+if (!tx.txid && !tx.idTransacao) {
+  console.log("⚠️ Sem txid/id, usando fallback");
+}
+
+  // evita duplicar na fila
+  if (!fila.find(t => {
+    const chaveFila = t.txid || t.idTransacao || `${t.valorLiquido}-${t.dataHora}-${t.nomePagador}`;
+    return chaveFila === chave;
+  })) {
+    fila.push(tx);
+  }
+}
 
     console.log("📦 Fila:", fila.length);
 
-    // 🔥 PROCESSA FILA (CORRETO)
     await processarFila();
-    ultimaAtividade = Date.now();
+ultimaAtividade = Date.now();
 
   } catch (e) {
     console.log("❌ Loop erro:", e.message);
 
     // 🔥 RECUPERAÇÃO AUTOMÁTICA
     await resetBrowser();
-
   } finally {
     executando = false;
   }

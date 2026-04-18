@@ -1,8 +1,7 @@
 const { chromium } = require("playwright");
 const fs = require("fs");
-const path = require("path");
 
-const USER_DATA_DIR = path.join(__dirname, "user_data");
+const STORAGE_PATH = "./storage.json";
 const APP_URL = "https://app.dentpeg.com/";
 const STATEMENT_URL = "https://app.dentpeg.com/app/statement";
 
@@ -21,25 +20,35 @@ async function iniciarBrowser() {
   }
 
   booting = (async () => {
-    const context = await chromium.launchPersistentContext(USER_DATA_DIR, {
-  headless: true,
-  args: [
-    "--disable-dev-shm-usage",
-    "--no-sandbox"
-  ],
-  viewport: { width: 1366, height: 900 }
-});
+    const browser = await chromium.launch({
+      headless: true,
+      args: [
+        "--disable-dev-shm-usage",
+        "--no-sandbox",
+        "--disable-blink-features=AutomationControlled"
+      ]
+    });
 
-const page = context.pages()[0] || await context.newPage();
+    const contextOptions = {
+      permissions: ["clipboard-read", "clipboard-write"],
+      viewport: { width: 1366, height: 900 }
+    };
+
+    if (fs.existsSync(STORAGE_PATH)) {
+      contextOptions.storageState = STORAGE_PATH;
+    }
+
+    const context = await browser.newContext(contextOptions);
+    const page = await context.newPage();
 
     page.setDefaultTimeout(5000);
     page.setDefaultNavigationTimeout(10000);
 
-    browserRef = null;
-contextRef = context;
-pageRef = page;
+    browserRef = browser;
+    contextRef = context;
+    pageRef = page;
 
-    return { context, page };
+    return { browser, context, page };
   })();
 
   try {
@@ -63,7 +72,7 @@ async function resetBrowser() {
 }
 
 async function salvarSessao(context) {
-  // não precisa mais fazer nada
+  await context.storageState({ path: STORAGE_PATH });
 }
 
 function normalizarValorBR(valorTexto) {
@@ -193,7 +202,7 @@ async function abrirExtratoRapido(page) {
 // LOGIN
 async function setupLogin() {
   await resetBrowser();
-  const { context, page } = await iniciarBrowser();
+  const { browser, context, page } = await iniciarBrowser();
 
   await page.goto(APP_URL, { waitUntil: "domcontentloaded" });
 
@@ -209,7 +218,7 @@ async function setupLogin() {
 
   await fecharPopups(page);
   await salvarSessao(context);
-  await context.close();
+  await browser.close();
 
   browserRef = null;
   contextRef = null;
