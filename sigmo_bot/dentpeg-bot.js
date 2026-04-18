@@ -12,6 +12,12 @@ const DENTPEG_EMAIL = String(process.env.DENTPEG_EMAIL || "").trim();
 const DENTPEG_PASSWORD = String(
   process.env.DENTPEG_SENHA || process.env.DENTPEG_PASSWORD || ""
 ).trim();
+const DENTPEG_DEBUG =
+  String(process.env.DENTPEG_DEBUG || "false").trim().toLowerCase() === "true";
+const DENTPEG_DEBUG_CARD_LIMIT = Math.max(
+  1,
+  Number(process.env.DENTPEG_DEBUG_CARD_LIMIT || 5)
+);
 
 let browserRef = null;
 let contextRef = null;
@@ -86,6 +92,50 @@ function normalizarEspacos(valor) {
     .trim();
 }
 
+function resumirTextoParaLog(valor, maxLen = 500) {
+  const texto = String(valor || "")
+    .replace(/\r/g, "")
+    .replace(/\n+/g, " | ")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  if (texto.length <= maxLen) {
+    return texto;
+  }
+
+  return `${texto.slice(0, maxLen)}...`;
+}
+
+function extrairDatasHorasVisiveis(texto) {
+  const resultados = [];
+  const regexes = [
+    /(\d{2}\/\d{2}\/\d{4})[^\d]{0,20}(\d{2}:\d{2}(?::\d{2})?)/gi,
+    /(\d{4}-\d{2}-\d{2})[^\d]{0,20}(\d{2}:\d{2}(?::\d{2})?)/gi
+  ];
+
+  for (const regex of regexes) {
+    for (const match of String(texto || "").matchAll(regex)) {
+      resultados.push(`${match[1]} ${match[2]}`);
+    }
+  }
+
+  return [...new Set(resultados)];
+}
+
+function contarOcorrencias(texto, regex) {
+  return (String(texto || "").match(regex) || []).length;
+}
+
+function debugDentpeg(evento, payload) {
+  if (!DENTPEG_DEBUG) return;
+
+  try {
+    console.log(`[dentpeg][debug] ${evento}: ${JSON.stringify(payload)}`);
+  } catch {
+    console.log(`[dentpeg][debug] ${evento}:`, payload);
+  }
+}
+
 function normalizarValorBR(valorTexto) {
   if (!valorTexto) return null;
 
@@ -132,6 +182,26 @@ async function obterSnapshotPagina(page) {
     bodyText,
     bodyLower: String(bodyText || "").toLowerCase()
   };
+}
+
+async function logDiagnosticoExtrato(page, cards) {
+  if (!DENTPEG_DEBUG) return;
+
+  const snapshot = await obterSnapshotPagina(page);
+  const titulo = await page.title().catch(() => "");
+  const h1 = await page.locator("h1").first().innerText().catch(() => "");
+  const quantCards = await cards.count().catch(() => 0);
+
+  debugDentpeg("pagina_extrato", {
+    url: snapshot.url,
+    titulo: normalizarEspacos(titulo),
+    h1: normalizarEspacos(h1),
+    cardCount: quantCards,
+    hasExtrato: snapshot.bodyLower.includes("extrato"),
+    hasEntrada: snapshot.bodyLower.includes("entrada"),
+    hasSaida: snapshot.bodyLower.includes("saida"),
+    bodyPreview: resumirTextoParaLog(snapshot.bodyText, 350)
+  });
 }
 
 async function estaNaAreaLogada(page) {
@@ -486,6 +556,8 @@ async function capturarTransacoes() {
         has: page.getByText("Entrada", { exact: true })
       });
 
+      await logDiagnosticoExtrato(page, cards);
+
       const total = Math.min(await cards.count(), 100);
       const transacoes = [];
 
@@ -494,10 +566,41 @@ async function capturarTransacoes() {
           const card = cards.nth(i);
           const texto = await card.innerText().catch(() => "");
           const textoNormalizado = normalizarEspacos(texto);
+          const datasEncontradas = extrairDatasHorasVisiveis(texto);
+          const entradasNoBloco = contarOcorrencias(texto, /\bentrada\b/gi);
 
-          if (!textoNormalizado) continue;
-          if (!/confirmado/i.test(textoNormalizado)) continue;
-          if (!/depix/i.test(textoNormalizado)) continue;
+          if (!textoNormalizado) {
+            if (DENTPEG_DEBUG && i < DENTPEG_DEBUG_CARD_LIMIT) {
+              debugDentpeg("card_vazio", { index: i });
+            }
+            continue;
+          }
+
+          if (!/confirmado/i.test(textoNormalizado)) {
+            if (DENTPEG_DEBUG && i < DENTPEG_DEBUG_CARD_LIMIT) {
+              debugDentpeg("card_ignorado", {
+                index: i,
+                motivo: "sem_confirmado",
+                entradasNoBloco,
+                datasEncontradas,
+                rawPreview: resumirTextoParaLog(texto)
+              });
+            }
+            continue;
+          }
+
+          if (!/depix/i.test(textoNormalizado)) {
+            if (DENTPEG_DEBUG && i < DENTPEG_DEBUG_CARD_LIMIT) {
+              debugDentpeg("card_ignorado", {
+                index: i,
+                motivo: "sem_depix",
+                entradasNoBloco,
+                datasEncontradas,
+                rawPreview: resumirTextoParaLog(texto)
+              });
+            }
+            continue;
+          }
 
           const valorLiquidoTexto = extrairTextoSeguro(textoNormalizado, /DePix\s*R?\$?\s*([\d.,]+)/i);
           const valorBrutoTexto = extrairTextoSeguro(textoNormalizado, /BRUTO\s*R?\$?\s*([\d.,]+)/i);
@@ -509,6 +612,32 @@ async function capturarTransacoes() {
           if (!nomePagador) continue;
 
           const txid = await capturarTxidDoCard(page, card, textoNormalizado);
+
+          if (DENTPEG_DEBUG && i < DENTPEG_DEBUG_CARD_LIMIT) {
+            debugDentpeg("card_extraido", {
+              index: i,
+              entradasNoBloco,
+              datasEncontradas,
+              dataHoraExtraida: dataHora,
+              valorLiquidoTexto,
+              valorBrutoTexto,
+              nomePagadorRaw: nomePagadorRaw,
+              nomePagador,
+              idTransacao,
+              txid,
+              rawPreview: resumirTextoParaLog(texto, 700)
+            });
+          }
+
+          if (DENTPEG_DEBUG && entradasNoBloco > 1 && i < DENTPEG_DEBUG_CARD_LIMIT) {
+            debugDentpeg("alerta_bloco_amplo", {
+              index: i,
+              entradasNoBloco,
+              datasEncontradas,
+              observacao:
+                "O bloco capturado contem mais de uma ocorrencia de 'Entrada' e pode estar juntando mais de um card."
+            });
+          }
 
           transacoes.push({
             valorLiquido: normalizarValorBR(valorLiquidoTexto),

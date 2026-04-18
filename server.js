@@ -26,7 +26,10 @@ const BACKUP_INTERVAL_HOURS = Number(process.env.BACKUP_INTERVAL_HOURS || 24);
 const BACKUP_RETENTION_DAYS = Number(process.env.BACKUP_RETENTION_DAYS || 7);
 const BACKUP_INITIAL_DELAY_MS = Number(process.env.BACKUP_INITIAL_DELAY_MS || 30000);
 const BACKUP_DIR = String(process.env.BACKUP_DIR || "").trim();
-const MATCH_TIME_WINDOW_MINUTES = Number(process.env.MATCH_TIME_WINDOW_MINUTES || 30);
+const MATCH_TIME_WINDOW_MINUTES = Number(process.env.MATCH_TIME_WINDOW_MINUTES || 3);
+const COMPROVANTE_UPLOAD_WINDOW_MINUTES = Number(
+  process.env.COMPROVANTE_UPLOAD_WINDOW_MINUTES || 60
+);
 
 if (!DATABASE_URL) {
   console.error("DATABASE_URL não configurada.");
@@ -2579,9 +2582,27 @@ app.post("/deposito/confirmar-bot", authBot, async (req, res) => {
         const dep = mapDeposito(row);
         const textoComprovante = normalizarNome(dep.comprovanteTexto);
         const datasComprovante = extrairDatasHorasDoComprovante(dep.comprovanteTexto);
+        const tComprovanteEnviado = Date.parse(
+          String(dep.comprovanteEnviadoEm || "")
+        );
+        const idadeComprovanteMin = Number.isNaN(tComprovanteEnviado)
+          ? null
+          : (Date.now() - tComprovanteEnviado) / 60000;
+        const comprovanteRecente =
+          idadeComprovanteMin !== null &&
+          idadeComprovanteMin >= 0 &&
+          idadeComprovanteMin <= COMPROVANTE_UPLOAD_WINDOW_MINUTES;
 
         if (!textoComprovante || textoComprovante.length < 5) {
           console.log("⚠️ OCR vazio ou invalido para deposito", dep.id);
+          continue;
+        }
+
+        if (!comprovanteRecente) {
+          console.log("⚠️ Comprovante fora da janela valida", dep.id, {
+            comprovanteEnviadoEm: dep.comprovanteEnviadoEm,
+            idadeComprovanteMin
+          });
           continue;
         }
 
@@ -2633,6 +2654,8 @@ app.post("/deposito/confirmar-bot", authBot, async (req, res) => {
           textoComprovante,
           valorBot,
           valorPedido: dep.valor,
+          comprovanteEnviadoEm: dep.comprovanteEnviadoEm,
+          idadeComprovanteMin,
           dataBot: dataHoraBot,
           dataComprovanteMatch,
           datasComprovanteEncontradas: datasComprovante.slice(0, 3),
