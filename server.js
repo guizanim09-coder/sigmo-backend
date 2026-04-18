@@ -26,7 +26,6 @@ const BACKUP_INTERVAL_HOURS = Number(process.env.BACKUP_INTERVAL_HOURS || 24);
 const BACKUP_RETENTION_DAYS = Number(process.env.BACKUP_RETENTION_DAYS || 7);
 const BACKUP_INITIAL_DELAY_MS = Number(process.env.BACKUP_INITIAL_DELAY_MS || 30000);
 const BACKUP_DIR = String(process.env.BACKUP_DIR || "").trim();
-const MATCH_TIME_WINDOW_MINUTES = Number(process.env.MATCH_TIME_WINDOW_MINUTES || 3);
 const COMPROVANTE_UPLOAD_WINDOW_MINUTES = Number(
   process.env.COMPROVANTE_UPLOAD_WINDOW_MINUTES || 60
 );
@@ -375,6 +374,14 @@ function normalizarDataHoraLocal(value) {
   )}:${pad(partes.minute)}:${pad(partes.second)}`;
 }
 
+function normalizarDataLocal(value) {
+  const partes = parseDataHoraLocal(value);
+  if (!partes) return null;
+
+  const pad = (numero) => String(numero).padStart(2, "0");
+  return `${partes.year}-${pad(partes.month)}-${pad(partes.day)}`;
+}
+
 function toEpochLocal(value) {
   const partes =
     value && typeof value === "object" && "year" in value
@@ -405,6 +412,32 @@ function extrairDatasHorasDoComprovante(texto) {
   for (const regex of regexes) {
     for (const match of bruto.matchAll(regex)) {
       const normalizada = normalizarDataHoraLocal(`${match[1]} ${match[2]}`);
+      if (!normalizada || vistos.has(normalizada)) continue;
+
+      vistos.add(normalizada);
+      resultados.push(normalizada);
+    }
+  }
+
+  return resultados;
+}
+
+function extrairDatasDoComprovante(texto) {
+  const bruto = String(texto || "").replace(/\r/g, "\n");
+  const resultados = [];
+  const vistos = new Set();
+  const regexes = [
+    /(\d{2}\/\d{2}\/\d{4})/g,
+    /(\d{4}-\d{2}-\d{2})/g
+  ];
+
+  for (const regex of regexes) {
+    for (const match of bruto.matchAll(regex)) {
+      const dataBruta = String(match[1] || "").trim();
+      const normalizada = dataBruta.includes("/")
+        ? normalizarDataLocal(`${dataBruta} 00:00:00`)
+        : normalizarDataLocal(`${dataBruta} 00:00:00`);
+
       if (!normalizada || vistos.has(normalizada)) continue;
 
       vistos.add(normalizada);
@@ -2385,21 +2418,18 @@ if (typeof calc === "number") {
 
 let bateTempo = false;
 
-const tBot = toEpoch(req.body.dataHora);
-const tPed = toEpoch(dep.criadoEm);
+const dataBot = normalizarDataLocal(req.body.dataHora);
+const dataPedido = normalizarDataLocal(dep.criadoEm);
 
-if (!isNaN(tBot) && !isNaN(tPed)) {
-  const diffMin = Math.abs(tPed - tBot) / 60000;
-
-  console.log("🕒 DEBUG TEMPO:", {
+if (dataBot && dataPedido) {
+  console.log("🕒 DEBUG DATA:", {
     rawBot: req.body.dataHora,
     rawPedido: dep.criadoEm,
-    dataBot: new Date(tBot).toISOString(),
-    dataPedido: new Date(tPed).toISOString(),
-    diffMin
+    dataBot,
+    dataPedido
   });
 
-  bateTempo = diffMin <= MATCH_TIME_WINDOW_MINUTES;
+  bateTempo = dataBot === dataPedido;
 }
 
 // 🔥 DEBUG FINAL (AGORA SIM CORRETO)
@@ -2410,6 +2440,8 @@ console.log("🔎 MATCH RESULT:", {
   valorPedido: dep.valor,
   dataBot: req.body.dataHora,
   dataPedido: dep.criadoEm,
+  dataBotNormalizada: dataBot,
+  dataPedidoNormalizada: dataPedido,
   bateNome,
   bateValor,
   bateTempo,
@@ -2581,7 +2613,7 @@ app.post("/deposito/confirmar-bot", authBot, async (req, res) => {
       for (const row of candidatos.rows) {
         const dep = mapDeposito(row);
         const textoComprovante = normalizarNome(dep.comprovanteTexto);
-        const datasComprovante = extrairDatasHorasDoComprovante(dep.comprovanteTexto);
+        const datasComprovante = extrairDatasDoComprovante(dep.comprovanteTexto);
         const tComprovanteEnviado = Date.parse(
           String(dep.comprovanteEnviadoEm || "")
         );
@@ -2607,7 +2639,7 @@ app.post("/deposito/confirmar-bot", authBot, async (req, res) => {
         }
 
         if (datasComprovante.length === 0) {
-          console.log("⚠️ Hora nao encontrada no comprovante", dep.id);
+          console.log("⚠️ Data nao encontrada no comprovante", dep.id);
           continue;
         }
 
@@ -2626,27 +2658,11 @@ app.post("/deposito/confirmar-bot", authBot, async (req, res) => {
           continue;
         }
 
-        const tBot = toEpochLocal(dataHoraBot);
-        let bateTempo = false;
-        let diffMin = null;
-        let dataComprovanteMatch = null;
-
-        if (!Number.isNaN(tBot)) {
-          for (const dataComprovante of datasComprovante) {
-            const tComprovante = toEpochLocal(dataComprovante);
-            if (Number.isNaN(tComprovante)) continue;
-
-            const diffAtual = Math.abs(tComprovante - tBot) / 60000;
-
-            if (diffMin === null || diffAtual < diffMin) {
-              diffMin = diffAtual;
-              dataComprovanteMatch = dataComprovante;
-            }
-          }
-
-          bateTempo =
-            diffMin !== null && diffMin <= MATCH_TIME_WINDOW_MINUTES;
-        }
+        const dataBot = normalizarDataLocal(dataHoraBot);
+        const dataComprovanteMatch = dataBot && datasComprovante.includes(dataBot)
+          ? dataBot
+          : null;
+        const bateData = Boolean(dataComprovanteMatch);
 
         console.log("🔎 MATCH RESULT:", {
           depositoId: dep.id,
@@ -2657,15 +2673,15 @@ app.post("/deposito/confirmar-bot", authBot, async (req, res) => {
           comprovanteEnviadoEm: dep.comprovanteEnviadoEm,
           idadeComprovanteMin,
           dataBot: dataHoraBot,
+          dataBotNormalizada: dataBot,
           dataComprovanteMatch,
-          datasComprovanteEncontradas: datasComprovante.slice(0, 3),
-          diffMin,
+          datasComprovanteEncontradas: datasComprovante.slice(0, 5),
           bateNome,
           bateValor,
-          bateTempo
+          bateData
         });
 
-        if (!bateTempo) {
+        if (!bateData) {
           continue;
         }
 

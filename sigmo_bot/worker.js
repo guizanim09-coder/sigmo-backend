@@ -122,33 +122,65 @@ function toEpochLocal(data) {
   );
 }
 
+function formatDateKey(partes) {
+  const pad = (numero) => String(numero).padStart(2, "0");
+  return `${partes.ano}-${pad(partes.mes)}-${pad(partes.dia)}`;
+}
+
+function getDateKeyFromLocalDateTime(data) {
+  const partes = parseDataHoraLocal(data);
+  if (!partes) return null;
+  return formatDateKey(partes);
+}
+
+function getAgoraLocalParts() {
+  const formatter = new Intl.DateTimeFormat("en-CA", {
+    timeZone: APP_LOCAL_TIMEZONE,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: false
+  });
+
+  const parts = Object.fromEntries(
+    formatter
+      .formatToParts(new Date())
+      .filter((item) => item.type !== "literal")
+      .map((item) => [item.type, item.value])
+  );
+
+  return {
+    ano: Number(parts.year),
+    mes: Number(parts.month),
+    dia: Number(parts.day),
+    hora: Number(parts.hour),
+    minuto: Number(parts.minute),
+    segundo: Number(parts.second)
+  };
+}
+
+function getAgoraLocalDateKey() {
+  try {
+    return formatDateKey(getAgoraLocalParts());
+  } catch {
+    return new Date().toISOString().slice(0, 10);
+  }
+}
+
 function getAgoraLocalEpoch() {
   try {
-    const formatter = new Intl.DateTimeFormat("en-CA", {
-      timeZone: APP_LOCAL_TIMEZONE,
-      year: "numeric",
-      month: "2-digit",
-      day: "2-digit",
-      hour: "2-digit",
-      minute: "2-digit",
-      second: "2-digit",
-      hour12: false
-    });
-
-    const parts = Object.fromEntries(
-      formatter
-        .formatToParts(new Date())
-        .filter((item) => item.type !== "literal")
-        .map((item) => [item.type, item.value])
-    );
+    const parts = getAgoraLocalParts();
 
     return Date.UTC(
-      Number(parts.year),
-      Number(parts.month) - 1,
-      Number(parts.day),
-      Number(parts.hour),
-      Number(parts.minute),
-      Number(parts.second)
+      Number(parts.ano),
+      Number(parts.mes) - 1,
+      Number(parts.dia),
+      Number(parts.hora),
+      Number(parts.minuto),
+      Number(parts.segundo)
     );
   } catch {
     return Date.now();
@@ -352,16 +384,16 @@ async function loop() {
 
     for (const tx of transacoes) {
       const dataHoraLocal = normalizarDataHoraLocal(tx.dataHora);
-      const dataTxEpoch = toEpochLocal(dataHoraLocal || tx.dataHora);
+      const dataTxDia = getDateKeyFromLocalDateTime(dataHoraLocal || tx.dataHora);
 
-      if (!dataHoraLocal || Number.isNaN(dataTxEpoch)) {
+      if (!dataHoraLocal || !dataTxDia) {
         console.log("[worker] transacao ignorada por data invalida:", tx.dataHora || "(vazia)");
         continue;
       }
 
-      const diffHoras = Math.abs(getAgoraLocalEpoch() - dataTxEpoch) / 3600000;
-      if (diffHoras > 2) {
-        console.log("[worker] ignorada por ser antiga:", dataHoraLocal);
+      const hojeLocal = getAgoraLocalDateKey();
+      if (dataTxDia !== hojeLocal) {
+        console.log("[worker] ignorada por ser de outra data:", dataHoraLocal);
         continue;
       }
 
