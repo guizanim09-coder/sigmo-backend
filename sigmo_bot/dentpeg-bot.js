@@ -19,6 +19,8 @@ const DENTPEG_DEBUG_CARD_LIMIT = Math.max(
   1,
   Number(process.env.DENTPEG_DEBUG_CARD_LIMIT || 5)
 );
+const DENTPEG_MAX_CARDS_POR_VARREDURA = 100;
+const DENTPEG_MAX_CLIQUES_VER_MAIS = 10;
 
 let browserRef = null;
 let contextRef = null;
@@ -400,6 +402,19 @@ async function clicarPrimeiroDisponivel(page, seletores) {
   return false;
 }
 
+async function localizarPrimeiroDisponivel(page, seletores) {
+  for (const seletor of seletores) {
+    const elemento = page.locator(seletor).first();
+    const existe = await elemento.count().catch(() => 0);
+
+    if (!existe) continue;
+
+    return elemento;
+  }
+
+  return null;
+}
+
 async function navegarParaExtratoPeloMenu(page) {
   const tentativas = [
     async () =>
@@ -525,6 +540,67 @@ async function abrirExtratoRapido(page) {
   }
 
   throw new Error("Nao foi possivel abrir o extrato da DentPeg");
+}
+
+async function expandirExtratoAteLimite(page) {
+  let cardsMarcados = await marcarCardsExtrato(page);
+  let totalAtual = cardsMarcados.length;
+  let cliquesEfetivos = 0;
+
+  for (
+    let tentativa = 0;
+    tentativa < DENTPEG_MAX_CLIQUES_VER_MAIS && totalAtual < DENTPEG_MAX_CARDS_POR_VARREDURA;
+    tentativa += 1
+  ) {
+    const botaoVerMais = await localizarPrimeiroDisponivel(page, [
+      'button:has-text("Ver mais")',
+      'a:has-text("Ver mais")',
+      'button:has-text("Mostrar mais")',
+      'a:has-text("Mostrar mais")',
+      'button:has-text("Load more")',
+      'a:has-text("Load more")'
+    ]);
+
+    if (!botaoVerMais) {
+      break;
+    }
+
+    const visivel = await botaoVerMais.isVisible().catch(() => false);
+    if (!visivel) {
+      break;
+    }
+
+    await botaoVerMais.scrollIntoViewIfNeeded().catch(() => {});
+    await botaoVerMais.click({ force: true }).catch(() => {});
+    await page.waitForTimeout(1200);
+    await fecharPopups(page);
+
+    const cardsDepoisClique = await marcarCardsExtrato(page);
+    const totalDepoisClique = cardsDepoisClique.length;
+
+    if (totalDepoisClique <= totalAtual) {
+      break;
+    }
+
+    cardsMarcados = cardsDepoisClique;
+    totalAtual = totalDepoisClique;
+    cliquesEfetivos += 1;
+  }
+
+  if (DENTPEG_DEBUG) {
+    debugDentpeg("extrato_expandido", {
+      totalCards: totalAtual,
+      cliquesEfetivos,
+      limiteCards: DENTPEG_MAX_CARDS_POR_VARREDURA,
+      limiteCliques: DENTPEG_MAX_CLIQUES_VER_MAIS
+    });
+  }
+
+  return {
+    cardsMarcados,
+    totalAtual,
+    cliquesEfetivos
+  };
 }
 
 function extrairNomePagador(texto) {
@@ -681,13 +757,13 @@ async function capturarTransacoes() {
         await fecharPopups(page);
       }
 
-      const cardsMarcados = await marcarCardsExtrato(page);
+      const { cardsMarcados } = await expandirExtratoAteLimite(page);
       const cards = page.locator("[data-codex-card-root]");
 
       await logDiagnosticoExtrato(page, cards);
       debugDentpeg("cards_marcados", cardsMarcados.slice(0, DENTPEG_DEBUG_CARD_LIMIT));
 
-      const total = Math.min(await cards.count(), 100);
+      const total = Math.min(await cards.count(), DENTPEG_MAX_CARDS_POR_VARREDURA);
       const transacoes = [];
       const cardsUnicos = new Set();
 

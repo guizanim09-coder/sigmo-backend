@@ -7,8 +7,26 @@ const path = require("path");
 
 const { capturarTransacoes, resetBrowser } = require("./dentpeg-bot");
 
+function getBoundedInt(value, fallback, { min = 1, max = Number.MAX_SAFE_INTEGER } = {}) {
+  const numero = Number(value);
+
+  if (!Number.isFinite(numero)) return fallback;
+
+  const inteiro = Math.trunc(numero);
+  if (inteiro < min) return min;
+  if (inteiro > max) return max;
+  return inteiro;
+}
+
 const LOOP_INTERVAL = 4000;
-const MAX_CONCURRENCY = 3;
+const MAX_CONCURRENCY = getBoundedInt(process.env.WORKER_MAX_CONCURRENCY, 6, {
+  min: 1,
+  max: 8
+});
+const MAX_BATCHES_PER_LOOP = getBoundedInt(process.env.WORKER_MAX_BATCHES_PER_LOOP, 4, {
+  min: 1,
+  max: 10
+});
 const HTTP_RETRY_LIMIT = 3;
 const QUEUE_RETRY_LIMIT = 10;
 const MAX_QUEUE_SIZE = 500;
@@ -328,52 +346,67 @@ function puxarChunkProcessavel() {
 }
 
 async function processarFila() {
-  const chunk = puxarChunkProcessavel();
-  if (chunk.length === 0) return;
+  let lotesProcessados = 0;
+  let itensProcessados = 0;
 
-  await Promise.all(
-    chunk.map(async (tx) => {
-      const resultado = await enviarParaBackend(tx);
+  while (lotesProcessados < MAX_BATCHES_PER_LOOP) {
+    const chunk = puxarChunkProcessavel();
+    if (chunk.length === 0) break;
 
-      if (resultado.ok) {
-        txidsProcessados.add(tx.chave);
-        salvarCache();
-        return;
-      }
+    lotesProcessados += 1;
+    itensProcessados += chunk.length;
 
-      const tentativas = (tx.tentativas || 0) + 1;
-      tx.tentativas = tentativas;
+    await Promise.all(
+      chunk.map(async (tx) => {
+        const resultado = await enviarParaBackend(tx);
 
-      if (!resultado.requeue) {
-        console.log(
-          "[worker] falha definitiva:",
-          tx.chave,
-          resultado.reason,
-          resultado.error || ""
-        );
-        return;
-      }
+        if (resultado.ok) {
+          txidsProcessados.add(tx.chave);
+          salvarCache();
+          return;
+        }
 
-      if (tentativas >= QUEUE_RETRY_LIMIT) {
-        console.log("[worker] limite de retries atingido:", tx.chave, resultado.reason);
-        return;
-      }
+        const tentativas = (tx.tentativas || 0) + 1;
+        tx.tentativas = tentativas;
 
-      if (fila.length >= MAX_QUEUE_SIZE) {
-        console.log("[worker] fila cheia, descartando retry:", tx.chave);
-        return;
-      }
+        if (!resultado.requeue) {
+          console.log(
+            "[worker] falha definitiva:",
+            tx.chave,
+            resultado.reason,
+            resultado.error || ""
+          );
+          return;
+        }
 
-      tx.proximaTentativaEm = Date.now() + getDelayForResult(resultado);
-      fila.push(tx);
+        if (tentativas >= QUEUE_RETRY_LIMIT) {
+          console.log("[worker] limite de retries atingido:", tx.chave, resultado.reason);
+          return;
+        }
 
-      if (resultado.reason === "no-match") {
-        console.log("[worker] sem match ainda, reprogramado:", tx.chave);
-      } else {
-        console.log("[worker] reprogramado para retry:", tx.chave, resultado.reason);
-      }
-    })
-  );
+        if (fila.length >= MAX_QUEUE_SIZE) {
+          console.log("[worker] fila cheia, descartando retry:", tx.chave);
+          return;
+        }
+
+        tx.proximaTentativaEm = Date.now() + getDelayForResult(resultado);
+        fila.push(tx);
+
+        if (resultado.reason === "no-match") {
+          console.log("[worker] sem match ainda, reprogramado:", tx.chave);
+        } else {
+          console.log("[worker] reprogramado para retry:", tx.chave, resultado.reason);
+        }
+      })
+    );
+
+    ultimaAtividade = Date.now();
+  }
+
+  return {
+    lotesProcessados,
+    itensProcessados
+  };
 }
 
 async function loop() {
@@ -451,7 +484,13 @@ async function loop() {
     }
 
     console.log("[worker] fila:", fila.length);
-    await processarFila();
+    const resumoFila = await processarFila();
+    if (resumoFila.itensProcessados > 0) {
+      console.log(
+        "[worker] lotes enviados no ciclo:",
+        `${resumoFila.lotesProcessados} lotes / ${resumoFila.itensProcessados} itens`
+      );
+    }
     ultimaAtividade = Date.now();
   } catch (error) {
     console.log("[worker] erro no loop:", error.message);
@@ -484,6 +523,10 @@ async function start() {
   validarEnvObrigatorias();
   console.log("[worker] bot iniciado");
   console.log("[worker] backend:", process.env.BACKEND_URL);
+  console.log(
+    "[worker] throughput:",
+    `concorrencia=${MAX_CONCURRENCY} lotesPorLoop=${MAX_BATCHES_PER_LOOP}`
+  );
 
   await loop();
   setInterval(loop, LOOP_INTERVAL);
