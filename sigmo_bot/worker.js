@@ -433,8 +433,6 @@ async function loop() {
       console.log("[worker] capturadas:", transacoes.length);
     }
 
-    let jaProcessadosSeguidos = 0;
-
     for (const tx of transacoes) {
       const dataHoraLocal = normalizarDataHoraLocal(tx.dataHora);
       if (!dataHoraLocal) {
@@ -485,17 +483,8 @@ async function loop() {
       itemFila.chave = getTransactionKey(itemFila);
 
       if (txidsProcessados.has(itemFila.chave)) {
-        jaProcessadosSeguidos += 1;
-
-        if (jaProcessadosSeguidos >= 5) {
-          console.log("[worker] 5 processadas seguidas, encerrando a varredura");
-          break;
-        }
-
         continue;
       }
-
-      jaProcessadosSeguidos = 0;
 
       if (!itemFila.txid && !itemFila.idTransacao) {
         console.log("[worker] sem txid/id, usando fallback deterministico:", itemFila.fallbackKey);

@@ -176,6 +176,42 @@ function normalizarDataHoraBR(texto) {
   return `${match[1]} ${match[2]}:${segundos}`;
 }
 
+function toEpochDataHoraBR(texto) {
+  const valor = normalizarEspacos(texto);
+
+  let match = valor.match(
+    /(\d{2})\/(\d{2})\/(\d{4})\s+(\d{2}):(\d{2})(?::(\d{2}))?/
+  );
+
+  if (match) {
+    const [, dia, mes, ano, hora, minuto, segundoBruto] = match;
+    return Date.UTC(
+      Number(ano),
+      Number(mes) - 1,
+      Number(dia),
+      Number(hora),
+      Number(minuto),
+      Number(segundoBruto || "0")
+    );
+  }
+
+  match = valor.match(
+    /(\d{4})-(\d{2})-(\d{2})[T\s](\d{2}):(\d{2})(?::(\d{2}))?/
+  );
+
+  if (!match) return NaN;
+
+  const [, ano, mes, dia, hora, minuto, segundoBruto] = match;
+  return Date.UTC(
+    Number(ano),
+    Number(mes) - 1,
+    Number(dia),
+    Number(hora),
+    Number(minuto),
+    Number(segundoBruto || "0")
+  );
+}
+
 function normalizarNomePagador(nome) {
   return normalizarEspacos(nome)
     .toLowerCase()
@@ -944,6 +980,25 @@ async function capturarTransacoes() {
           console.log("[dentpeg] erro ao ler card:", error.message);
         }
       }
+
+      transacoes.sort((a, b) => {
+        const epochB = toEpochDataHoraBR(b.dataHora);
+        const epochA = toEpochDataHoraBR(a.dataHora);
+
+        if (!Number.isNaN(epochB) && !Number.isNaN(epochA) && epochB !== epochA) {
+          return epochB - epochA;
+        }
+
+        if (!Number.isNaN(epochB) && Number.isNaN(epochA)) {
+          return 1;
+        }
+
+        if (Number.isNaN(epochB) && !Number.isNaN(epochA)) {
+          return -1;
+        }
+
+        return 0;
+      });
 
       return transacoes;
     } catch (error) {
