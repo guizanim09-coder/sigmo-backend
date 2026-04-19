@@ -542,6 +542,36 @@ async function abrirExtratoRapido(page) {
   throw new Error("Nao foi possivel abrir o extrato da DentPeg");
 }
 
+async function atualizarExtrato(page) {
+  await page.evaluate(() => window.scrollTo(0, 0)).catch(() => {});
+  await fecharPopups(page);
+
+  const botaoAtualizar = await localizarPrimeiroDisponivel(page, [
+    'button:has-text("Atualizar")',
+    'a:has-text("Atualizar")',
+    'button:has-text("Refresh")',
+    'a:has-text("Refresh")'
+  ]);
+
+  if (botaoAtualizar) {
+    const visivel = await botaoAtualizar.isVisible().catch(() => false);
+
+    if (visivel) {
+      await botaoAtualizar.scrollIntoViewIfNeeded().catch(() => {});
+      await botaoAtualizar.click({ force: true }).catch(() => {});
+      await page.waitForLoadState("networkidle", { timeout: 5000 }).catch(() => {});
+      await page.waitForTimeout(1500);
+      await fecharPopups(page);
+      return;
+    }
+  }
+
+  await page.reload({ waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForLoadState("networkidle", { timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(1200);
+  await fecharPopups(page);
+}
+
 async function expandirExtratoAteLimite(page) {
   let cardsMarcados = await marcarCardsExtrato(page);
   let totalAtual = cardsMarcados.length;
@@ -756,6 +786,8 @@ async function capturarTransacoes() {
         await page.waitForTimeout(750);
         await fecharPopups(page);
       }
+
+      await atualizarExtrato(page);
 
       const { cardsMarcados } = await expandirExtratoAteLimite(page);
       const cards = page.locator("[data-codex-card-root]");

@@ -27,6 +27,14 @@ const MAX_BATCHES_PER_LOOP = getBoundedInt(process.env.WORKER_MAX_BATCHES_PER_LO
   min: 1,
   max: 10
 });
+const MAX_TRANSACTION_AGE_HOURS = getBoundedInt(
+  process.env.WORKER_MAX_TRANSACTION_AGE_HOURS,
+  36,
+  {
+    min: 1,
+    max: 168
+  }
+);
 const HTTP_RETRY_LIMIT = 3;
 const QUEUE_RETRY_LIMIT = 10;
 const MAX_QUEUE_SIZE = 500;
@@ -429,16 +437,32 @@ async function loop() {
 
     for (const tx of transacoes) {
       const dataHoraLocal = normalizarDataHoraLocal(tx.dataHora);
-      const dataTxDia = getDateKeyFromLocalDateTime(dataHoraLocal || tx.dataHora);
-
-      if (!dataHoraLocal || !dataTxDia) {
+      if (!dataHoraLocal) {
         console.log("[worker] transacao ignorada por data invalida:", tx.dataHora || "(vazia)");
         continue;
       }
 
-      const hojeLocal = getAgoraLocalDateKey();
-      if (dataTxDia !== hojeLocal) {
-        console.log("[worker] ignorada por ser de outra data:", dataHoraLocal);
+      const epochTx = toEpochLocal(dataHoraLocal);
+      const agoraLocalEpoch = getAgoraLocalEpoch();
+      const idadeHoras = Number.isNaN(epochTx)
+        ? NaN
+        : Number(((agoraLocalEpoch - epochTx) / 3600000).toFixed(3));
+
+      if (Number.isNaN(idadeHoras)) {
+        console.log("[worker] ignorada por data ilegivel:", dataHoraLocal);
+        continue;
+      }
+
+      if (idadeHoras < -0.5) {
+        console.log("[worker] ignorada por estar no futuro:", dataHoraLocal);
+        continue;
+      }
+
+      if (idadeHoras > MAX_TRANSACTION_AGE_HOURS) {
+        console.log(
+          "[worker] ignorada por ser antiga:",
+          `${dataHoraLocal} | idadeHoras=${idadeHoras}`
+        );
         continue;
       }
 
@@ -527,6 +551,7 @@ async function start() {
     "[worker] throughput:",
     `concorrencia=${MAX_CONCURRENCY} lotesPorLoop=${MAX_BATCHES_PER_LOOP}`
   );
+  console.log("[worker] janela de captura:", `${MAX_TRANSACTION_AGE_HOURS}h`);
 
   await loop();
   setInterval(loop, LOOP_INTERVAL);
