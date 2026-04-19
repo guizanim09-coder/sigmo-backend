@@ -1093,6 +1093,8 @@ const adminLoginLimiter = rateLimit({
 
 const allowedOrigins = [
   /^https:\/\/.*\.netlify\.app$/,
+"https://sigmopay.com",
+  "https://www.sigmopay.com",
   "http://localhost:3000",
   "http://127.0.0.1:3000",
   "http://localhost:5173",
