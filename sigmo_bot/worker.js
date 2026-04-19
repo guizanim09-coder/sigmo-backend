@@ -29,7 +29,7 @@ const MAX_BATCHES_PER_LOOP = getBoundedInt(process.env.WORKER_MAX_BATCHES_PER_LO
 });
 const MAX_TRANSACTION_AGE_HOURS = getBoundedInt(
   process.env.WORKER_MAX_TRANSACTION_AGE_HOURS,
-  36,
+  6,
   {
     min: 1,
     max: 168

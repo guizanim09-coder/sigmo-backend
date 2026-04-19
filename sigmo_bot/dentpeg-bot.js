@@ -13,6 +13,10 @@ const DENTPEG_EMAIL = String(process.env.DENTPEG_EMAIL || "").trim();
 const DENTPEG_PASSWORD = String(
   process.env.DENTPEG_SENHA || process.env.DENTPEG_PASSWORD || ""
 ).trim();
+const DENTPEG_TIMEZONE = String(
+  process.env.DENTPEG_TIMEZONE || process.env.APP_LOCAL_TIMEZONE || "America/Sao_Paulo"
+).trim();
+const DENTPEG_LOCALE = String(process.env.DENTPEG_LOCALE || "pt-BR").trim();
 const DENTPEG_DEBUG =
   String(process.env.DENTPEG_DEBUG || "false").trim().toLowerCase() === "true";
 const DENTPEG_DEBUG_CARD_LIMIT = Math.max(
@@ -44,7 +48,9 @@ async function iniciarBrowser() {
 
     const contextOptions = {
       permissions: ["clipboard-read", "clipboard-write"],
-      viewport: { width: 1366, height: 900 }
+      viewport: { width: 1366, height: 900 },
+      locale: DENTPEG_LOCALE,
+      timezoneId: DENTPEG_TIMEZONE
     };
 
     if (fs.existsSync(STORAGE_PATH)) {
