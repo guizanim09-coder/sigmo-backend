@@ -1,4 +1,5 @@
 const express = require("express");
+const crypto = require("crypto");
 const fs = require("fs");
 const path = require("path");
 const cors = require("cors");
@@ -318,6 +319,24 @@ function normalizarNome(s) {
     .trim();
 }
 
+function normalizarTextoLivre(s, maxLen = 1200) {
+  return String(s || "")
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, maxLen);
+}
+
+function sanitizeBotIdentifier(value, { allowColon = false } = {}) {
+  const limpo = String(value || "")
+    .trim()
+    .replace(allowColon ? /[^A-Za-z0-9:_-]/g : /[^A-Za-z0-9_-]/g, "");
+
+  return limpo || null;
+}
+
 function normalizarDataHoraBot(value) {
   return normalizarDataHoraLocal(value);
 }
@@ -534,6 +553,177 @@ function toEpoch(value) {
 
   const s = String(value).trim();
   return Date.parse(s.includes("T") ? s : s.replace(" ", "T"));
+}
+
+function buildDentpegEventFingerprint({
+  txid,
+  idTransacao,
+  cardKey,
+  fallbackKey,
+  valorLiquido,
+  nomePagador,
+  dataHora,
+  raw
+}) {
+  const txidNormalizado = sanitizeBotIdentifier(txid);
+  if (txidNormalizado) {
+    return `txid:${txidNormalizado}`;
+  }
+
+  const idTransacaoNormalizado = sanitizeBotIdentifier(idTransacao);
+  if (idTransacaoNormalizado) {
+    return `id:${idTransacaoNormalizado}`;
+  }
+
+  const cardKeyNormalizado = sanitizeBotIdentifier(cardKey, { allowColon: true });
+  if (cardKeyNormalizado) {
+    return `card:${cardKeyNormalizado}`;
+  }
+
+  const dataHoraNormalizada =
+    normalizarDataHoraLocal(dataHora) || normalizarDataLocal(dataHora) || "";
+  const valorNormalizado = Number(toMoney(valorLiquido || 0)).toFixed(2);
+  const nomeNormalizado = normalizarNome(nomePagador || "");
+  const fallbackNormalizado = sanitizeBotIdentifier(fallbackKey) || "";
+  const rawNormalizado = normalizarTextoLivre(raw || "");
+
+  if (
+    !dataHoraNormalizada &&
+    !nomeNormalizado &&
+    valorNormalizado === "0.00" &&
+    !rawNormalizado &&
+    fallbackNormalizado
+  ) {
+    return `fallback:${fallbackNormalizado}`;
+  }
+
+  const base = [
+    dataHoraNormalizada,
+    valorNormalizado,
+    nomeNormalizado,
+    rawNormalizado
+  ].join("|");
+
+  return `hash:${crypto.createHash("sha1").update(base).digest("hex")}`;
+}
+
+function buildDentpegDuplicateSearchParams({
+  referenceKey,
+  txid,
+  idTransacao,
+  cardKey,
+  fallbackKey,
+  eventFingerprint
+}) {
+  const normalized = {
+    referenceKey: String(referenceKey || "").trim() || null,
+    txid: sanitizeBotIdentifier(txid),
+    idTransacao: sanitizeBotIdentifier(idTransacao),
+    cardKey: sanitizeBotIdentifier(cardKey, { allowColon: true }),
+    fallbackKey: sanitizeBotIdentifier(fallbackKey),
+    eventFingerprint: String(eventFingerprint || "").trim() || null
+  };
+
+  const clauses = [];
+  const params = [];
+
+  const push = (sql, value) => {
+    if (!value) return;
+    params.push(value);
+    clauses.push(sql.replace("?", `$${params.length}`));
+  };
+
+  push("reference_key = ?", normalized.referenceKey);
+  push("metadata->>'txid' = ?", normalized.txid);
+  push("metadata->>'idTransacao' = ?", normalized.idTransacao);
+  push("metadata->>'cardKey' = ?", normalized.cardKey);
+  push("metadata->>'fallbackKey' = ?", normalized.fallbackKey);
+  push("metadata->>'eventFingerprint' = ?", normalized.eventFingerprint);
+
+  return {
+    normalized,
+    clauses,
+    params
+  };
+}
+
+function buildDentpegEventFingerprintFromTransaction(tx) {
+  if (!tx) return null;
+
+  const metadata = tx.metadata || {};
+
+  return buildDentpegEventFingerprint({
+    txid: metadata.txid,
+    idTransacao: metadata.idTransacao,
+    cardKey: metadata.cardKey,
+    fallbackKey: metadata.fallbackKey,
+    valorLiquido: metadata.valorLiquidoBot,
+    nomePagador: metadata.nomePagador,
+    dataHora: metadata.dataHoraBot,
+    raw: metadata.raw
+  });
+}
+
+async function findExistingDentpegTransactionByEvent(
+  client,
+  {
+    referenceKey,
+    txid,
+    idTransacao,
+    cardKey,
+    fallbackKey,
+    eventFingerprint
+  }
+) {
+  const search = buildDentpegDuplicateSearchParams({
+    referenceKey,
+    txid,
+    idTransacao,
+    cardKey,
+    fallbackKey,
+    eventFingerprint
+  });
+
+  if (search.clauses.length > 0) {
+    const direct = await client.query(
+      `
+      SELECT *
+      FROM financial_transactions
+      WHERE source_type = 'dentpeg'
+        AND (${search.clauses.join(" OR ")})
+      ORDER BY created_at DESC NULLS LAST
+      LIMIT 1
+      `,
+      search.params
+    );
+
+    if (direct.rows.length > 0) {
+      return mapFinancialTransaction(direct.rows[0]);
+    }
+  }
+
+  if (!search.normalized.eventFingerprint) {
+    return null;
+  }
+
+  const recentes = await client.query(
+    `
+    SELECT *
+    FROM financial_transactions
+    WHERE source_type = 'dentpeg'
+    ORDER BY created_at DESC NULLS LAST
+    LIMIT 2000
+    `
+  );
+
+  for (const row of recentes.rows) {
+    const tx = mapFinancialTransaction(row);
+    if (buildDentpegEventFingerprintFromTransaction(tx) === search.normalized.eventFingerprint) {
+      return tx;
+    }
+  }
+
+  return null;
 }
 
 function decodificarStringPdf(valor) {
@@ -2600,7 +2790,7 @@ const valorFinal = calcularCreditoSigmo(valorBruto);
   }
 });
 
-app.post("/deposito/confirmar-bot", authBot, async (req, res) => {
+app.post("/deposito/confirmar-bot-path-legacy", authBot, async (req, res) => {
   try {
     const txid = String(req.body.txid || "").trim() || null;
     const idTransacao = String(req.body.idTransacao || "").trim() || null;
@@ -2803,6 +2993,272 @@ app.post("/deposito/confirmar-bot", authBot, async (req, res) => {
           txid,
           idTransacao,
           fallbackKey,
+          userId: usuario.id,
+          valor: valorFinal,
+          dataHoraBot,
+          dataHoraComprovanteMatch
+        },
+        ipAddress: "bot"
+      });
+
+      return {
+        duplicado: false,
+        saldo: usuarioAtualizado.saldo,
+        depositoId: depositoMatch.id
+      };
+    });
+
+    if (resultado.duplicado) {
+      return res.json({ message: "Transacao ja processada", duplicado: true });
+    }
+
+    res.json({
+      message: "Depósito automático aprovado",
+      saldo: resultado.saldo,
+      depositoId: resultado.depositoId
+    });
+  } catch (error) {
+    console.error("❌ ERRO BOT:", error.message);
+
+    res.status(400).json({
+      error: error.message || "Erro no depósito automático"
+    });
+  }
+});
+
+app.post("/deposito/confirmar-bot", authBot, async (req, res) => {
+  try {
+    const txid = sanitizeBotIdentifier(req.body.txid);
+    const idTransacao = sanitizeBotIdentifier(req.body.idTransacao);
+    const cardKey = sanitizeBotIdentifier(req.body.cardKey, { allowColon: true });
+    const fallbackKey = sanitizeBotIdentifier(req.body.fallbackKey);
+    const valorBot = toMoney(req.body.valorLiquido);
+    const nomeExtrato = normalizarNome(req.body.nomePagador);
+    const dataHoraBot = normalizarDataHoraLocal(req.body.dataHora);
+    const eventFingerprint = buildDentpegEventFingerprint({
+      txid,
+      idTransacao,
+      cardKey,
+      fallbackKey,
+      valorLiquido: valorBot,
+      nomePagador: nomeExtrato,
+      dataHora: dataHoraBot,
+      raw: req.body.raw || null
+    });
+
+    if (!txid && !idTransacao && !cardKey && !fallbackKey) {
+      return res.status(400).json({ error: "Identificador da transacao obrigatorio" });
+    }
+
+    if (!valorBot || valorBot <= 0) {
+      return res.status(400).json({ error: "Valor obrigatorio" });
+    }
+
+    if (!nomeExtrato || !nomeExtrato.includes(" ")) {
+      return res.status(400).json({ error: "Nome do pagador invalido" });
+    }
+
+    if (!dataHoraBot) {
+      return res.status(400).json({ error: "dataHora invalida" });
+    }
+
+    const referenceKey = txid
+      ? `dentpeg:txid:${txid}`
+      : idTransacao
+        ? `dentpeg:id:${idTransacao}`
+        : cardKey
+          ? `dentpeg:card:${cardKey}`
+          : `dentpeg:fallback:${fallbackKey}`;
+
+    const txConsumida = await findExistingDentpegTransactionByEvent(pool, {
+      referenceKey,
+      txid,
+      idTransacao,
+      cardKey,
+      fallbackKey,
+      eventFingerprint
+    });
+
+    if (txConsumida) {
+      console.log("⛔ CARD JA UTILIZADO IGNORADO:", {
+        referenceKey,
+        cardKey,
+        eventFingerprint,
+        financialTransactionId: txConsumida.id
+      });
+      return res.json({ ok: true, duplicado: true });
+    }
+
+    const resultado = await runInTransaction(async (client) => {
+      const duplicadoTx = await findExistingDentpegTransactionByEvent(client, {
+        referenceKey,
+        txid,
+        idTransacao,
+        cardKey,
+        fallbackKey,
+        eventFingerprint
+      });
+
+      if (duplicadoTx) {
+        return { duplicado: true, saldo: null, depositoId: null };
+      }
+
+      const candidatos = await client.query(
+        `
+        SELECT *
+        FROM depositos
+        WHERE status = 'pendente'
+          AND tipo_transacao = 'entrada'
+        ORDER BY comprovante_enviado_em DESC NULLS LAST, criado_em DESC NULLS LAST, id DESC
+        FOR UPDATE
+        `
+      );
+
+      let depositoMatch = null;
+      let dataHoraComprovanteMatch = null;
+
+      for (const row of candidatos.rows) {
+        const dep = mapDeposito(row);
+        const textoComprovante = normalizarNome(dep.comprovanteTexto);
+        const datasComprovante = extrairDatasDoComprovante(dep.comprovanteTexto);
+        const tComprovanteEnviado = Date.parse(String(dep.comprovanteEnviadoEm || ""));
+        const idadeComprovanteMin = Number.isNaN(tComprovanteEnviado)
+          ? null
+          : (Date.now() - tComprovanteEnviado) / 60000;
+        const comprovanteRecente =
+          idadeComprovanteMin !== null &&
+          idadeComprovanteMin >= 0 &&
+          idadeComprovanteMin <= COMPROVANTE_UPLOAD_WINDOW_MINUTES;
+
+        if (!textoComprovante || textoComprovante.length < 5) {
+          console.log("⚠️ OCR vazio ou invalido para deposito", dep.id);
+          continue;
+        }
+
+        if (!comprovanteRecente) {
+          console.log("⚠️ Comprovante fora da janela valida", dep.id, {
+            comprovanteEnviadoEm: dep.comprovanteEnviadoEm,
+            idadeComprovanteMin
+          });
+          continue;
+        }
+
+        if (datasComprovante.length === 0) {
+          console.log("⚠️ Data nao encontrada no comprovante", dep.id);
+          continue;
+        }
+
+        const bateNome = bateNomeComprovante(textoComprovante, nomeExtrato);
+        if (!bateNome) {
+          continue;
+        }
+
+        const calc = calcularLiquidoDentpeg(dep.valor);
+        const bateValor =
+          typeof calc === "number"
+            ? Math.abs(calc - valorBot) < 1
+            : valorBot >= calc.min && valorBot <= calc.max;
+
+        if (!bateValor) {
+          continue;
+        }
+
+        const dataBot = normalizarDataLocal(dataHoraBot);
+        const dataComprovanteMatch = dataBot && datasComprovante.includes(dataBot)
+          ? dataBot
+          : null;
+        const bateData = Boolean(dataComprovanteMatch);
+
+        console.log("🔎 MATCH RESULT:", {
+          depositoId: dep.id,
+          referenceKey,
+          cardKey,
+          eventFingerprint,
+          nomeExtrato,
+          textoComprovante,
+          valorBot,
+          valorPedido: dep.valor,
+          comprovanteEnviadoEm: dep.comprovanteEnviadoEm,
+          idadeComprovanteMin,
+          dataBot: dataHoraBot,
+          dataBotNormalizada: dataBot,
+          dataComprovanteMatch,
+          datasComprovanteEncontradas: datasComprovante.slice(0, 5),
+          bateNome,
+          bateValor,
+          bateData
+        });
+
+        if (!bateData) {
+          continue;
+        }
+
+        depositoMatch = dep;
+        dataHoraComprovanteMatch = dataComprovanteMatch;
+        break;
+      }
+
+      if (!depositoMatch) {
+        throw new Error("Nenhum depósito compatível encontrado");
+      }
+
+      const usuario = await getUserByIdForUpdate(depositoMatch.userId, client);
+      if (!usuario) {
+        throw new Error("Usuário não encontrado");
+      }
+
+      const identificadorBot = txid || idTransacao || cardKey || fallbackKey;
+      const valorFinal = calcularCreditoSigmo(toMoney(depositoMatch.valor));
+      const metadata = {
+        txid,
+        idTransacao,
+        cardKey,
+        fallbackKey,
+        eventFingerprint,
+        dataHoraBot,
+        dataHoraComprovanteMatch,
+        nomePagador: nomeExtrato,
+        valorLiquidoBot: valorBot,
+        raw: req.body.raw || null
+      };
+
+      const tx = await createFinancialTransaction(client, {
+        userId: usuario.id,
+        referenceKey,
+        sourceType: "dentpeg",
+        sourceId: identificadorBot || buildId("dentpeg"),
+        operationType: "deposit",
+        direction: "credit",
+        amount: valorFinal,
+        description: "Depósito automático DentPeg",
+        metadata
+      });
+
+      const usuarioAtualizado = await applyLedgerChange(client, {
+        userId: usuario.id,
+        financialTransactionId: tx.id,
+        entryType: "credit",
+        amount: valorFinal,
+        description: "Depósito automático DentPeg",
+        metadata
+      });
+
+      depositoMatch.status = "aprovado";
+      depositoMatch.aprovadoEm = db();
+      depositoMatch.descricao = `Auto aprovado DentPeg ${identificadorBot}`;
+
+      await saveDeposito(depositoMatch, client);
+
+      await createAuditLog(client, {
+        action: "auto_deposit",
+        targetType: "deposito",
+        targetId: depositoMatch.id,
+        details: {
+          txid,
+          idTransacao,
+          cardKey,
+          fallbackKey,
+          eventFingerprint,
           userId: usuario.id,
           valor: valorFinal,
           dataHoraBot,
