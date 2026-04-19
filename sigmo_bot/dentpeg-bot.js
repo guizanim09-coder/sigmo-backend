@@ -1,6 +1,7 @@
 require("dotenv").config();
 
 const { chromium } = require("playwright");
+const crypto = require("crypto");
 const fs = require("fs");
 const path = require("path");
 
@@ -156,6 +157,10 @@ function extrairTextoSeguro(texto, regex) {
   const textoNormalizado = normalizarEspacos(texto);
   const match = textoNormalizado.match(regex);
   return match ? normalizarEspacos(match[1]) : null;
+}
+
+function gerarHashCurto(valor) {
+  return crypto.createHash("sha1").update(String(valor || "")).digest("hex");
 }
 
 function normalizarDataHoraBR(texto) {
@@ -601,11 +606,62 @@ async function capturarTxidDoCard(page, card, textoCard) {
 
 function extrairIdTransacao(texto) {
   const textoNormalizado = normalizarEspacos(texto);
-  const match =
-    textoNormalizado.match(/#\s*([A-Za-z0-9-]{6,})/i) ||
-    textoNormalizado.match(/id(?:\s+da\s+transacao)?\s*:?\s*([A-Za-z0-9-]{6,})/i);
+  const candidatos = [
+    textoNormalizado.match(/#\s*([A-Za-z0-9-]{6,})\b/i),
+    textoNormalizado.match(
+      /\bid(?:\s+da\s+transac(?:a|ã)o)?\b\s*:?\s*([A-Za-z0-9-]{6,})\b/i
+    )
+  ];
+  const bloqueados = new Set([
+    "detalhes",
+    "entrada",
+    "saida",
+    "confirmado",
+    "txid",
+    "pix",
+    "qr",
+    "dinamico"
+  ]);
 
-  return match ? match[1] : null;
+  for (const match of candidatos) {
+    if (!match || !match[1]) continue;
+
+    const valor = normalizarEspacos(match[1]).replace(/^#+/, "").trim();
+    if (!valor) continue;
+    if (bloqueados.has(valor.toLowerCase())) continue;
+
+    return valor;
+  }
+
+  return null;
+}
+
+function buildCardUniqueKey({
+  txid,
+  idTransacao,
+  dataHora,
+  valorLiquido,
+  valorBruto,
+  nomePagador,
+  raw
+}) {
+  if (txid) {
+    return `txid:${String(txid).trim()}`;
+  }
+
+  if (idTransacao) {
+    return `id:${String(idTransacao).trim()}`;
+  }
+
+  const base = [
+    normalizarDataHoraBR(dataHora || "") || "",
+    Number(valorLiquido || 0).toFixed(2),
+    Number(valorBruto || 0).toFixed(2),
+    normalizarNomePagador(nomePagador || "") || "",
+    normalizarEspacos(raw || "")
+  ].join("|");
+
+  return `fallback:${gerarHashCurto(base)}`;
 }
 
 async function capturarTransacoes() {
@@ -633,6 +689,7 @@ async function capturarTransacoes() {
 
       const total = Math.min(await cards.count(), 100);
       const transacoes = [];
+      const cardsUnicos = new Set();
 
       for (let i = 0; i < total; i += 1) {
         try {
@@ -735,13 +792,44 @@ async function capturarTransacoes() {
             });
           }
 
+          const valorLiquido = normalizarValorBR(valorLiquidoTexto);
+          const valorBruto = normalizarValorBR(valorBrutoTexto);
+          const cardKey = buildCardUniqueKey({
+            txid,
+            idTransacao,
+            dataHora,
+            valorLiquido,
+            valorBruto,
+            nomePagador,
+            raw: texto
+          });
+
+          if (cardsUnicos.has(cardKey)) {
+            if (DENTPEG_DEBUG && i < DENTPEG_DEBUG_CARD_LIMIT) {
+              debugDentpeg("card_ignorado", {
+                index: i,
+                motivo: "card_duplicado",
+                cardKey,
+                dataHoraExtraida: dataHora,
+                nomePagador,
+                txid,
+                idTransacao,
+                rawPreview: resumirTextoParaLog(texto, 700)
+              });
+            }
+            continue;
+          }
+
+          cardsUnicos.add(cardKey);
+
           transacoes.push({
-            valorLiquido: normalizarValorBR(valorLiquidoTexto),
-            valorBruto: normalizarValorBR(valorBrutoTexto),
+            valorLiquido,
+            valorBruto,
             nomePagador,
             txid,
             idTransacao,
             dataHora,
+            cardKey,
             raw: texto
           });
         } catch (error) {

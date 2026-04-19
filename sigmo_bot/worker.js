@@ -188,6 +188,13 @@ function getAgoraLocalEpoch() {
 }
 
 function buildFallbackKey(tx) {
+  if (tx.cardKey) {
+    return crypto
+      .createHash("sha1")
+      .update(String(tx.cardKey).trim())
+      .digest("hex");
+  }
+
   const base = [
     Number(tx.valorLiquido || 0).toFixed(2),
     normalizarDataHoraLocal(tx.dataHora) || "",
@@ -205,6 +212,10 @@ function getTransactionKey(tx) {
 
   if (tx.idTransacao) {
     return `id:${String(tx.idTransacao).trim()}`;
+  }
+
+  if (tx.cardKey) {
+    return `card:${String(tx.cardKey).trim()}`;
   }
 
   const fallbackKey = tx.fallbackKey || buildFallbackKey(tx);
@@ -241,6 +252,7 @@ async function enviarParaBackend(tx, tentativa = 1) {
     nomePagador: tx.nomePagador,
     dataHora: dataHoraLocal,
     idTransacao: tx.idTransacao || null,
+    cardKey: tx.cardKey || null,
     fallbackKey: tx.fallbackKey || buildFallbackKey(tx),
     raw: tx.raw || null
   };
