@@ -22,6 +22,13 @@ const DATABASE_URL = String(process.env.DATABASE_URL || "").trim();
 const JWT_SECRET = String(process.env.JWT_SECRET || "").trim();
 const ADMIN_EMAIL = String(process.env.ADMIN_EMAIL || "").trim().toLowerCase();
 const ADMIN_PASSWORD = String(process.env.ADMIN_PASSWORD || "").trim();
+const DENTPEG_PUBLIC_CHECKOUT_URL = String(
+  process.env.DENTPEG_PUBLIC_CHECKOUT_URL || "https://api.dentpeg.com/checkout/sigmo"
+).trim();
+const DENTPEG_CHECKOUT_TIMEOUT_MS = Math.max(
+  3000,
+  Number(process.env.DENTPEG_CHECKOUT_TIMEOUT_MS || 15000)
+);
 const BACKUP_ENABLED =
   String(process.env.BACKUP_ENABLED || "true").trim().toLowerCase() !== "false";
 const BACKUP_INTERVAL_HOURS = Number(process.env.BACKUP_INTERVAL_HOURS || 24);
@@ -86,6 +93,58 @@ function getBackupFileName(date = new Date()) {
 
 function getBackupFilePath(fileName) {
   return path.join(BACKUPS_DIR, fileName);
+}
+
+async function gerarPixDentpegPublico(valor) {
+  const valorNumero = toMoney(valor);
+
+  if (!Number.isFinite(valorNumero) || valorNumero <= 0) {
+    throw new Error("Valor inválido para gerar PIX");
+  }
+
+  const amountInCents = Math.round(valorNumero * 100);
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), DENTPEG_CHECKOUT_TIMEOUT_MS);
+
+  try {
+    const response = await fetch(DENTPEG_PUBLIC_CHECKOUT_URL, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Accept: "application/json"
+      },
+      body: JSON.stringify({ amountInCents }),
+      signal: controller.signal
+    });
+
+    const data = await response.json().catch(() => ({}));
+
+    if (!response.ok) {
+      throw new Error(data?.error || data?.message || "Falha ao gerar PIX na DentPeg");
+    }
+
+    const qrCopyPaste = String(data?.pix?.qrCopyPaste || "").trim();
+
+    if (!qrCopyPaste) {
+      throw new Error("DentPeg não retornou a chave PIX");
+    }
+
+    return {
+      pixCode: qrCopyPaste,
+      pixId: String(data?.pix?.id || "").trim() || null,
+      qrImageUrl: String(data?.pix?.qrImageUrl || "").trim() || null,
+      expiration: String(data?.pix?.expiration || "").trim() || null,
+      reused: Boolean(data?.reused)
+    };
+  } catch (error) {
+    if (error?.name === "AbortError") {
+      throw new Error("Tempo esgotado ao gerar PIX na DentPeg");
+    }
+
+    throw error;
+  } finally {
+    clearTimeout(timeout);
+  }
 }
 
 async function listBackupFiles() {
@@ -1879,6 +1938,41 @@ app.post("/deposito", async (req, res) => {
   } catch (error) {
     console.error(error);
     res.status(500).json({ error: "Erro ao criar pedido" });
+  }
+});
+
+app.post("/deposito/pix-code", async (req, res) => {
+  try {
+    const { userId, valor } = req.body;
+
+    if (!userId || valor === undefined || valor === null) {
+      return res.status(400).json({ error: "userId e valor são obrigatórios" });
+    }
+
+    const valorNumero = toMoney(valor);
+
+    if (!Number.isFinite(valorNumero) || valorNumero <= 0) {
+      return res.status(400).json({ error: "Valor inválido" });
+    }
+
+    const user = await getUserById(userId);
+
+    if (!user) {
+      return res.status(404).json({ error: "Usuário não encontrado" });
+    }
+
+    const pix = await gerarPixDentpegPublico(valorNumero);
+
+    res.json({
+      message: "Chave PIX gerada com sucesso",
+      valor: valorNumero,
+      ...pix
+    });
+  } catch (error) {
+    console.error("Erro ao gerar chave PIX:", error);
+    res.status(500).json({
+      error: error.message || "Erro ao gerar chave PIX"
+    });
   }
 });
 
