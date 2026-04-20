@@ -2691,20 +2691,50 @@ function bateNomeComprovante(textoComprovante, nomeExtrato) {
     return true;
   }
 
-  const tokens = nomeExtrato.split(" ").filter((token) => token.length >= 3);
-  if (tokens.length < 2) {
+  const ignorarTokens = new Set([
+    "da",
+    "de",
+    "di",
+    "do",
+    "du",
+    "das",
+    "des",
+    "dos",
+    "e"
+  ]);
+
+  const tokens = nomeExtrato
+    .split(" ")
+    .map((token) => token.trim())
+    .filter((token) => token.length >= 2 && !ignorarTokens.has(token));
+
+  if (tokens.length === 0) {
     return false;
   }
 
   const primeiro = tokens[0];
   const ultimo = tokens[tokens.length - 1];
   const coincidencias = tokens.filter((token) => textoComprovante.includes(token));
+  const tokensFortes = tokens.filter((token) => token.length >= 4);
+  const coincidenciasFortes = tokensFortes.filter((token) => textoComprovante.includes(token));
 
-  return (
+  if (
+    tokens.length >= 2 &&
     textoComprovante.includes(primeiro) &&
-    textoComprovante.includes(ultimo) &&
-    coincidencias.length >= 2
-  );
+    textoComprovante.includes(ultimo)
+  ) {
+    return true;
+  }
+
+  if (coincidenciasFortes.length >= 2) {
+    return true;
+  }
+
+  if (tokensFortes.length >= 3 && coincidenciasFortes.length >= 2 && coincidencias.length >= 3) {
+    return true;
+  }
+
+  return coincidencias.length >= Math.min(3, tokens.length);
 }
 
 app.post("/deposito/confirmar-bot-legacy", authBot, async (req, res) => {
