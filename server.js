@@ -2,11 +2,11 @@ const express = require("express");
 const crypto = require("crypto");
 const fs = require("fs");
 const path = require("path");
-const zlib = require("zlib");
 const cors = require("cors");
 const bcrypt = require("bcryptjs");
 const multer = require("multer");
 const Tesseract = require("tesseract.js");
+const { PDFParse } = require("pdf-parse");
 const helmet = require("helmet");
 const rateLimit = require("express-rate-limit");
 const jwt = require("jsonwebtoken");
@@ -727,191 +727,66 @@ async function findExistingDentpegTransactionByEvent(
   return null;
 }
 
-function decodificarStringPdf(valor) {
-  return String(valor || "")
-    .replace(/\\\r?\n/g, "")
-    .replace(/\\n/g, "\n")
-    .replace(/\\r/g, "\r")
-    .replace(/\\t/g, "\t")
-    .replace(/\\\(/g, "(")
-    .replace(/\\\)/g, ")")
-    .replace(/\\\\/g, "\\")
-    .replace(/\\([0-7]{3})/g, (_, octal) =>
-      String.fromCharCode(parseInt(octal, 8))
-    );
-}
-
-function decodificarHexPdf(valor) {
-  const limpo = String(valor || "").replace(/[^0-9A-Fa-f]/g, "");
-  if (!limpo) return "";
-
-  const hex = limpo.length % 2 === 0 ? limpo : limpo + "0";
-  const buffer = Buffer.from(hex, "hex");
-
-  if (buffer.length >= 2) {
-    const bom = buffer.slice(0, 2).toString("hex").toLowerCase();
-    if (bom === "feff" || bom === "fffe") {
-      const utf16 =
-        bom === "feff"
-          ? Buffer.from(buffer.slice(2)).swap16().toString("utf16le")
-          : buffer.slice(2).toString("utf16le");
-
-      if (utf16.trim()) return utf16;
-    }
-  }
-
-  return buffer.toString("latin1");
-}
-
 function normalizarTextoPdfExtraido(texto) {
   return String(texto || "")
     .replace(/\u0000/g, "")
+    .replace(/[^\x09\x0A\x0D\x20-\x7E\u00A0-\u024F\u20A0-\u20CF]/g, " ")
     .replace(/[^\S\r\n]+/g, " ")
     .replace(/[ \t]+\n/g, "\n")
     .replace(/\n{3,}/g, "\n\n")
     .trim();
 }
 
-function extrairTextosDeArrayPdf(conteudo) {
-  const itens = [];
-  let i = 0;
+function textoPdfPareceValido(texto) {
+  const limpo = normalizarTextoPdfExtraido(texto);
+  if (limpo.length < 12) return false;
 
-  while (i < conteudo.length) {
-    const ch = conteudo[i];
+  const total = limpo.length;
+  const legiveis =
+    (limpo.match(/[A-Za-zÀ-ÿ0-9\s.,:/\-@()$%#]/g) || []).length / total;
+  const estranhos =
+    (limpo.match(/[□�]/g) || []).length / total;
 
-    if (ch === "(") {
-      let atual = "(";
-      let profundidade = 1;
-      i++;
-
-      while (i < conteudo.length && profundidade > 0) {
-        const atualCh = conteudo[i];
-        atual += atualCh;
-
-        if (atualCh === "\\" && i + 1 < conteudo.length) {
-          atual += conteudo[i + 1];
-          i += 2;
-          continue;
-        }
-
-        if (atualCh === "(") profundidade++;
-        if (atualCh === ")") profundidade--;
-        i++;
-      }
-
-      itens.push(decodificarStringPdf(atual.slice(1, -1)));
-      continue;
-    }
-
-    if (ch === "<" && conteudo[i + 1] !== "<") {
-      const fim = conteudo.indexOf(">", i + 1);
-      if (fim !== -1) {
-        itens.push(decodificarHexPdf(conteudo.slice(i + 1, fim)));
-        i = fim + 1;
-        continue;
-      }
-    }
-
-    i++;
-  }
-
-  return itens;
+  return legiveis >= 0.75 && estranhos <= 0.02;
 }
 
-function extrairTextoDeConteudoPdf(conteudo) {
-  const partes = [];
-  const blocos = String(conteudo || "").match(/BT[\s\S]*?ET/g) || [];
+async function extrairTextoPdfComParser(caminho) {
+  const parser = new PDFParse({ data: fs.readFileSync(caminho) });
 
-  for (const bloco of blocos) {
-    let teveTextoNoBloco = false;
-    let match;
-
-    const regexTj = /(\((?:\\.|[^\\)])*\)|<[\dA-Fa-f\s]+>)\s*Tj/g;
-    while ((match = regexTj.exec(bloco))) {
-      const bruto = match[1];
-      const texto =
-        bruto[0] === "("
-          ? decodificarStringPdf(bruto.slice(1, -1))
-          : decodificarHexPdf(bruto.slice(1, -1));
-      if (texto.trim()) {
-        partes.push(texto);
-        teveTextoNoBloco = true;
-      }
-    }
-
-    const regexTJ = /\[(.*?)\]\s*TJ/g;
-    while ((match = regexTJ.exec(bloco))) {
-      const textos = extrairTextosDeArrayPdf(match[1]).filter((parte) => parte.trim());
-      if (textos.length) {
-        partes.push(textos.join(" "));
-        teveTextoNoBloco = true;
-      }
-    }
-
-    const regexQuote = /(\((?:\\.|[^\\)])*\)|<[\dA-Fa-f\s]+>)\s*['"]/g;
-    while ((match = regexQuote.exec(bloco))) {
-      const bruto = match[1];
-      const texto =
-        bruto[0] === "("
-          ? decodificarStringPdf(bruto.slice(1, -1))
-          : decodificarHexPdf(bruto.slice(1, -1));
-      if (texto.trim()) {
-        partes.push(texto);
-        teveTextoNoBloco = true;
-      }
-    }
-
-    if (teveTextoNoBloco) partes.push("\n");
-  }
-
-  return normalizarTextoPdfExtraido(partes.join(" "));
-}
-
-function extrairTextoPdfBasico(caminho) {
   try {
-    const buffer = fs.readFileSync(caminho);
-    const conteudo = buffer.toString("latin1");
-    const partes = [];
-    const regexStream = /<<(.*?)>>[\r\n\s]*stream\r?\n([\s\S]*?)\r?\nendstream/g;
-    let match;
+    const result = await parser.getText();
+    return normalizarTextoPdfExtraido(result?.text || "");
+  } finally {
+    await parser.destroy().catch(() => {});
+  }
+}
 
-    while ((match = regexStream.exec(conteudo))) {
-      const dicionario = match[1] || "";
-      const streamLatin1 = match[2] || "";
-      let streamBuffer = Buffer.from(streamLatin1, "latin1");
-      const usaFlate = /\/Filter\s*(?:\[\s*)?\/FlateDecode\b/.test(dicionario);
+async function extrairTextoPdfViaOcr(caminho) {
+  const parser = new PDFParse({ data: fs.readFileSync(caminho) });
 
-      if (usaFlate) {
-        try {
-          streamBuffer = zlib.inflateSync(streamBuffer);
-        } catch (e) {
-          try {
-            streamBuffer = zlib.inflateRawSync(streamBuffer);
-          } catch {
-            continue;
-          }
-        }
-      }
+  try {
+    const screenshots = await parser.getScreenshot({
+      first: 1,
+      desiredWidth: 1800,
+      imageDataUrl: false,
+      imageBuffer: true
+    });
 
-      const texto = extrairTextoDeConteudoPdf(streamBuffer.toString("latin1"));
-      if (texto) partes.push(texto);
+    const paginas = Array.isArray(screenshots?.pages) ? screenshots.pages : [];
+    const textos = [];
+
+    for (const pagina of paginas) {
+      const imagem = pagina?.data;
+      if (!imagem) continue;
+
+      const result = await Tesseract.recognize(imagem, "por+eng");
+      const texto = limparTextoComprovante(result?.data?.text || "");
+      if (texto) textos.push(texto);
     }
 
-    const textoStreams = normalizarTextoPdfExtraido(partes.join("\n"));
-    if (textoStreams.length >= 8) return textoStreams;
-
-    const matches = [...conteudo.matchAll(/\((?:\\.|[^\\)])*\)/g)];
-    const textoFallback = normalizarTextoPdfExtraido(
-      matches
-        .map((item) => decodificarStringPdf(item[0].slice(1, -1)))
-        .filter((parte) => parte.trim().length >= 2)
-        .join(" ")
-    );
-
-    return textoFallback;
-  } catch (e) {
-    console.log("❌ PDF texto erro:", e.message);
-    return "";
+    return limparTextoComprovante(textos.join("\n\n"));
+  } finally {
+    await parser.destroy().catch(() => {});
   }
 }
 
@@ -922,13 +797,19 @@ async function extrairTextoComprovante(caminho, mimetype = "") {
       path.extname(caminho).toLowerCase() === ".pdf";
 
     if (isPdf) {
-      const textoPdf = extrairTextoPdfBasico(caminho);
-      if (textoPdf) {
+      const textoPdf = await extrairTextoPdfComParser(caminho);
+      if (textoPdfPareceValido(textoPdf)) {
         return limparTextoComprovante(textoPdf);
       }
 
-      console.log("⚠️ PDF sem camada de texto legivel para OCR");
-      return "";
+      console.log("⚠️ Texto do PDF inválido; tentando OCR da página renderizada");
+
+      const textoOcrPdf = await extrairTextoPdfViaOcr(caminho);
+      if (textoPdfPareceValido(textoOcrPdf)) {
+        return limparTextoComprovante(textoOcrPdf);
+      }
+
+      return limparTextoComprovante(textoOcrPdf || textoPdf || "");
     }
 
     const result = await Tesseract.recognize(caminho, "por+eng");
