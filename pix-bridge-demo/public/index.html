@@ -1,0 +1,67 @@
+<!doctype html>
+<html lang="pt-BR">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Sigmo PIX Demo</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <main class="app-shell">
+      <section class="hero-card">
+        <span class="hero-kicker">PRIVATE FINANCE DASHBOARD</span>
+        <h1>Gerar chave PIX</h1>
+        <p>
+          Digite o valor, gere a chave PIX e copie o codigo na mesma tela.
+        </p>
+        <button class="neon-btn" id="openModalButton" type="button">
+          Abrir pagamento
+        </button>
+      </section>
+    </main>
+
+    <div id="modalSaldo" class="modal">
+      <div class="modal-content modal-saldo-content" role="dialog" aria-modal="true" aria-labelledby="modalSaldoTitulo">
+        <div class="modal-saldo-header">
+          <h3 id="modalSaldoTitulo">Adicionar saldo</h3>
+          <p class="scanner-status">
+            Informe o valor para que o dentpeg.com/checkout/sigmo gere a chave PIX corretamente.
+          </p>
+        </div>
+
+        <div class="modal-saldo-step">
+          <div class="modal-saldo-value-box">
+            <label for="valorAdicionarSaldo">Quanto voce deseja adicionar?</label>
+            <input type="number" id="valorAdicionarSaldo" placeholder="Digite o valor" min="1" step="1" />
+            <p id="previewLiquido">Sera processado: R$ 0,00</p>
+          </div>
+
+          <button class="neon-btn" id="generatePixButton" type="button">
+            Gerar chave PIX
+          </button>
+        </div>
+
+        <div id="etapaAcoes" class="modal-saldo-step" hidden>
+          <div class="modal-saldo-summary-card" id="pedidoEntradaResumo"></div>
+          <div class="modal-saldo-actions">
+            <button class="neon-btn" id="copyPixButton" type="button">
+              Copiar chave PIX
+            </button>
+            <button class="neon-btn outline" id="newPixButton" type="button">
+              Gerar nova chave
+            </button>
+          </div>
+        </div>
+
+        <button class="neon-btn outline" id="closeModalButton" type="button">
+          Fechar
+        </button>
+      </div>
+    </div>
+
+    <div id="toast" class="toast" role="status" aria-live="polite"></div>
+
+    <script src="/config.js"></script>
+    <script src="/app.js"></script>
+  </body>
+</html>

@@ -1,0 +1,15 @@
+{
+  "name": "pix-bridge-demo",
+  "version": "1.0.0",
+  "description": "Demonstracao segura de frontend em um dominio e geracao de PIX em outro servico",
+  "main": "mask-server.js",
+  "scripts": {
+    "start": "node mask-server.js",
+    "start:mask": "node mask-server.js",
+    "start:link": "node link-server.js"
+  },
+  "dependencies": {
+    "express": "^4.21.2",
+    "playwright": "^1.54.2"
+  }
+}
