@@ -35,6 +35,13 @@ const BACKUP_INTERVAL_HOURS = Number(process.env.BACKUP_INTERVAL_HOURS || 24);
 const BACKUP_RETENTION_DAYS = Number(process.env.BACKUP_RETENTION_DAYS || 7);
 const BACKUP_INITIAL_DELAY_MS = Number(process.env.BACKUP_INITIAL_DELAY_MS || 30000);
 const BACKUP_DIR = String(process.env.BACKUP_DIR || "").trim();
+const LIMITE_DEPOSITO_MIN = Number(process.env.LIMITE_DEPOSITO_MIN || 10);
+const LIMITE_DEPOSITO_MAX = Number(process.env.LIMITE_DEPOSITO_MAX || 3000);
+const LIMITE_SAQUE_PIX_MIN = Number(process.env.LIMITE_SAQUE_PIX_MIN || 100);
+const LIMITE_SAQUE_PIX_MAX = Number(process.env.LIMITE_SAQUE_PIX_MAX || 5900);
+const TAXA_SAQUE_PIX_PERCENTUAL = Number(
+  process.env.TAXA_SAQUE_PIX_PERCENTUAL || 0.10
+);
 const COMPROVANTE_UPLOAD_WINDOW_MINUTES = Number(
   process.env.COMPROVANTE_UPLOAD_WINDOW_MINUTES || 60
 );
@@ -900,24 +907,43 @@ async function extrairTextoComprovanteLegacy(caminho) {
 
 
 
-// =========================
-// 🔥 ADICIONE ISSO (logo após toMoney)
-// =========================
-
-function calcularCreditoSigmo(valorBruto) {
-  const v = Number(valorBruto);
+function calcularValorCreditadoDeposito(valorBruto) {
+  const v = toMoney(valorBruto);
 
   if (!Number.isFinite(v) || v <= 0) return 0;
 
-  if (v <= 50) {
-    return Number((v - 3).toFixed(2));
+  return v;
+}
+
+function calcularDetalhesSaquePix(valorSolicitado, repassarTaxa = false) {
+  const valor = toMoney(valorSolicitado);
+  const repassar = Boolean(repassarTaxa);
+
+  if (!Number.isFinite(valor) || valor <= 0) {
+    return {
+      valorSolicitado: 0,
+      taxa: 0,
+      valorLiquido: 0,
+      valorDebitado: 0,
+      repassarTaxa: repassar
+    };
   }
 
-  if (v <= 99.99) {
-    return Number((v - 4).toFixed(2));
-  }
+  const taxa = toMoney(valor * TAXA_SAQUE_PIX_PERCENTUAL);
+  const valorLiquido = repassar
+    ? Math.max(0, toMoney(valor - taxa))
+    : valor;
+  const valorDebitado = repassar
+    ? valor
+    : toMoney(valor + taxa);
 
-  return Number((v - (v * 0.04)).toFixed(2));
+  return {
+    valorSolicitado: valor,
+    taxa,
+    valorLiquido,
+    valorDebitado,
+    repassarTaxa: repassar
+  };
 }
 
 
@@ -1031,6 +1057,10 @@ async function initDB() {
   await ensureColumn("depositos", "tipo_chave", "TEXT DEFAULT ''");
   await ensureColumn("depositos", "descricao", "TEXT DEFAULT ''");
 await ensureColumn("depositos", "comprovante_texto", "TEXT DEFAULT ''");
+  await ensureColumn("depositos", "repassar_taxa", "BOOLEAN DEFAULT false");
+  await ensureColumn("depositos", "taxa_pix", "NUMERIC DEFAULT 0");
+  await ensureColumn("depositos", "valor_liquido_pix", "NUMERIC DEFAULT 0");
+  await ensureColumn("depositos", "valor_debitado_pix", "NUMERIC DEFAULT 0");
   await ensureColumn("depositos", "aprovado_em", "TIMESTAMP");
   await ensureColumn("depositos", "recusado_em", "TIMESTAMP");
   await ensureColumn("depositos", "comprovante_enviado_em", "TIMESTAMP");
@@ -1292,6 +1322,10 @@ function mapDeposito(row) {
     comprovanteTexto: row.comprovante_texto || "",
 comprovanteUrl: row.comprovante_url || "",
     descricao: row.descricao || "",
+    repassarTaxa: Boolean(row.repassar_taxa),
+    taxaPix: toMoney(row.taxa_pix),
+    valorLiquidoPix: toMoney(row.valor_liquido_pix),
+    valorDebitadoPix: toMoney(row.valor_debitado_pix),
     criadoEm: row.criado_em || null,
     aprovadoEm: row.aprovado_em || null,
     recusadoEm: row.recusado_em || null,
@@ -1435,10 +1469,11 @@ async function saveDeposito(dep, client = pool) {
     `
     INSERT INTO depositos (
       id, user_id, valor, chave_pix, tipo_chave, tipo_transacao, status,
-      comprovante_url, comprovante_texto, descricao, criado_em,
+      comprovante_url, comprovante_texto, descricao, repassar_taxa,
+      taxa_pix, valor_liquido_pix, valor_debitado_pix, criado_em,
       aprovado_em, recusado_em, comprovante_enviado_em
     )
-    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)
     ON CONFLICT (id) DO UPDATE SET
       user_id = EXCLUDED.user_id,
       valor = EXCLUDED.valor,
@@ -1449,6 +1484,10 @@ async function saveDeposito(dep, client = pool) {
       comprovante_url = EXCLUDED.comprovante_url,
       comprovante_texto = EXCLUDED.comprovante_texto, -- 🔥 FALTAVA ISSO
       descricao = EXCLUDED.descricao,
+      repassar_taxa = EXCLUDED.repassar_taxa,
+      taxa_pix = EXCLUDED.taxa_pix,
+      valor_liquido_pix = EXCLUDED.valor_liquido_pix,
+      valor_debitado_pix = EXCLUDED.valor_debitado_pix,
       criado_em = COALESCE(depositos.criado_em, EXCLUDED.criado_em),
       aprovado_em = EXCLUDED.aprovado_em,
       recusado_em = EXCLUDED.recusado_em,
@@ -1465,6 +1504,10 @@ async function saveDeposito(dep, client = pool) {
       dep.comprovanteUrl || "",
       dep.comprovanteTexto || "",
       dep.descricao || "",
+      Boolean(dep.repassarTaxa),
+      toMoney(dep.taxaPix),
+      toMoney(dep.valorLiquidoPix),
+      toMoney(dep.valorDebitadoPix),
       dep.criadoEm || db(),
       dep.aprovadoEm || null,
       dep.recusadoEm || null,
@@ -1898,16 +1941,47 @@ app.post("/usuario/delete", async (req, res) => {
 
 app.post("/deposito", async (req, res) => {
   try {
-    const { userId, valor, chavePix, tipoChave, tipoTransacao } = req.body;
+    const {
+      userId,
+      valor,
+      chavePix,
+      tipoChave,
+      tipoTransacao,
+      repassarTaxa
+    } = req.body;
 
     if (!userId || valor === undefined || valor === null) {
       return res.status(400).json({ error: "userId e valor são obrigatórios" });
     }
 
     const valorNumero = toMoney(valor);
+    const tipoTransacaoNormalizado =
+      String(tipoTransacao || "entrada").trim().toLowerCase() === "saida"
+        ? "saida"
+        : "entrada";
+    const isSaida = tipoTransacaoNormalizado === "saida";
 
     if (!Number.isFinite(valorNumero) || valorNumero <= 0) {
       return res.status(400).json({ error: "Valor inválido" });
+    }
+
+    if (isSaida) {
+      if (valorNumero < LIMITE_SAQUE_PIX_MIN || valorNumero > LIMITE_SAQUE_PIX_MAX) {
+        return res.status(400).json({
+          error: `Saque via Pix disponível entre R$${LIMITE_SAQUE_PIX_MIN.toFixed(2)} e R$${LIMITE_SAQUE_PIX_MAX.toFixed(2)}`
+        });
+      }
+
+      if (!String(chavePix || "").trim()) {
+        return res.status(400).json({ error: "Chave Pix obrigatória para saque" });
+      }
+    } else if (
+      valorNumero < LIMITE_DEPOSITO_MIN ||
+      valorNumero > LIMITE_DEPOSITO_MAX
+    ) {
+      return res.status(400).json({
+        error: `Depósito disponível entre R$${LIMITE_DEPOSITO_MIN.toFixed(2)} e R$${LIMITE_DEPOSITO_MAX.toFixed(2)}`
+      });
     }
 
     const user = await getUserById(userId);
@@ -1916,16 +1990,30 @@ app.post("/deposito", async (req, res) => {
       return res.status(404).json({ error: "Usuário não encontrado" });
     }
 
+    const detalhesSaque = isSaida
+      ? calcularDetalhesSaquePix(valorNumero, repassarTaxa)
+      : null;
+
+    if (detalhesSaque && toMoney(user.saldo) < detalhesSaque.valorDebitado) {
+      return res.status(400).json({ error: "Saldo insuficiente" });
+    }
+
     const pedido = {
       id: buildId("dep"),
       userId,
       valor: valorNumero,
       chavePix: chavePix || "",
       tipoChave: tipoChave || "",
-      tipoTransacao: tipoTransacao || "entrada",
+      tipoTransacao: tipoTransacaoNormalizado,
       status: "pendente",
       comprovanteUrl: "",
-      descricao: "",
+      descricao: detalhesSaque
+        ? `Saque Pix solicitado | Repassar taxa: ${detalhesSaque.repassarTaxa ? "sim" : "nao"} | Taxa: R$${detalhesSaque.taxa.toFixed(2)} | Valor liquido: R$${detalhesSaque.valorLiquido.toFixed(2)} | Valor debitado: R$${detalhesSaque.valorDebitado.toFixed(2)}`
+        : "",
+      repassarTaxa: detalhesSaque?.repassarTaxa || false,
+      taxaPix: detalhesSaque?.taxa || 0,
+      valorLiquidoPix: detalhesSaque?.valorLiquido || 0,
+      valorDebitadoPix: detalhesSaque?.valorDebitado || 0,
       criadoEm: db(),
       aprovadoEm: null,
       recusadoEm: null,
@@ -1934,7 +2022,13 @@ app.post("/deposito", async (req, res) => {
 
     await saveDeposito(pedido);
 
-    res.status(201).json(pedido);
+    res.status(201).json({
+      ...pedido,
+      repassarTaxa: detalhesSaque?.repassarTaxa || false,
+      taxaPix: detalhesSaque?.taxa || 0,
+      valorLiquidoPix: detalhesSaque?.valorLiquido || 0,
+      valorDebitadoPix: detalhesSaque?.valorDebitado || 0
+    });
   } catch (error) {
     console.error(error);
     res.status(500).json({ error: "Erro ao criar pedido" });
@@ -1953,6 +2047,12 @@ app.post("/deposito/pix-code", async (req, res) => {
 
     if (!Number.isFinite(valorNumero) || valorNumero <= 0) {
       return res.status(400).json({ error: "Valor inválido" });
+    }
+
+    if (valorNumero < LIMITE_DEPOSITO_MIN || valorNumero > LIMITE_DEPOSITO_MAX) {
+      return res.status(400).json({
+        error: `Depósito disponível entre R$${LIMITE_DEPOSITO_MIN.toFixed(2)} e R$${LIMITE_DEPOSITO_MAX.toFixed(2)}`
+      });
     }
 
     const user = await getUserById(userId);
@@ -2235,13 +2335,29 @@ app.post("/aprovar", authAdmin, async (req, res) => {
       }
 
       const valorPedido = toMoney(pedido.valor);
-const valorFinal = calcularCreditoSigmo(valorPedido);
 
       if (!Number.isFinite(valorPedido) || valorPedido <= 0) {
         throw new Error("Valor do pedido inválido");
       }
 
       const isSaida = pedido.tipoTransacao === "saida";
+      const detalhesSaque = isSaida
+        ? {
+            repassarTaxa: Boolean(pedido.repassarTaxa),
+            taxa: toMoney(pedido.taxaPix),
+            valorLiquido:
+              toMoney(pedido.valorLiquidoPix) > 0
+                ? toMoney(pedido.valorLiquidoPix)
+                : valorPedido,
+            valorDebitado:
+              toMoney(pedido.valorDebitadoPix) > 0
+                ? toMoney(pedido.valorDebitadoPix)
+                : valorPedido
+          }
+        : null;
+      const valorFinal = isSaida
+        ? detalhesSaque.valorDebitado
+        : calcularValorCreditadoDeposito(valorPedido);
       const operationType = isSaida ? "withdrawal" : "deposit";
       const direction = isSaida ? "debit" : "credit";
       const description = isSaida
@@ -2261,7 +2377,10 @@ const valorFinal = calcularCreditoSigmo(valorPedido);
         metadata: {
           pedidoId: pedido.id,
           tipoTransacao: pedido.tipoTransacao,
-          adminId: req.admin.sub
+          adminId: req.admin.sub,
+          repassarTaxa: detalhesSaque?.repassarTaxa || false,
+          taxaPix: detalhesSaque?.taxa || 0,
+          valorLiquidoPix: detalhesSaque?.valorLiquido || null
         }
       });
 
@@ -2274,7 +2393,10 @@ const valorFinal = calcularCreditoSigmo(valorPedido);
         metadata: {
           pedidoId: pedido.id,
           tipoTransacao: pedido.tipoTransacao,
-          adminId: req.admin.sub
+          adminId: req.admin.sub,
+          repassarTaxa: detalhesSaque?.repassarTaxa || false,
+          taxaPix: detalhesSaque?.taxa || 0,
+          valorLiquidoPix: detalhesSaque?.valorLiquido || null
         }
       });
 
@@ -2292,6 +2414,9 @@ const valorFinal = calcularCreditoSigmo(valorPedido);
           userId: usuario.id,
           valor: valorFinal,
           tipoTransacao: pedido.tipoTransacao,
+          repassarTaxa: detalhesSaque?.repassarTaxa || false,
+          taxaPix: detalhesSaque?.taxa || 0,
+          valorLiquidoPix: detalhesSaque?.valorLiquido || null,
           saldoFinal: toMoney(usuarioAtualizado.saldo)
         },
         ipAddress: getRequestIp(req)
@@ -2877,7 +3002,7 @@ if (bate) {
 
 // 🔥 NOVO (SIGMO)
 const valorBruto = toMoney(depositoMatch.valor);
-const valorFinal = calcularCreditoSigmo(valorBruto);
+const valorFinal = calcularValorCreditadoDeposito(valorBruto);
 
       if (!usuario) {
         throw new Error("Usuário não encontrado");
@@ -3112,7 +3237,7 @@ app.post("/deposito/confirmar-bot-path-legacy", authBot, async (req, res) => {
       }
 
       const identificadorBot = txid || idTransacao || fallbackKey;
-      const valorFinal = calcularCreditoSigmo(toMoney(depositoMatch.valor));
+      const valorFinal = calcularValorCreditadoDeposito(toMoney(depositoMatch.valor));
       const metadata = {
         txid,
         idTransacao,
@@ -3374,7 +3499,7 @@ app.post("/deposito/confirmar-bot", authBot, async (req, res) => {
       }
 
       const identificadorBot = txid || idTransacao || cardKey || fallbackKey;
-      const valorFinal = calcularCreditoSigmo(toMoney(depositoMatch.valor));
+      const valorFinal = calcularValorCreditadoDeposito(toMoney(depositoMatch.valor));
       const metadata = {
         txid,
         idTransacao,
