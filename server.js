@@ -45,6 +45,15 @@ const TAXA_SAQUE_PIX_PERCENTUAL = Number(
 const COMPROVANTE_UPLOAD_WINDOW_MINUTES = Number(
   process.env.COMPROVANTE_UPLOAD_WINDOW_MINUTES || 60
 );
+const BONUS_BOAS_VINDAS_VALOR = Number(
+  process.env.BONUS_BOAS_VINDAS_VALOR || 5
+);
+const PIX_SAQUE_DESBLOQUEIO_MIN = Number(
+  process.env.PIX_SAQUE_DESBLOQUEIO_MIN || 100
+);
+const STATUS_CONTA_ATIVA = "ativa";
+const STATUS_CONTA_BANIDA = "banida";
+const MOTIVO_BANIMENTO_FRAUDE_BONUS = "tentativa_fraude_bonus";
 
 if (!DATABASE_URL) {
   console.error("DATABASE_URL não configurada.");
@@ -374,6 +383,39 @@ function toMoney(value) {
   const num = Number(value || 0);
   if (!Number.isFinite(num)) return 0;
   return Number(num.toFixed(2));
+}
+
+function isContaBanida(user) {
+  return String(user?.statusConta || "")
+    .trim()
+    .toLowerCase() === STATUS_CONTA_BANIDA;
+}
+
+function getMensagemContaBanida() {
+  return "Conta banida permanentemente por tentativa de fraude. Esta acao e irreversivel e o saldo ficou congelado.";
+}
+
+function buildContaBanidaPayload(user, code = "ACCOUNT_BANNED") {
+  return {
+    error: getMensagemContaBanida(),
+    code,
+    statusConta: STATUS_CONTA_BANIDA,
+    contaBanida: true,
+    contaBanidaEm: user?.contaBanidaEm || null,
+    motivoBanimento: user?.motivoBanimento || MOTIVO_BANIMENTO_FRAUDE_BONUS,
+    saldo: toMoney(user?.saldo)
+  };
+}
+
+function buildPixUnlockPayload(valorRecebidoViaPix = 0) {
+  return {
+    error:
+      "Para desbloquear a transferencia via Pix e necessario ter recebido ao menos R$100,00 via Pix, sem contabilizar valores recebidos por transferencia Sigmo para Sigmo.",
+    code: "PIX_UNLOCK_REQUIRED",
+    pixDesbloqueado: false,
+    valorRecebidoViaPix: toMoney(valorRecebidoViaPix),
+    valorMinimoDesbloqueioPix: PIX_SAQUE_DESBLOQUEIO_MIN
+  };
 }
 
 function normalizarNome(s) {
@@ -1041,6 +1083,16 @@ async function initDB() {
     );
   `);
 
+  await ensureColumn(
+    "usuarios",
+    "status_conta",
+    `TEXT DEFAULT '${STATUS_CONTA_ATIVA}'`
+  );
+  await ensureColumn("usuarios", "conta_banida_em", "TIMESTAMP");
+  await ensureColumn("usuarios", "motivo_banimento", "TEXT DEFAULT ''");
+  await ensureColumn("usuarios", "bonus_boas_vindas", "NUMERIC DEFAULT 0");
+  await ensureColumn("usuarios", "bonus_boas_vindas_concedido_em", "TIMESTAMP");
+
   await pool.query(`
     CREATE TABLE IF NOT EXISTS depositos (
       id TEXT PRIMARY KEY,
@@ -1304,8 +1356,41 @@ function mapUser(row) {
     criadoEm: row.criado_em || null,
     nomeAtualizadoEm: row.nome_atualizado_em || null,
     saldoAtualizadoEm: row.saldo_atualizado_em || null,
-    senhaAtualizadaEm: row.senha_atualizada_em || null
+    senhaAtualizadaEm: row.senha_atualizada_em || null,
+    statusConta: row.status_conta || STATUS_CONTA_ATIVA,
+    contaBanidaEm: row.conta_banida_em || null,
+    motivoBanimento: row.motivo_banimento || "",
+    bonusBoasVindas: toMoney(row.bonus_boas_vindas),
+    bonusBoasVindasConcedidoEm: row.bonus_boas_vindas_concedido_em || null
   };
+}
+
+function buildUserPublicResponse(user, extras = {}) {
+  return {
+    id: user.id,
+    nome: user.nome,
+    email: user.email,
+    saldo: toMoney(user.saldo),
+    criadoEm: user.criadoEm || null,
+    statusConta: user.statusConta || STATUS_CONTA_ATIVA,
+    contaBanida: isContaBanida(user),
+    contaBanidaEm: user.contaBanidaEm || null,
+    motivoBanimento: user.motivoBanimento || "",
+    bonusBoasVindas: toMoney(user.bonusBoasVindas),
+    bonusBoasVindasConcedidoEm: user.bonusBoasVindasConcedidoEm || null,
+    ...extras
+  };
+}
+
+async function buildUserPublicResponseWithPix(user, client = pool, extras = {}) {
+  const valorRecebidoViaPix = await getValorRecebidoViaPix(user.id, client);
+
+  return buildUserPublicResponse(user, {
+    pixDesbloqueado: valorRecebidoViaPix >= PIX_SAQUE_DESBLOQUEIO_MIN,
+    valorRecebidoViaPix,
+    valorMinimoDesbloqueioPix: PIX_SAQUE_DESBLOQUEIO_MIN,
+    ...extras
+  });
 }
 
 function mapDeposito(row) {
@@ -1406,9 +1491,11 @@ async function saveUser(user, client = pool) {
     `
     INSERT INTO usuarios (
       id, nome, email, senha, saldo, criado_em,
-      nome_atualizado_em, saldo_atualizado_em, senha_atualizada_em
+      nome_atualizado_em, saldo_atualizado_em, senha_atualizada_em,
+      status_conta, conta_banida_em, motivo_banimento,
+      bonus_boas_vindas, bonus_boas_vindas_concedido_em
     )
-    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
     ON CONFLICT (id) DO UPDATE SET
       nome = EXCLUDED.nome,
       email = EXCLUDED.email,
@@ -1417,7 +1504,12 @@ async function saveUser(user, client = pool) {
       criado_em = COALESCE(usuarios.criado_em, EXCLUDED.criado_em),
       nome_atualizado_em = EXCLUDED.nome_atualizado_em,
       saldo_atualizado_em = EXCLUDED.saldo_atualizado_em,
-      senha_atualizada_em = EXCLUDED.senha_atualizada_em
+      senha_atualizada_em = EXCLUDED.senha_atualizada_em,
+      status_conta = EXCLUDED.status_conta,
+      conta_banida_em = EXCLUDED.conta_banida_em,
+      motivo_banimento = EXCLUDED.motivo_banimento,
+      bonus_boas_vindas = EXCLUDED.bonus_boas_vindas,
+      bonus_boas_vindas_concedido_em = EXCLUDED.bonus_boas_vindas_concedido_em
     `,
     [
       user.id,
@@ -1428,7 +1520,12 @@ async function saveUser(user, client = pool) {
       user.criadoEm || db(),
       user.nomeAtualizadoEm || null,
       user.saldoAtualizadoEm || null,
-      user.senhaAtualizadaEm || null
+      user.senhaAtualizadaEm || null,
+      user.statusConta || STATUS_CONTA_ATIVA,
+      user.contaBanidaEm || null,
+      user.motivoBanimento || "",
+      toMoney(user.bonusBoasVindas),
+      user.bonusBoasVindasConcedidoEm || null
     ]
   );
 }
@@ -1554,6 +1651,158 @@ async function listLedgerEntriesByUser(userId) {
     [userId]
   );
   return result.rows.map(mapLedgerEntry);
+}
+
+async function getValorRecebidoViaPix(userId, client = pool) {
+  const result = await client.query(
+    `
+    SELECT COALESCE(SUM(amount), 0) AS total
+    FROM financial_transactions
+    WHERE user_id = $1
+      AND status = 'completed'
+      AND direction = 'credit'
+      AND operation_type = 'deposit'
+      AND source_type IN ('dentpeg', 'deposito')
+    `,
+    [userId]
+  );
+
+  return toMoney(result.rows[0]?.total);
+}
+
+async function listTransferenciasRecebidasPorUsuario(userId, client = pool) {
+  const result = await client.query(
+    `
+    SELECT
+      COALESCE(metadata->>'fromUserId', '') AS from_user_id,
+      COALESCE(metadata->>'fromEmail', '') AS from_email,
+      COALESCE(SUM(amount), 0) AS total_amount,
+      MAX(created_at) AS last_received_at
+    FROM financial_transactions
+    WHERE user_id = $1
+      AND status = 'completed'
+      AND source_type = 'transfer'
+      AND operation_type = 'transfer_in'
+      AND direction = 'credit'
+    GROUP BY 1, 2
+    ORDER BY MAX(created_at) DESC NULLS LAST
+    `,
+    [userId]
+  );
+
+  return result.rows.map((row) => ({
+    fromUserId: row.from_user_id || "",
+    fromEmail: row.from_email || "",
+    totalAmount: toMoney(row.total_amount),
+    lastReceivedAt: row.last_received_at || null
+  }));
+}
+
+async function getResumoFinanceiroUsuario(userId, client = pool) {
+  const result = await client.query(
+    `
+    SELECT
+      COUNT(*) FILTER (WHERE status = 'completed') AS completed_count,
+      COUNT(*) FILTER (
+        WHERE status = 'completed'
+          AND source_type = 'transfer'
+          AND operation_type = 'transfer_in'
+          AND direction = 'credit'
+      ) AS transfer_in_count,
+      COUNT(*) FILTER (
+        WHERE status = 'completed'
+          AND source_type = 'transfer'
+          AND operation_type = 'transfer_out'
+          AND direction = 'debit'
+      ) AS transfer_out_count,
+      COUNT(*) FILTER (
+        WHERE status = 'completed'
+          AND source_type NOT IN ('welcome_bonus', 'transfer')
+      ) AS other_completed_ops,
+      COALESCE(SUM(
+        CASE
+          WHEN status = 'completed'
+            AND direction = 'credit'
+            AND operation_type = 'deposit'
+            AND source_type IN ('dentpeg', 'deposito')
+          THEN amount
+          ELSE 0
+        END
+      ), 0) AS qualifying_pix_total
+    FROM financial_transactions
+    WHERE user_id = $1
+    `,
+    [userId]
+  );
+
+  const row = result.rows[0] || {};
+
+  return {
+    completedCount: Number(row.completed_count || 0),
+    transferInCount: Number(row.transfer_in_count || 0),
+    transferOutCount: Number(row.transfer_out_count || 0),
+    otherCompletedOps: Number(row.other_completed_ops || 0),
+    qualifyingPixTotal: toMoney(row.qualifying_pix_total)
+  };
+}
+
+async function isContaOrigemFraudeBonus(userId, client = pool) {
+  if (!userId) return false;
+
+  const user = await getUserById(userId, client);
+
+  if (!user) return false;
+  if (toMoney(user.bonusBoasVindas) <= 0) return false;
+  if (toMoney(user.saldo) > 0) return false;
+
+  const resumo = await getResumoFinanceiroUsuario(userId, client);
+
+  if (resumo.qualifyingPixTotal > 0) return false;
+  if (resumo.otherCompletedOps > 0) return false;
+  if (resumo.transferInCount > 0) return false;
+  if (resumo.transferOutCount <= 0) return false;
+
+  return resumo.completedCount <= resumo.transferOutCount + 1;
+}
+
+async function encontrarOrigemFraudeBonus(userId, client = pool) {
+  const transferencias = await listTransferenciasRecebidasPorUsuario(userId, client);
+
+  for (const transferencia of transferencias) {
+    if (!transferencia.fromUserId) continue;
+
+    const suspeita = await isContaOrigemFraudeBonus(
+      transferencia.fromUserId,
+      client
+    );
+
+    if (suspeita) {
+      return transferencia;
+    }
+  }
+
+  return null;
+}
+
+async function banirContaPorFraudeBonus(userId, client = pool) {
+  const user =
+    client === pool ? await getUserById(userId, client) : await getUserByIdForUpdate(userId, client);
+
+  if (!user) {
+    throw new Error("Usuario nao encontrado");
+  }
+
+  if (isContaBanida(user)) {
+    return user;
+  }
+
+  user.statusConta = STATUS_CONTA_BANIDA;
+  user.contaBanidaEm = db();
+  user.motivoBanimento = MOTIVO_BANIMENTO_FRAUDE_BONUS;
+
+  await saveUser(user, client);
+
+  return user;
 }
 
 async function createAuditLog(
@@ -1792,28 +2041,86 @@ app.post("/register", async (req, res) => {
     }
 
     const hash = await bcrypt.hash(String(senha), 10);
+    const novoUsuario = await runInTransaction(async (client) => {
+      const user = {
+        id: buildId("user"),
+        nome: emailNorm.split("@")[0],
+        email: emailNorm,
+        senha: hash,
+        saldo: 0,
+        criadoEm: db(),
+        nomeAtualizadoEm: null,
+        saldoAtualizadoEm: null,
+        senhaAtualizadaEm: null,
+        statusConta: STATUS_CONTA_ATIVA,
+        contaBanidaEm: null,
+        motivoBanimento: "",
+        bonusBoasVindas: BONUS_BOAS_VINDAS_VALOR,
+        bonusBoasVindasConcedidoEm: db()
+      };
 
-    const novoUsuario = {
-      id: buildId("user"),
-      nome: emailNorm.split("@")[0],
-      email: emailNorm,
-      senha: hash,
-      saldo: 0,
-      criadoEm: db(),
-      nomeAtualizadoEm: null,
-      saldoAtualizadoEm: null,
-      senhaAtualizadaEm: null
-    };
+      await saveUser(user, client);
 
-    await saveUser(novoUsuario);
+      const txBonus = await createFinancialTransaction(client, {
+        userId: user.id,
+        referenceKey: `welcome-bonus:${user.id}`,
+        sourceType: "welcome_bonus",
+        sourceId: user.id,
+        operationType: "welcome_bonus",
+        direction: "credit",
+        amount: BONUS_BOAS_VINDAS_VALOR,
+        status: "completed",
+        description: "Saldo de boas-vindas Sigmo",
+        metadata: {
+          tipoBonus: "boas_vindas"
+        }
+      });
 
-    res.status(201).json({
-      id: novoUsuario.id,
-      nome: novoUsuario.nome,
-      email: novoUsuario.email,
-      saldo: novoUsuario.saldo,
-      criadoEm: novoUsuario.criadoEm
+      const userAtualizado = await applyLedgerChange(client, {
+        userId: user.id,
+        financialTransactionId: txBonus.id,
+        entryType: "credit",
+        amount: BONUS_BOAS_VINDAS_VALOR,
+        description: "Saldo de boas-vindas Sigmo",
+        metadata: {
+          tipoBonus: "boas_vindas"
+        }
+      });
+
+      await saveDeposito(
+        {
+          id: buildId("dep"),
+          userId: user.id,
+          valor: BONUS_BOAS_VINDAS_VALOR,
+          chavePix: "",
+          tipoChave: "",
+          tipoTransacao: "entrada",
+          status: "aprovado",
+          comprovanteUrl: "",
+          descricao: "Saldo de boas-vindas Sigmo",
+          repassarTaxa: false,
+          taxaPix: 0,
+          valorLiquidoPix: 0,
+          valorDebitadoPix: 0,
+          criadoEm: db(),
+          aprovadoEm: db(),
+          recusadoEm: null,
+          comprovanteEnviadoEm: null
+        },
+        client
+      );
+
+      return userAtualizado;
     });
+
+    res.status(201).json(
+      buildUserPublicResponse(novoUsuario, {
+        pixDesbloqueado: false,
+        valorRecebidoViaPix: 0,
+        valorMinimoDesbloqueioPix: PIX_SAQUE_DESBLOQUEIO_MIN,
+        welcomeBonusGranted: true
+      })
+    );
   } catch (error) {
     console.error(error);
     res.status(500).json({ error: "Erro ao cadastrar" });
@@ -1840,13 +2147,7 @@ app.post("/login", loginLimiter, async (req, res) => {
       return res.status(401).json({ error: "Login inválido" });
     }
 
-    res.json({
-      id: user.id,
-      nome: user.nome,
-      email: user.email,
-      saldo: toMoney(user.saldo),
-      criadoEm: user.criadoEm || null
-    });
+    res.json(await buildUserPublicResponseWithPix(user));
   } catch (error) {
     console.error(error);
     res.status(500).json({ error: "Erro no login" });
@@ -1861,13 +2162,7 @@ app.get("/usuario/:id", async (req, res) => {
       return res.status(404).json({ error: "Usuário não encontrado" });
     }
 
-    res.json({
-      id: user.id,
-      nome: user.nome,
-      email: user.email,
-      saldo: toMoney(user.saldo),
-      criadoEm: user.criadoEm || null
-    });
+    res.json(await buildUserPublicResponseWithPix(user));
   } catch (error) {
     console.error(error);
     res.status(500).json({ error: "Erro ao buscar usuário" });
@@ -1886,6 +2181,10 @@ app.post("/usuario/update-nome", async (req, res) => {
 
     if (!user) {
       return res.status(404).json({ error: "Usuário não encontrado" });
+    }
+
+    if (isContaBanida(user)) {
+      return res.status(403).json(buildContaBanidaPayload(user));
     }
 
     user.nome = String(nome).trim();
@@ -1912,6 +2211,10 @@ app.post("/usuario/delete", async (req, res) => {
 
     if (!user) {
       return res.status(404).json({ error: "Usuário não encontrado" });
+    }
+
+    if (isContaBanida(user)) {
+      return res.status(403).json(buildContaBanidaPayload(user));
     }
 
     if (normalizeEmail(email) !== normalizeEmail(user.email)) {
@@ -1990,6 +2293,44 @@ app.post("/deposito", async (req, res) => {
       return res.status(404).json({ error: "Usuário não encontrado" });
     }
 
+    if (isContaBanida(user)) {
+      return res.status(403).json(buildContaBanidaPayload(user));
+    }
+
+    if (isSaida) {
+      const valorRecebidoViaPix = await getValorRecebidoViaPix(user.id);
+
+      if (valorRecebidoViaPix < PIX_SAQUE_DESBLOQUEIO_MIN) {
+        return res.status(403).json(buildPixUnlockPayload(valorRecebidoViaPix));
+      }
+
+      const origemFraude = await encontrarOrigemFraudeBonus(user.id);
+
+      if (origemFraude) {
+        const userBanido = await banirContaPorFraudeBonus(user.id);
+
+        await createAuditLog(pool, {
+          action: "ban_user_bonus_fraud",
+          targetType: "usuario",
+          targetId: userBanido.id,
+          details: {
+            userId: userBanido.id,
+            origemFraudeUserId: origemFraude.fromUserId,
+            origemFraudeEmail: origemFraude.fromEmail,
+            valorRecebidoOrigemFraude: origemFraude.totalAmount,
+            valorRecebidoViaPix
+          },
+          ipAddress: getRequestIp(req)
+        });
+
+        return res.status(403).json({
+          ...buildContaBanidaPayload(userBanido, "ACCOUNT_BANNED_FRAUD"),
+          fraudSourceUserId: origemFraude.fromUserId,
+          fraudSourceEmail: origemFraude.fromEmail
+        });
+      }
+    }
+
     const detalhesSaque = isSaida
       ? calcularDetalhesSaquePix(valorNumero, repassarTaxa)
       : null;
@@ -2061,6 +2402,10 @@ app.post("/deposito/pix-code", async (req, res) => {
       return res.status(404).json({ error: "Usuário não encontrado" });
     }
 
+    if (isContaBanida(user)) {
+      return res.status(403).json(buildContaBanidaPayload(user));
+    }
+
     const pix = await gerarPixDentpegPublico(valorNumero);
 
     res.json({
@@ -2086,6 +2431,16 @@ app.post("/deposito/:id/comprovante", upload.single("comprovante"), async (req, 
 
     if (!req.file) {
       return res.status(400).json({ error: "Arquivo obrigatório" });
+    }
+
+    const user = await getUserById(pedido.userId);
+
+    if (!user) {
+      return res.status(404).json({ error: "Usuario nao encontrado" });
+    }
+
+    if (isContaBanida(user)) {
+      return res.status(403).json(buildContaBanidaPayload(user));
     }
 
     pedido.comprovanteUrl = "/uploads/" + req.file.filename;
@@ -2147,6 +2502,22 @@ app.post("/transferir-sigmo", async (req, res) => {
 
       if (!destino) {
         throw new Error("Usuário destino não encontrado");
+      }
+
+      if (isContaBanida(remetente)) {
+        const error = new Error(getMensagemContaBanida());
+        error.statusCode = 403;
+        error.payload = buildContaBanidaPayload(remetente);
+        throw error;
+      }
+
+      if (isContaBanida(destino)) {
+        const error = new Error("Conta destino indisponivel");
+        error.statusCode = 403;
+        error.payload = {
+          error: "Conta destino indisponivel"
+        };
+        throw error;
       }
 
       if (remetente.id === destino.id) {
@@ -2269,7 +2640,9 @@ app.post("/transferir-sigmo", async (req, res) => {
     });
   } catch (error) {
     console.error(error);
-    res.status(400).json({ error: error.message || "Erro na transferência" });
+    res
+      .status(error.statusCode || 400)
+      .json(error.payload || { error: error.message || "Erro na transferência" });
   }
 });
 
@@ -2282,7 +2655,11 @@ app.get("/usuarios", authAdmin, async (req, res) => {
         nome: u.nome,
         email: u.email,
         saldo: toMoney(u.saldo),
-        criadoEm: u.criadoEm || null
+        criadoEm: u.criadoEm || null,
+        statusConta: u.statusConta || STATUS_CONTA_ATIVA,
+        contaBanida: isContaBanida(u),
+        contaBanidaEm: u.contaBanidaEm || null,
+        bonusBoasVindas: toMoney(u.bonusBoasVindas)
       }))
     );
   } catch (error) {
@@ -2328,6 +2705,10 @@ app.post("/aprovar", authAdmin, async (req, res) => {
 
       if (!usuario) {
         throw new Error("Usuário não encontrado");
+      }
+
+      if (isContaBanida(usuario)) {
+        throw new Error(getMensagemContaBanida());
       }
 
       if (pedido.tipoTransacao !== "saida" && !pedido.comprovanteUrl) {
@@ -3249,6 +3630,10 @@ app.post("/deposito/confirmar-bot-path-legacy", authBot, async (req, res) => {
         raw: req.body.raw || null
       };
 
+      if (isContaBanida(usuario)) {
+        throw new Error(getMensagemContaBanida());
+      }
+
       const tx = await createFinancialTransaction(client, {
         userId: usuario.id,
         referenceKey,
@@ -3496,6 +3881,10 @@ app.post("/deposito/confirmar-bot", authBot, async (req, res) => {
       const usuario = await getUserByIdForUpdate(depositoMatch.userId, client);
       if (!usuario) {
         throw new Error("Usuário não encontrado");
+      }
+
+      if (isContaBanida(usuario)) {
+        throw new Error(getMensagemContaBanida());
       }
 
       const identificadorBot = txid || idTransacao || cardKey || fallbackKey;
