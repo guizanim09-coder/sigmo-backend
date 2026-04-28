@@ -1486,6 +1486,27 @@ async function listUsers() {
   return result.rows.map(mapUser);
 }
 
+async function listUsersByIds(userIds, client = pool) {
+  const ids = Array.from(
+    new Set(
+      (Array.isArray(userIds) ? userIds : [])
+        .map((id) => String(id || "").trim())
+        .filter(Boolean)
+    )
+  );
+
+  if (!ids.length) {
+    return [];
+  }
+
+  const result = await client.query(
+    "SELECT * FROM usuarios WHERE id = ANY($1::text[])",
+    [ids]
+  );
+
+  return result.rows.map(mapUser);
+}
+
 async function saveUser(user, client = pool) {
   await client.query(
     `
@@ -1653,6 +1674,292 @@ async function listLedgerEntriesByUser(userId) {
   return result.rows.map(mapLedgerEntry);
 }
 
+async function listCompletedFinancialTransactionsForUsers(userIds, client = pool) {
+  const ids = Array.isArray(userIds)
+    ? userIds.map((id) => String(id || "").trim()).filter(Boolean)
+    : [];
+
+  if (!ids.length) {
+    return [];
+  }
+
+  const result = await client.query(
+    `
+    SELECT *
+    FROM financial_transactions
+    WHERE user_id = ANY($1::text[])
+      AND status = 'completed'
+    ORDER BY user_id ASC, created_at ASC NULLS LAST, id ASC
+    `,
+    [ids]
+  );
+
+  return result.rows.map(mapFinancialTransaction);
+}
+
+function normalizeBalanceSplit(amount, bonusAmount = 0, realAmount = 0) {
+  const totalAmount = toMoney(amount);
+
+  if (!Number.isFinite(totalAmount) || totalAmount <= 0) {
+    return {
+      bonusAmount: 0,
+      realAmount: 0,
+      hasExplicitSplit: false
+    };
+  }
+
+  let bonus = Math.max(0, toMoney(bonusAmount));
+  let real = Math.max(0, toMoney(realAmount));
+  const explicit = bonus > 0 || real > 0;
+
+  if (!explicit) {
+    return {
+      bonusAmount: 0,
+      realAmount: totalAmount,
+      hasExplicitSplit: false
+    };
+  }
+
+  const splitTotal = toMoney(bonus + real);
+
+  if (splitTotal <= 0) {
+    return {
+      bonusAmount: 0,
+      realAmount: totalAmount,
+      hasExplicitSplit: false
+    };
+  }
+
+  if (splitTotal !== totalAmount) {
+    const factor = totalAmount / splitTotal;
+    bonus = toMoney(bonus * factor);
+    real = toMoney(real * factor);
+  }
+
+  const diff = toMoney(totalAmount - bonus - real);
+
+  if (diff !== 0) {
+    real = toMoney(real + diff);
+  }
+
+  return {
+    bonusAmount: bonus,
+    realAmount: real,
+    hasExplicitSplit: true
+  };
+}
+
+function getBalanceSplitFromMetadata(metadata, amount) {
+  if (!metadata || typeof metadata !== "object") return null;
+
+  const split = normalizeBalanceSplit(
+    amount,
+    metadata.bonusAmount,
+    metadata.realAmount
+  );
+
+  return split.hasExplicitSplit ? split : null;
+}
+
+function computeUserFinancialContext(transactions, currentBalance = 0) {
+  let saldoBonusAtual = 0;
+  let saldoRealAtual = 0;
+  let valorRecebidoViaPix = 0;
+
+  for (const tx of Array.isArray(transactions) ? transactions : []) {
+    const amount = toMoney(tx?.amount);
+
+    if (!Number.isFinite(amount) || amount <= 0) continue;
+
+    if (
+      tx.direction === "credit" &&
+      tx.operationType === "deposit" &&
+      (tx.sourceType === "dentpeg" || tx.sourceType === "deposito")
+    ) {
+      valorRecebidoViaPix = toMoney(valorRecebidoViaPix + amount);
+    }
+
+    if (tx.direction === "credit") {
+      if (
+        tx.sourceType === "welcome_bonus" ||
+        tx.operationType === "welcome_bonus"
+      ) {
+        saldoBonusAtual = toMoney(saldoBonusAtual + amount);
+        continue;
+      }
+
+      if (tx.sourceType === "transfer" && tx.operationType === "transfer_in") {
+        const split = getBalanceSplitFromMetadata(tx.metadata, amount);
+
+        if (split) {
+          saldoBonusAtual = toMoney(saldoBonusAtual + split.bonusAmount);
+          saldoRealAtual = toMoney(saldoRealAtual + split.realAmount);
+          continue;
+        }
+      }
+
+      saldoRealAtual = toMoney(saldoRealAtual + amount);
+      continue;
+    }
+
+    if (tx.direction === "debit") {
+      const split = getBalanceSplitFromMetadata(tx.metadata, amount);
+
+      if (split) {
+        saldoBonusAtual = toMoney(
+          Math.max(0, saldoBonusAtual - split.bonusAmount)
+        );
+        saldoRealAtual = toMoney(
+          Math.max(0, saldoRealAtual - split.realAmount)
+        );
+        continue;
+      }
+
+      const debitoBonus = Math.min(saldoBonusAtual, amount);
+      const debitoReal = toMoney(amount - debitoBonus);
+
+      saldoBonusAtual = toMoney(Math.max(0, saldoBonusAtual - debitoBonus));
+      saldoRealAtual = toMoney(Math.max(0, saldoRealAtual - debitoReal));
+    }
+  }
+
+  const saldoTotalAtual = toMoney(currentBalance);
+  let totalCalculado = toMoney(saldoBonusAtual + saldoRealAtual);
+
+  if (totalCalculado < saldoTotalAtual) {
+    saldoRealAtual = toMoney(saldoRealAtual + (saldoTotalAtual - totalCalculado));
+    totalCalculado = saldoTotalAtual;
+  } else if (totalCalculado > saldoTotalAtual) {
+    let excesso = toMoney(totalCalculado - saldoTotalAtual);
+
+    if (saldoRealAtual >= excesso) {
+      saldoRealAtual = toMoney(saldoRealAtual - excesso);
+    } else {
+      excesso = toMoney(excesso - saldoRealAtual);
+      saldoRealAtual = 0;
+      saldoBonusAtual = toMoney(Math.max(0, saldoBonusAtual - excesso));
+    }
+  }
+
+  return {
+    saldoTotalAtual,
+    saldoBonusAtual: toMoney(Math.min(saldoTotalAtual, saldoBonusAtual)),
+    saldoRealAtual: toMoney(Math.max(0, saldoTotalAtual - saldoBonusAtual)),
+    bonusConcedido: 0,
+    valorRecebidoViaPix,
+    pixDesbloqueado: valorRecebidoViaPix >= PIX_SAQUE_DESBLOQUEIO_MIN
+  };
+}
+
+function buildUserFinancialContextMap(users, transactions) {
+  const txByUserId = new Map();
+
+  for (const tx of Array.isArray(transactions) ? transactions : []) {
+    const userId = String(tx?.userId || "").trim();
+    if (!userId) continue;
+    if (!txByUserId.has(userId)) txByUserId.set(userId, []);
+    txByUserId.get(userId).push(tx);
+  }
+
+  const contextMap = new Map();
+
+  for (const user of Array.isArray(users) ? users : []) {
+    const txList = txByUserId.get(user.id) || [];
+    const context = computeUserFinancialContext(txList, user.saldo);
+    context.bonusConcedido = toMoney(user.bonusBoasVindas);
+    contextMap.set(user.id, context);
+  }
+
+  return contextMap;
+}
+
+function buildDefaultUserFinancialContext(user) {
+  return {
+    saldoTotalAtual: toMoney(user?.saldo),
+    saldoBonusAtual: 0,
+    saldoRealAtual: toMoney(user?.saldo),
+    bonusConcedido: toMoney(user?.bonusBoasVindas),
+    valorRecebidoViaPix: 0,
+    pixDesbloqueado: false
+  };
+}
+
+function buildDefaultAdminFraudRiskContext() {
+  return {
+    riscoFraudeSaquePix: false,
+    riscoFraudeSaquePixOrigemUserId: "",
+    riscoFraudeSaquePixOrigemEmail: "",
+    riscoFraudeSaquePixValorRecebido: 0,
+    riscoFraudeSaquePixUltimoRecebimentoEm: null
+  };
+}
+
+function buildDefaultAdminUserContext(user) {
+  return {
+    ...buildDefaultUserFinancialContext(user),
+    ...buildDefaultAdminFraudRiskContext()
+  };
+}
+
+async function getUsersFinancialContextMap(users, client = pool) {
+  const lista = Array.isArray(users) ? users.filter(Boolean) : [];
+
+  if (!lista.length) {
+    return new Map();
+  }
+
+  const transactions = await listCompletedFinancialTransactionsForUsers(
+    lista.map((user) => user.id),
+    client
+  );
+
+  return buildUserFinancialContextMap(lista, transactions);
+}
+
+async function getUserFinancialContext(user, client = pool) {
+  if (!user?.id) {
+    return buildDefaultUserFinancialContext(user);
+  }
+
+  const contextMap = await getUsersFinancialContextMap([user], client);
+  return contextMap.get(user.id) || buildDefaultUserFinancialContext(user);
+}
+
+function buildAdminUserResponse(user, context = null) {
+  const financialContext = {
+    ...buildDefaultAdminUserContext(user),
+    ...(context || {})
+  };
+
+  return {
+    id: user.id,
+    nome: user.nome,
+    email: user.email,
+    saldo: toMoney(user.saldo),
+    criadoEm: user.criadoEm || null,
+    statusConta: user.statusConta || STATUS_CONTA_ATIVA,
+    contaBanida: isContaBanida(user),
+    contaBanidaEm: user.contaBanidaEm || null,
+    motivoBanimento: user.motivoBanimento || "",
+    bonusBoasVindas: toMoney(user.bonusBoasVindas),
+    bonusBoasVindasConcedidoEm: user.bonusBoasVindasConcedidoEm || null,
+    saldoBonusAtual: toMoney(financialContext.saldoBonusAtual),
+    saldoRealAtual: toMoney(financialContext.saldoRealAtual),
+    valorRecebidoViaPix: toMoney(financialContext.valorRecebidoViaPix),
+    pixDesbloqueado: Boolean(financialContext.pixDesbloqueado),
+    riscoFraudeSaquePix: Boolean(financialContext.riscoFraudeSaquePix),
+    riscoFraudeSaquePixOrigemUserId:
+      String(financialContext.riscoFraudeSaquePixOrigemUserId || "").trim(),
+    riscoFraudeSaquePixOrigemEmail:
+      String(financialContext.riscoFraudeSaquePixOrigemEmail || "").trim(),
+    riscoFraudeSaquePixValorRecebido: toMoney(
+      financialContext.riscoFraudeSaquePixValorRecebido
+    ),
+    riscoFraudeSaquePixUltimoRecebimentoEm:
+      financialContext.riscoFraudeSaquePixUltimoRecebimentoEm || null
+  };
+}
+
 async function getValorRecebidoViaPix(userId, client = pool) {
   const result = await client.query(
     `
@@ -1691,6 +1998,48 @@ async function listTransferenciasRecebidasPorUsuario(userId, client = pool) {
   );
 
   return result.rows.map((row) => ({
+    fromUserId: row.from_user_id || "",
+    fromEmail: row.from_email || "",
+    totalAmount: toMoney(row.total_amount),
+    lastReceivedAt: row.last_received_at || null
+  }));
+}
+
+async function listTransferenciasRecebidasPorUsuarios(userIds, client = pool) {
+  const ids = Array.from(
+    new Set(
+      (Array.isArray(userIds) ? userIds : [])
+        .map((id) => String(id || "").trim())
+        .filter(Boolean)
+    )
+  );
+
+  if (!ids.length) {
+    return [];
+  }
+
+  const result = await client.query(
+    `
+    SELECT
+      user_id,
+      COALESCE(metadata->>'fromUserId', '') AS from_user_id,
+      COALESCE(metadata->>'fromEmail', '') AS from_email,
+      COALESCE(SUM(amount), 0) AS total_amount,
+      MAX(created_at) AS last_received_at
+    FROM financial_transactions
+    WHERE user_id = ANY($1::text[])
+      AND status = 'completed'
+      AND source_type = 'transfer'
+      AND operation_type = 'transfer_in'
+      AND direction = 'credit'
+    GROUP BY 1, 2, 3
+    ORDER BY user_id ASC, MAX(created_at) DESC NULLS LAST
+    `,
+    [ids]
+  );
+
+  return result.rows.map((row) => ({
+    userId: row.user_id || "",
     fromUserId: row.from_user_id || "",
     fromEmail: row.from_email || "",
     totalAmount: toMoney(row.total_amount),
@@ -1746,6 +2095,87 @@ async function getResumoFinanceiroUsuario(userId, client = pool) {
   };
 }
 
+async function getResumoFinanceiroUsuarios(userIds, client = pool) {
+  const ids = Array.from(
+    new Set(
+      (Array.isArray(userIds) ? userIds : [])
+        .map((id) => String(id || "").trim())
+        .filter(Boolean)
+    )
+  );
+
+  if (!ids.length) {
+    return new Map();
+  }
+
+  const result = await client.query(
+    `
+    SELECT
+      user_id,
+      COUNT(*) FILTER (WHERE status = 'completed') AS completed_count,
+      COUNT(*) FILTER (
+        WHERE status = 'completed'
+          AND source_type = 'transfer'
+          AND operation_type = 'transfer_in'
+          AND direction = 'credit'
+      ) AS transfer_in_count,
+      COUNT(*) FILTER (
+        WHERE status = 'completed'
+          AND source_type = 'transfer'
+          AND operation_type = 'transfer_out'
+          AND direction = 'debit'
+      ) AS transfer_out_count,
+      COUNT(*) FILTER (
+        WHERE status = 'completed'
+          AND source_type NOT IN ('welcome_bonus', 'transfer')
+      ) AS other_completed_ops,
+      COALESCE(SUM(
+        CASE
+          WHEN status = 'completed'
+            AND direction = 'credit'
+            AND operation_type = 'deposit'
+            AND source_type IN ('dentpeg', 'deposito')
+          THEN amount
+          ELSE 0
+        END
+      ), 0) AS qualifying_pix_total
+    FROM financial_transactions
+    WHERE user_id = ANY($1::text[])
+    GROUP BY user_id
+    `,
+    [ids]
+  );
+
+  const resumoMap = new Map();
+
+  for (const row of result.rows) {
+    resumoMap.set(row.user_id, {
+      completedCount: Number(row.completed_count || 0),
+      transferInCount: Number(row.transfer_in_count || 0),
+      transferOutCount: Number(row.transfer_out_count || 0),
+      otherCompletedOps: Number(row.other_completed_ops || 0),
+      qualifyingPixTotal: toMoney(row.qualifying_pix_total)
+    });
+  }
+
+  return resumoMap;
+}
+
+function isResumoContaOrigemFraudeBonus(user, resumo = null) {
+  if (!user) return false;
+  if (toMoney(user.bonusBoasVindas) <= 0) return false;
+  if (toMoney(user.saldo) > 0) return false;
+
+  const stats = resumo || {};
+
+  if (toMoney(stats.qualifyingPixTotal) > 0) return false;
+  if (Number(stats.otherCompletedOps || 0) > 0) return false;
+  if (Number(stats.transferInCount || 0) > 0) return false;
+  if (Number(stats.transferOutCount || 0) <= 0) return false;
+
+  return Number(stats.completedCount || 0) <= Number(stats.transferOutCount || 0) + 1;
+}
+
 async function isContaOrigemFraudeBonus(userId, client = pool) {
   if (!userId) return false;
 
@@ -1756,13 +2186,7 @@ async function isContaOrigemFraudeBonus(userId, client = pool) {
   if (toMoney(user.saldo) > 0) return false;
 
   const resumo = await getResumoFinanceiroUsuario(userId, client);
-
-  if (resumo.qualifyingPixTotal > 0) return false;
-  if (resumo.otherCompletedOps > 0) return false;
-  if (resumo.transferInCount > 0) return false;
-  if (resumo.transferOutCount <= 0) return false;
-
-  return resumo.completedCount <= resumo.transferOutCount + 1;
+  return isResumoContaOrigemFraudeBonus(user, resumo);
 }
 
 async function encontrarOrigemFraudeBonus(userId, client = pool) {
@@ -1782,6 +2206,107 @@ async function encontrarOrigemFraudeBonus(userId, client = pool) {
   }
 
   return null;
+}
+
+async function getUsersFraudRiskMap(users, client = pool) {
+  const lista = Array.isArray(users) ? users.filter((user) => user?.id) : [];
+
+  if (!lista.length) {
+    return new Map();
+  }
+
+  const transferencias = await listTransferenciasRecebidasPorUsuarios(
+    lista.map((user) => user.id),
+    client
+  );
+
+  if (!transferencias.length) {
+    return new Map();
+  }
+
+  const transferenciasByUserId = new Map();
+  const sourceUserIds = new Set();
+
+  for (const transferencia of transferencias) {
+    if (!transferencia?.userId) continue;
+    if (!transferenciasByUserId.has(transferencia.userId)) {
+      transferenciasByUserId.set(transferencia.userId, []);
+    }
+    transferenciasByUserId.get(transferencia.userId).push(transferencia);
+    if (transferencia.fromUserId) {
+      sourceUserIds.add(transferencia.fromUserId);
+    }
+  }
+
+  if (!sourceUserIds.size) {
+    return new Map();
+  }
+
+  const [sourceUsers, sourceResumoMap] = await Promise.all([
+    listUsersByIds(Array.from(sourceUserIds), client),
+    getResumoFinanceiroUsuarios(Array.from(sourceUserIds), client)
+  ]);
+
+  const sourceUserMap = new Map(sourceUsers.map((user) => [user.id, user]));
+  const riskMap = new Map();
+
+  for (const [userId, listaTransferencias] of transferenciasByUserId.entries()) {
+    for (const transferencia of listaTransferencias) {
+      if (!transferencia.fromUserId) continue;
+
+      const sourceUser = sourceUserMap.get(transferencia.fromUserId);
+      const sourceResumo = sourceResumoMap.get(transferencia.fromUserId);
+
+      if (!isResumoContaOrigemFraudeBonus(sourceUser, sourceResumo)) {
+        continue;
+      }
+
+      riskMap.set(userId, {
+        riscoFraudeSaquePix: true,
+        riscoFraudeSaquePixOrigemUserId: transferencia.fromUserId || "",
+        riscoFraudeSaquePixOrigemEmail: transferencia.fromEmail || "",
+        riscoFraudeSaquePixValorRecebido: toMoney(transferencia.totalAmount),
+        riscoFraudeSaquePixUltimoRecebimentoEm: transferencia.lastReceivedAt || null
+      });
+      break;
+    }
+  }
+
+  return riskMap;
+}
+
+async function getUsersAdminContextMap(users, client = pool) {
+  const lista = Array.isArray(users) ? users.filter(Boolean) : [];
+
+  if (!lista.length) {
+    return new Map();
+  }
+
+  const [financialContextMap, fraudRiskMap] = await Promise.all([
+    getUsersFinancialContextMap(lista, client),
+    getUsersFraudRiskMap(lista, client)
+  ]);
+
+  const contextMap = new Map();
+
+  for (const user of lista) {
+    contextMap.set(user.id, {
+      ...buildDefaultAdminUserContext(user),
+      ...(financialContextMap.get(user.id) || {}),
+      ...(fraudRiskMap.get(user.id) || {})
+    });
+  }
+
+  return contextMap;
+}
+
+async function getAdminUserContext(user, client = pool) {
+  if (!user?.id) {
+    return buildDefaultAdminUserContext(user);
+  }
+
+  const contextMap = await getUsersAdminContextMap([user], client);
+  return contextMap.get(user.id) || buildDefaultAdminUserContext(user);
 }
 
 async function banirContaPorFraudeBonus(userId, client = pool) {
@@ -2528,6 +3053,12 @@ app.post("/transferir-sigmo", async (req, res) => {
         throw new Error("Saldo insuficiente");
       }
 
+      const remetenteContexto = await getUserFinancialContext(remetente, client);
+      const bonusTransferido = Math.min(
+        toMoney(remetenteContexto.saldoBonusAtual),
+        valorNum
+      );
+      const realTransferido = toMoney(valorNum - bonusTransferido);
       const transferId = buildId("transfer");
       const now = db();
 
@@ -2544,7 +3075,9 @@ app.post("/transferir-sigmo", async (req, res) => {
         metadata: {
           fromUserId: remetente.id,
           toUserId: destino.id,
-          toEmail: destino.email
+          toEmail: destino.email,
+          bonusAmount: bonusTransferido,
+          realAmount: realTransferido
         }
       });
 
@@ -2557,7 +3090,9 @@ app.post("/transferir-sigmo", async (req, res) => {
         metadata: {
           transferId,
           counterpartUserId: destino.id,
-          counterpartEmail: destino.email
+          counterpartEmail: destino.email,
+          bonusAmount: bonusTransferido,
+          realAmount: realTransferido
         }
       });
 
@@ -2574,7 +3109,9 @@ app.post("/transferir-sigmo", async (req, res) => {
         metadata: {
           fromUserId: remetente.id,
           fromEmail: remetente.email,
-          toUserId: destino.id
+          toUserId: destino.id,
+          bonusAmount: bonusTransferido,
+          realAmount: realTransferido
         }
       });
 
@@ -2587,7 +3124,9 @@ app.post("/transferir-sigmo", async (req, res) => {
         metadata: {
           transferId,
           counterpartUserId: remetente.id,
-          counterpartEmail: remetente.email
+          counterpartEmail: remetente.email,
+          bonusAmount: bonusTransferido,
+          realAmount: realTransferido
         }
       });
 
@@ -2649,19 +3188,8 @@ app.post("/transferir-sigmo", async (req, res) => {
 app.get("/usuarios", authAdmin, async (req, res) => {
   try {
     const result = await listUsers();
-    res.json(
-      result.map((u) => ({
-        id: u.id,
-        nome: u.nome,
-        email: u.email,
-        saldo: toMoney(u.saldo),
-        criadoEm: u.criadoEm || null,
-        statusConta: u.statusConta || STATUS_CONTA_ATIVA,
-        contaBanida: isContaBanida(u),
-        contaBanidaEm: u.contaBanidaEm || null,
-        bonusBoasVindas: toMoney(u.bonusBoasVindas)
-      }))
-    );
+    const contextMap = await getUsersAdminContextMap(result);
+    res.json(result.map((u) => buildAdminUserResponse(u, contextMap.get(u.id))));
   } catch (error) {
     console.error(error);
     res.status(500).json({ error: "Erro" });
@@ -3072,13 +3600,10 @@ app.get("/admin/user/:id/ledger", authAdmin, async (req, res) => {
       listFinancialTransactionsByUser(user.id),
       listLedgerEntriesByUser(user.id)
     ]);
+    const context = await getAdminUserContext(user);
 
     res.json({
-      user: {
-        id: user.id,
-        email: user.email,
-        saldo: toMoney(user.saldo)
-      },
+      user: buildAdminUserResponse(user, context),
       transactions,
       ledger
     });
