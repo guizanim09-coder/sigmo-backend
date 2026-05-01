@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="sigmo_bg">#071319</color>
+    <color name="sigmo_surface">#0F1D24</color>
+    <color name="sigmo_surface_alt">#17303A</color>
+    <color name="sigmo_primary">#24D3A8</color>
+    <color name="sigmo_primary_dark">#159F80</color>
+    <color name="sigmo_text">#F4FCFA</color>
+    <color name="sigmo_muted">#90AAA6</color>
+    <color name="sigmo_warning">#D9A441</color>
+    <color name="sigmo_danger">#E45865</color>
+    <color name="sigmo_outline">#24404A</color>
+</resources>

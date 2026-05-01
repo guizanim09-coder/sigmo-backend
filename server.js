@@ -51,6 +51,27 @@ const BONUS_BOAS_VINDAS_VALOR = Number(
 const PIX_SAQUE_DESBLOQUEIO_MIN = Number(
   process.env.PIX_SAQUE_DESBLOQUEIO_MIN || 100
 );
+const USER_MOBILE_TOKEN_TTL = String(
+  process.env.USER_MOBILE_TOKEN_TTL || "30d"
+).trim();
+const SIGMO_TAP_CHARGE_TTL_SECONDS = Math.max(
+  60,
+  Number(process.env.SIGMO_TAP_CHARGE_TTL_SECONDS || 600)
+);
+const NFC_RECEIVE_SESSION_TTL_SECONDS = Math.max(
+  15,
+  Number(process.env.NFC_RECEIVE_SESSION_TTL_SECONDS || 30)
+);
+const NFC_PROTOCOL_VERSION = Math.max(
+  1,
+  Number(process.env.NFC_PROTOCOL_VERSION || 1)
+);
+const SIGMO_APP_TAP_RECEIVE_SCHEME = String(
+  process.env.SIGMO_APP_TAP_RECEIVE_SCHEME || "sigmo://tap-receive"
+).trim();
+const SIGMO_APP_CARD_CLAIM_SCHEME = String(
+  process.env.SIGMO_APP_CARD_CLAIM_SCHEME || "sigmo://card-claim"
+).trim();
 const STATUS_CONTA_ATIVA = "ativa";
 const STATUS_CONTA_BANIDA = "banida";
 const MOTIVO_BANIMENTO_FRAUDE_BONUS = "tentativa_fraude_bonus";
@@ -373,6 +394,41 @@ async function getBackupStatus() {
 
 function db(now = new Date()) {
   return now.toISOString();
+}
+
+function addSeconds(date, seconds) {
+  const base = date instanceof Date ? date : new Date(date || Date.now());
+  return new Date(base.getTime() + Math.max(0, Number(seconds || 0)) * 1000);
+}
+
+function isTimestampExpired(value, now = new Date()) {
+  if (!value) return false;
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return false;
+  return date.getTime() <= now.getTime();
+}
+
+function getUserDisplayName(user) {
+  const nome = String(user?.nome || "").trim();
+
+  if (nome) return nome;
+
+  const email = String(user?.email || "").trim();
+  return email ? email.split("@")[0] : "Usuario";
+}
+
+function getRequestDeviceId(req) {
+  return String(req.headers["x-sigmo-device-id"] || "")
+    .trim()
+    .slice(0, 120);
+}
+
+function normalizeTransactionPin(value) {
+  return String(value || "").replace(/\D/g, "").trim();
+}
+
+function isValidTransactionPin(value) {
+  return /^\d{4}$/.test(normalizeTransactionPin(value));
 }
 
 function normalizeEmail(email) {
@@ -1092,6 +1148,8 @@ async function initDB() {
   await ensureColumn("usuarios", "motivo_banimento", "TEXT DEFAULT ''");
   await ensureColumn("usuarios", "bonus_boas_vindas", "NUMERIC DEFAULT 0");
   await ensureColumn("usuarios", "bonus_boas_vindas_concedido_em", "TIMESTAMP");
+  await ensureColumn("usuarios", "pin_transacao_hash", "TEXT DEFAULT ''");
+  await ensureColumn("usuarios", "pin_transacao_atualizado_em", "TIMESTAMP");
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS depositos (
@@ -1176,6 +1234,67 @@ await ensureColumn("depositos", "comprovante_texto", "TEXT DEFAULT ''");
     );
   `);
 
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS nfc_receive_sessions (
+      id TEXT PRIMARY KEY,
+      public_token TEXT UNIQUE NOT NULL,
+      receiver_user_id TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'pending',
+      nonce TEXT NOT NULL,
+      protocol_version INTEGER NOT NULL DEFAULT 1,
+      expires_at TIMESTAMP NOT NULL,
+      consumed_at TIMESTAMP,
+      cancelled_at TIMESTAMP,
+      payer_user_id TEXT DEFAULT '',
+      amount NUMERIC DEFAULT 0,
+      financial_transaction_id TEXT DEFAULT '',
+      read_count INTEGER DEFAULT 0,
+      last_read_at TIMESTAMP,
+      metadata JSONB DEFAULT '{}'::jsonb,
+      created_at TIMESTAMP,
+      updated_at TIMESTAMP
+    );
+  `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS sigmo_tap_charges (
+      id TEXT PRIMARY KEY,
+      public_code TEXT UNIQUE NOT NULL,
+      receiver_user_id TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'pending',
+      amount NUMERIC NOT NULL DEFAULT 0,
+      description TEXT DEFAULT '',
+      expires_at TIMESTAMP NOT NULL,
+      nfc_session_id TEXT DEFAULT '',
+      payer_user_id TEXT DEFAULT '',
+      financial_transaction_id TEXT DEFAULT '',
+      paid_at TIMESTAMP,
+      cancelled_at TIMESTAMP,
+      metadata JSONB DEFAULT '{}'::jsonb,
+      created_at TIMESTAMP,
+      updated_at TIMESTAMP
+    );
+  `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS sigmo_cards (
+      id TEXT PRIMARY KEY,
+      owner_user_id TEXT NOT NULL,
+      holder_user_id TEXT NOT NULL,
+      card_type TEXT NOT NULL DEFAULT 'primary',
+      label TEXT DEFAULT '',
+      status TEXT NOT NULL DEFAULT 'active',
+      spending_limit NUMERIC NOT NULL DEFAULT 0,
+      device_id TEXT DEFAULT '',
+      claim_token TEXT DEFAULT '',
+      bound_at TIMESTAMP,
+      last_used_at TIMESTAMP,
+      metadata JSONB DEFAULT '{}'::jsonb,
+      created_at TIMESTAMP,
+      updated_at TIMESTAMP
+    );
+  `);
+
   await ensureIndex(
     "idx_financial_transactions_user_id",
     "CREATE INDEX idx_financial_transactions_user_id ON financial_transactions (user_id)"
@@ -1189,6 +1308,41 @@ await ensureColumn("depositos", "comprovante_texto", "TEXT DEFAULT ''");
   await ensureIndex(
     "idx_audit_logs_admin_id",
     "CREATE INDEX idx_audit_logs_admin_id ON audit_logs (admin_id)"
+  );
+
+  await ensureIndex(
+    "idx_nfc_receive_sessions_receiver_user_id",
+    "CREATE INDEX idx_nfc_receive_sessions_receiver_user_id ON nfc_receive_sessions (receiver_user_id)"
+  );
+
+  await ensureIndex(
+    "idx_nfc_receive_sessions_status",
+    "CREATE INDEX idx_nfc_receive_sessions_status ON nfc_receive_sessions (status)"
+  );
+
+  await ensureIndex(
+    "idx_sigmo_tap_charges_receiver_user_id",
+    "CREATE INDEX idx_sigmo_tap_charges_receiver_user_id ON sigmo_tap_charges (receiver_user_id)"
+  );
+
+  await ensureIndex(
+    "idx_sigmo_tap_charges_status",
+    "CREATE INDEX idx_sigmo_tap_charges_status ON sigmo_tap_charges (status)"
+  );
+
+  await ensureIndex(
+    "idx_sigmo_cards_owner_user_id",
+    "CREATE INDEX idx_sigmo_cards_owner_user_id ON sigmo_cards (owner_user_id)"
+  );
+
+  await ensureIndex(
+    "idx_sigmo_cards_holder_user_id",
+    "CREATE INDEX idx_sigmo_cards_holder_user_id ON sigmo_cards (holder_user_id)"
+  );
+
+  await ensureIndex(
+    "idx_sigmo_cards_device_id",
+    "CREATE INDEX idx_sigmo_cards_device_id ON sigmo_cards (device_id)"
   );
 
   await ensureAdmin();
@@ -1344,6 +1498,19 @@ function signToken(admin) {
   );
 }
 
+function signUserToken(user) {
+  return jwt.sign(
+    {
+      sub: user.id,
+      email: user.email,
+      nome: getUserDisplayName(user),
+      type: "user"
+    },
+    JWT_SECRET,
+    { expiresIn: USER_MOBILE_TOKEN_TTL }
+  );
+}
+
 function mapUser(row) {
   if (!row) return null;
 
@@ -1361,7 +1528,9 @@ function mapUser(row) {
     contaBanidaEm: row.conta_banida_em || null,
     motivoBanimento: row.motivo_banimento || "",
     bonusBoasVindas: toMoney(row.bonus_boas_vindas),
-    bonusBoasVindasConcedidoEm: row.bonus_boas_vindas_concedido_em || null
+    bonusBoasVindasConcedidoEm: row.bonus_boas_vindas_concedido_em || null,
+    pinTransacaoHash: row.pin_transacao_hash || "",
+    pinTransacaoAtualizadoEm: row.pin_transacao_atualizado_em || null
   };
 }
 
@@ -1384,11 +1553,179 @@ function buildUserPublicResponse(user, extras = {}) {
 
 async function buildUserPublicResponseWithPix(user, client = pool, extras = {}) {
   const valorRecebidoViaPix = await getValorRecebidoViaPix(user.id, client);
+  const deviceId = String(extras.deviceId || "").trim();
+  const activeCard =
+    Object.prototype.hasOwnProperty.call(extras, "activeCard")
+      ? extras.activeCard
+      : await buildUserActiveCardResponse(user, deviceId, client);
+  const extraPayload = { ...extras };
+  delete extraPayload.deviceId;
+  delete extraPayload.activeCard;
 
   return buildUserPublicResponse(user, {
     pixDesbloqueado: valorRecebidoViaPix >= PIX_SAQUE_DESBLOQUEIO_MIN,
     valorRecebidoViaPix,
     valorMinimoDesbloqueioPix: PIX_SAQUE_DESBLOQUEIO_MIN,
+    activeCard,
+    ...extraPayload
+  });
+}
+
+function buildUserMobileAuthResponse(user, token, extras = {}) {
+  return {
+    token,
+    tokenType: "Bearer",
+    tokenTtl: USER_MOBILE_TOKEN_TTL,
+    user,
+    ...extras
+  };
+}
+
+function buildNfcReceiveSessionPayload(session) {
+  return JSON.stringify({
+    v: Number(session?.protocolVersion || NFC_PROTOCOL_VERSION),
+    t: String(session?.publicToken || ""),
+    n: String(session?.nonce || "")
+  });
+}
+
+function parseNfcReceiveSessionPayload(payload) {
+  if (typeof payload === "object" && payload) {
+    return {
+      version: Number(payload.v || payload.version || NFC_PROTOCOL_VERSION),
+      publicToken: String(payload.t || payload.publicToken || "").trim(),
+      nonce: String(payload.n || payload.nonce || "").trim()
+    };
+  }
+
+  if (!String(payload || "").trim()) {
+    return {
+      version: NFC_PROTOCOL_VERSION,
+      publicToken: "",
+      nonce: ""
+    };
+  }
+
+  try {
+    const parsed = JSON.parse(String(payload));
+    return parseNfcReceiveSessionPayload(parsed);
+  } catch {
+    return {
+      version: NFC_PROTOCOL_VERSION,
+      publicToken: "",
+      nonce: ""
+    };
+  }
+}
+
+function buildNfcReceiveSessionResponse(session, receiver, extras = {}) {
+  return {
+    id: session.id,
+    status: normalizeNfcSessionStatus(session.status),
+    protocolVersion: Number(session.protocolVersion || NFC_PROTOCOL_VERSION),
+    publicToken: session.publicToken,
+    nonce: session.nonce,
+    payload: buildNfcReceiveSessionPayload(session),
+    expiresAt: session.expiresAt,
+    consumedAt: session.consumedAt || null,
+    cancelledAt: session.cancelledAt || null,
+    amount: toMoney(session.amount),
+    readCount: Number(session.readCount || 0),
+    lastReadAt: session.lastReadAt || null,
+    receiver: receiver
+      ? {
+          id: receiver.id,
+          nome: getUserDisplayName(receiver),
+          email: receiver.email
+        }
+      : null,
+    ...extras
+  };
+}
+
+function buildSigmoTapChargeAppLink(charge) {
+  const chargeId = encodeURIComponent(String(charge?.id || "").trim());
+  return `${SIGMO_APP_TAP_RECEIVE_SCHEME}?chargeId=${chargeId}`;
+}
+
+function buildSigmoTapChargeResponse(charge, receiver, extras = {}) {
+  return {
+    id: charge.id,
+    publicCode: charge.publicCode,
+    status: normalizeSigmoTapChargeStatus(charge.status),
+    amount: toMoney(charge.amount),
+    description: charge.description || "",
+    expiresAt: charge.expiresAt || null,
+    paidAt: charge.paidAt || null,
+    cancelledAt: charge.cancelledAt || null,
+    appLink: buildSigmoTapChargeAppLink(charge),
+    receiver: receiver
+      ? {
+          id: receiver.id,
+          nome: getUserDisplayName(receiver),
+          email: receiver.email
+        }
+      : null,
+    ...extras
+  };
+}
+
+function normalizeSigmoCardType(cardType) {
+  const normalized = String(cardType || "").trim().toLowerCase();
+  return normalized === "additional" ? "additional" : "primary";
+}
+
+function normalizeSigmoCardStatus(status) {
+  const normalized = String(status || "").trim().toLowerCase();
+  return ["active", "blocked"].includes(normalized) ? normalized : "active";
+}
+
+function buildSigmoCardClaimAppLink(card) {
+  const cardId = encodeURIComponent(String(card?.id || "").trim());
+  const claimToken = encodeURIComponent(String(card?.claimToken || "").trim());
+  return `${SIGMO_APP_CARD_CLAIM_SCHEME}?cardId=${cardId}&claimToken=${claimToken}`;
+}
+
+function buildSigmoCardResponse(card, owner, holder, extras = {}) {
+  const spendingLimit = toMoney(card?.spendingLimit);
+  const ownerBalance = toMoney(owner?.saldo);
+  const availableToSpend = Math.max(0, Math.min(spendingLimit, ownerBalance));
+
+  return {
+    id: card.id,
+    ownerUserId: card.ownerUserId,
+    holderUserId: card.holderUserId,
+    cardType: normalizeSigmoCardType(card.cardType),
+    label: String(card.label || "").trim() || "Cartao Sigmo",
+    status: normalizeSigmoCardStatus(card.status),
+    spendingLimit,
+    availableToSpend,
+    deviceBound: Boolean(String(card.deviceId || "").trim()),
+    boundAt: card.boundAt || null,
+    lastUsedAt: card.lastUsedAt || null,
+    appLink: buildSigmoCardClaimAppLink(card),
+    owner: owner
+      ? {
+          id: owner.id,
+          nome: getUserDisplayName(owner),
+          email: owner.email
+        }
+      : null,
+    holder: holder
+      ? {
+          id: holder.id,
+          nome: getUserDisplayName(holder),
+          email: holder.email
+        }
+      : null,
+    ...extras
+  };
+}
+
+function sendJsonError(res, statusCode, code, error, extras = {}) {
+  return res.status(statusCode).json({
+    code,
+    error,
     ...extras
   });
 }
@@ -1455,6 +1792,68 @@ function mapLedgerEntry(row) {
   };
 }
 
+function mapNfcReceiveSession(row) {
+  if (!row) return null;
+
+  return {
+    id: row.id,
+    publicToken: row.public_token,
+    receiverUserId: row.receiver_user_id,
+    status: row.status || "pending",
+    nonce: row.nonce || "",
+    protocolVersion: Number(row.protocol_version || NFC_PROTOCOL_VERSION),
+    expiresAt: row.expires_at || null,
+    consumedAt: row.consumed_at || null,
+    cancelledAt: row.cancelled_at || null,
+    payerUserId: row.payer_user_id || "",
+    amount: toMoney(row.amount),
+    financialTransactionId: row.financial_transaction_id || "",
+    readCount: Number(row.read_count || 0),
+    lastReadAt: row.last_read_at || null,
+    metadata: row.metadata || {},
+    createdAt: row.created_at || null,
+    updatedAt: row.updated_at || null
+  };
+}
+
+function normalizeNfcSessionStatus(status) {
+  const normalized = String(status || "").trim().toLowerCase();
+  if (["pending", "consumed", "cancelled", "expired"].includes(normalized)) {
+    return normalized;
+  }
+  return "pending";
+}
+
+function mapSigmoTapCharge(row) {
+  if (!row) return null;
+
+  return {
+    id: row.id,
+    publicCode: row.public_code || "",
+    receiverUserId: row.receiver_user_id || "",
+    status: row.status || "pending",
+    amount: toMoney(row.amount),
+    description: row.description || "",
+    expiresAt: row.expires_at || null,
+    nfcSessionId: row.nfc_session_id || "",
+    payerUserId: row.payer_user_id || "",
+    financialTransactionId: row.financial_transaction_id || "",
+    paidAt: row.paid_at || null,
+    cancelledAt: row.cancelled_at || null,
+    metadata: row.metadata || {},
+    createdAt: row.created_at || null,
+    updatedAt: row.updated_at || null
+  };
+}
+
+function normalizeSigmoTapChargeStatus(status) {
+  const normalized = String(status || "").trim().toLowerCase();
+  if (["pending", "armed", "paid", "cancelled", "expired"].includes(normalized)) {
+    return normalized;
+  }
+  return "pending";
+}
+
 async function getUserById(id, client = pool) {
   const result = await client.query(
     "SELECT * FROM usuarios WHERE id = $1 LIMIT 1",
@@ -1507,6 +1906,492 @@ async function listUsersByIds(userIds, client = pool) {
   return result.rows.map(mapUser);
 }
 
+async function getNfcReceiveSessionById(id, client = pool) {
+  const result = await client.query(
+    "SELECT * FROM nfc_receive_sessions WHERE id = $1 LIMIT 1",
+    [String(id || "").trim()]
+  );
+  return mapNfcReceiveSession(result.rows[0]);
+}
+
+async function getNfcReceiveSessionByIdForUpdate(id, client) {
+  const result = await client.query(
+    "SELECT * FROM nfc_receive_sessions WHERE id = $1 LIMIT 1 FOR UPDATE",
+    [String(id || "").trim()]
+  );
+  return mapNfcReceiveSession(result.rows[0]);
+}
+
+async function getNfcReceiveSessionByPublicToken(publicToken, client = pool) {
+  const result = await client.query(
+    "SELECT * FROM nfc_receive_sessions WHERE public_token = $1 LIMIT 1",
+    [String(publicToken || "").trim()]
+  );
+  return mapNfcReceiveSession(result.rows[0]);
+}
+
+async function getNfcReceiveSessionByPublicTokenForUpdate(publicToken, client) {
+  const result = await client.query(
+    "SELECT * FROM nfc_receive_sessions WHERE public_token = $1 LIMIT 1 FOR UPDATE",
+    [String(publicToken || "").trim()]
+  );
+  return mapNfcReceiveSession(result.rows[0]);
+}
+
+async function saveNfcReceiveSession(session, client = pool) {
+  const payload = {
+    ...session,
+    status: normalizeNfcSessionStatus(session?.status),
+    protocolVersion: Number(session?.protocolVersion || NFC_PROTOCOL_VERSION),
+    amount: toMoney(session?.amount),
+    readCount: Math.max(0, Number(session?.readCount || 0)),
+    metadata: session?.metadata || {}
+  };
+
+  await client.query(
+    `
+    INSERT INTO nfc_receive_sessions (
+      id, public_token, receiver_user_id, status, nonce, protocol_version,
+      expires_at, consumed_at, cancelled_at, payer_user_id, amount,
+      financial_transaction_id, read_count, last_read_at, metadata,
+      created_at, updated_at
+    )
+    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)
+    ON CONFLICT (id) DO UPDATE SET
+      public_token = EXCLUDED.public_token,
+      receiver_user_id = EXCLUDED.receiver_user_id,
+      status = EXCLUDED.status,
+      nonce = EXCLUDED.nonce,
+      protocol_version = EXCLUDED.protocol_version,
+      expires_at = EXCLUDED.expires_at,
+      consumed_at = EXCLUDED.consumed_at,
+      cancelled_at = EXCLUDED.cancelled_at,
+      payer_user_id = EXCLUDED.payer_user_id,
+      amount = EXCLUDED.amount,
+      financial_transaction_id = EXCLUDED.financial_transaction_id,
+      read_count = EXCLUDED.read_count,
+      last_read_at = EXCLUDED.last_read_at,
+      metadata = EXCLUDED.metadata,
+      created_at = COALESCE(nfc_receive_sessions.created_at, EXCLUDED.created_at),
+      updated_at = EXCLUDED.updated_at
+    `,
+    [
+      payload.id,
+      payload.publicToken,
+      payload.receiverUserId,
+      payload.status,
+      payload.nonce,
+      payload.protocolVersion,
+      payload.expiresAt,
+      payload.consumedAt || null,
+      payload.cancelledAt || null,
+      payload.payerUserId || "",
+      payload.amount,
+      payload.financialTransactionId || "",
+      payload.readCount,
+      payload.lastReadAt || null,
+      JSON.stringify(payload.metadata || {}),
+      payload.createdAt || db(),
+      payload.updatedAt || db()
+    ]
+  );
+}
+
+async function getSigmoTapChargeById(id, client = pool) {
+  const result = await client.query(
+    "SELECT * FROM sigmo_tap_charges WHERE id = $1 LIMIT 1",
+    [String(id || "").trim()]
+  );
+  return mapSigmoTapCharge(result.rows[0]);
+}
+
+async function getSigmoTapChargeByIdForUpdate(id, client) {
+  const result = await client.query(
+    "SELECT * FROM sigmo_tap_charges WHERE id = $1 LIMIT 1 FOR UPDATE",
+    [String(id || "").trim()]
+  );
+  return mapSigmoTapCharge(result.rows[0]);
+}
+
+async function getSigmoTapChargeByPublicCode(publicCode, client = pool) {
+  const result = await client.query(
+    "SELECT * FROM sigmo_tap_charges WHERE public_code = $1 LIMIT 1",
+    [String(publicCode || "").trim()]
+  );
+  return mapSigmoTapCharge(result.rows[0]);
+}
+
+async function saveSigmoTapCharge(charge, client = pool) {
+  const payload = {
+    ...charge,
+    publicCode: String(charge?.publicCode || "").trim(),
+    receiverUserId: String(charge?.receiverUserId || "").trim(),
+    status: normalizeSigmoTapChargeStatus(charge?.status),
+    amount: toMoney(charge?.amount),
+    description: String(charge?.description || "").trim(),
+    nfcSessionId: String(charge?.nfcSessionId || "").trim(),
+    payerUserId: String(charge?.payerUserId || "").trim(),
+    financialTransactionId: String(charge?.financialTransactionId || "").trim(),
+    metadata: charge?.metadata || {}
+  };
+
+  await client.query(
+    `
+    INSERT INTO sigmo_tap_charges (
+      id, public_code, receiver_user_id, status, amount, description,
+      expires_at, nfc_session_id, payer_user_id, financial_transaction_id,
+      paid_at, cancelled_at, metadata, created_at, updated_at
+    )
+    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
+    ON CONFLICT (id) DO UPDATE SET
+      public_code = EXCLUDED.public_code,
+      receiver_user_id = EXCLUDED.receiver_user_id,
+      status = EXCLUDED.status,
+      amount = EXCLUDED.amount,
+      description = EXCLUDED.description,
+      expires_at = EXCLUDED.expires_at,
+      nfc_session_id = EXCLUDED.nfc_session_id,
+      payer_user_id = EXCLUDED.payer_user_id,
+      financial_transaction_id = EXCLUDED.financial_transaction_id,
+      paid_at = EXCLUDED.paid_at,
+      cancelled_at = EXCLUDED.cancelled_at,
+      metadata = EXCLUDED.metadata,
+      created_at = COALESCE(sigmo_tap_charges.created_at, EXCLUDED.created_at),
+      updated_at = EXCLUDED.updated_at
+    `,
+    [
+      payload.id,
+      payload.publicCode,
+      payload.receiverUserId,
+      payload.status,
+      payload.amount,
+      payload.description,
+      payload.expiresAt,
+      payload.nfcSessionId,
+      payload.payerUserId,
+      payload.financialTransactionId,
+      payload.paidAt || null,
+      payload.cancelledAt || null,
+      JSON.stringify(payload.metadata || {}),
+      payload.createdAt || db(),
+      payload.updatedAt || db()
+    ]
+  );
+}
+
+function buildSigmoCardClaimToken() {
+  return crypto.randomBytes(12).toString("hex");
+}
+
+function mapSigmoCard(row) {
+  if (!row) return null;
+
+  return {
+    id: row.id,
+    ownerUserId: row.owner_user_id || "",
+    holderUserId: row.holder_user_id || "",
+    cardType: normalizeSigmoCardType(row.card_type),
+    label: row.label || "",
+    status: normalizeSigmoCardStatus(row.status),
+    spendingLimit: toMoney(row.spending_limit),
+    deviceId: row.device_id || "",
+    claimToken: row.claim_token || "",
+    boundAt: row.bound_at || null,
+    lastUsedAt: row.last_used_at || null,
+    metadata: row.metadata || {},
+    createdAt: row.created_at || null,
+    updatedAt: row.updated_at || null
+  };
+}
+
+async function getSigmoCardById(id, client = pool) {
+  const result = await client.query(
+    "SELECT * FROM sigmo_cards WHERE id = $1 LIMIT 1",
+    [String(id || "").trim()]
+  );
+  return mapSigmoCard(result.rows[0]);
+}
+
+async function getSigmoCardByIdForUpdate(id, client) {
+  const result = await client.query(
+    "SELECT * FROM sigmo_cards WHERE id = $1 LIMIT 1 FOR UPDATE",
+    [String(id || "").trim()]
+  );
+  return mapSigmoCard(result.rows[0]);
+}
+
+async function getPrimarySigmoCardByOwner(ownerUserId, client = pool) {
+  const result = await client.query(
+    `
+    SELECT *
+    FROM sigmo_cards
+    WHERE owner_user_id = $1
+      AND card_type = 'primary'
+    ORDER BY created_at ASC NULLS LAST
+    LIMIT 1
+    `,
+    [String(ownerUserId || "").trim()]
+  );
+  return mapSigmoCard(result.rows[0]);
+}
+
+async function listSigmoCardsByOwner(ownerUserId, client = pool) {
+  const result = await client.query(
+    `
+    SELECT *
+    FROM sigmo_cards
+    WHERE owner_user_id = $1
+    ORDER BY
+      CASE WHEN card_type = 'primary' THEN 0 ELSE 1 END,
+      created_at ASC NULLS LAST,
+      id ASC
+    `,
+    [String(ownerUserId || "").trim()]
+  );
+  return result.rows.map(mapSigmoCard);
+}
+
+async function getBoundSigmoCardByHolderAndDevice(holderUserId, deviceId, client = pool) {
+  const holderId = String(holderUserId || "").trim();
+  const normalizedDeviceId = String(deviceId || "").trim();
+
+  if (!holderId || !normalizedDeviceId) {
+    return null;
+  }
+
+  const result = await client.query(
+    `
+    SELECT *
+    FROM sigmo_cards
+    WHERE holder_user_id = $1
+      AND device_id = $2
+      AND status = 'active'
+    ORDER BY created_at DESC NULLS LAST
+    LIMIT 1
+    `,
+    [holderId, normalizedDeviceId]
+  );
+
+  return mapSigmoCard(result.rows[0]);
+}
+
+async function getSigmoCardsByHolder(holderUserId, client = pool) {
+  const result = await client.query(
+    `
+    SELECT *
+    FROM sigmo_cards
+    WHERE holder_user_id = $1
+    ORDER BY created_at DESC NULLS LAST
+    `,
+    [String(holderUserId || "").trim()]
+  );
+  return result.rows.map(mapSigmoCard);
+}
+
+async function saveSigmoCard(card, client = pool) {
+  const payload = {
+    ...card,
+    ownerUserId: String(card?.ownerUserId || "").trim(),
+    holderUserId: String(card?.holderUserId || "").trim(),
+    cardType: normalizeSigmoCardType(card?.cardType),
+    label: String(card?.label || "").trim(),
+    status: normalizeSigmoCardStatus(card?.status),
+    spendingLimit: Math.max(0, toMoney(card?.spendingLimit)),
+    deviceId: String(card?.deviceId || "").trim(),
+    claimToken: String(card?.claimToken || buildSigmoCardClaimToken()).trim(),
+    metadata: card?.metadata || {}
+  };
+
+  await client.query(
+    `
+    INSERT INTO sigmo_cards (
+      id, owner_user_id, holder_user_id, card_type, label, status,
+      spending_limit, device_id, claim_token, bound_at, last_used_at,
+      metadata, created_at, updated_at
+    )
+    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+    ON CONFLICT (id) DO UPDATE SET
+      owner_user_id = EXCLUDED.owner_user_id,
+      holder_user_id = EXCLUDED.holder_user_id,
+      card_type = EXCLUDED.card_type,
+      label = EXCLUDED.label,
+      status = EXCLUDED.status,
+      spending_limit = EXCLUDED.spending_limit,
+      device_id = EXCLUDED.device_id,
+      claim_token = EXCLUDED.claim_token,
+      bound_at = EXCLUDED.bound_at,
+      last_used_at = EXCLUDED.last_used_at,
+      metadata = EXCLUDED.metadata,
+      created_at = COALESCE(sigmo_cards.created_at, EXCLUDED.created_at),
+      updated_at = EXCLUDED.updated_at
+    `,
+    [
+      payload.id,
+      payload.ownerUserId,
+      payload.holderUserId,
+      payload.cardType,
+      payload.label,
+      payload.status,
+      payload.spendingLimit,
+      payload.deviceId,
+      payload.claimToken,
+      payload.boundAt || null,
+      payload.lastUsedAt || null,
+      JSON.stringify(payload.metadata || {}),
+      payload.createdAt || db(),
+      payload.updatedAt || db()
+    ]
+  );
+}
+
+async function ensurePrimarySigmoCard(user, client = pool) {
+  if (!user?.id) return null;
+
+  let card = await getPrimarySigmoCardByOwner(user.id, client);
+
+  if (card) {
+    return card;
+  }
+
+  card = {
+    id: buildId("card"),
+    ownerUserId: user.id,
+    holderUserId: user.id,
+    cardType: "primary",
+    label: "Cartao principal",
+    status: "active",
+    spendingLimit: 0,
+    deviceId: "",
+    claimToken: buildSigmoCardClaimToken(),
+    boundAt: null,
+    lastUsedAt: null,
+    metadata: {
+      origin: "auto_primary"
+    },
+    createdAt: db(),
+    updatedAt: db()
+  };
+
+  await saveSigmoCard(card, client);
+  return card;
+}
+
+async function buildUserActiveCardResponse(user, deviceId, client = pool) {
+  if (!user?.id || !String(deviceId || "").trim()) {
+    return null;
+  }
+
+  const card = await getBoundSigmoCardByHolderAndDevice(user.id, deviceId, client);
+
+  if (!card) {
+    return null;
+  }
+
+  const owner = card.ownerUserId === user.id ? user : await getUserById(card.ownerUserId, client);
+  const holder = card.holderUserId === user.id ? user : await getUserById(card.holderUserId, client);
+
+  if (!owner || !holder) {
+    return null;
+  }
+
+  return buildSigmoCardResponse(card, owner, holder);
+}
+
+async function cancelPendingNfcReceiveSessionsByReceiver(
+  receiverUserId,
+  client = pool,
+  exceptSessionId = ""
+) {
+  const userId = String(receiverUserId || "").trim();
+  const exceptId = String(exceptSessionId || "").trim();
+
+  if (!userId) return;
+
+  const params = [userId, db()];
+  let sql = `
+    UPDATE nfc_receive_sessions
+    SET status = 'cancelled',
+        cancelled_at = $2,
+        updated_at = $2
+    WHERE receiver_user_id = $1
+      AND status = 'pending'
+  `;
+
+  if (exceptId) {
+    params.push(exceptId);
+    sql += ` AND id <> $3`;
+  }
+
+  await client.query(sql, params);
+}
+
+async function expireNfcReceiveSessionIfNeeded(session, client = pool) {
+  if (!session || session.status !== "pending") {
+    return session;
+  }
+
+  if (!isTimestampExpired(session.expiresAt)) {
+    return session;
+  }
+
+  const expiredSession = {
+    ...session,
+    status: "expired",
+    updatedAt: db()
+  };
+
+  await saveNfcReceiveSession(expiredSession, client);
+  return expiredSession;
+}
+
+async function touchNfcReceiveSessionRead(session, client = pool) {
+  if (!session?.id) return session;
+
+  const updated = {
+    ...session,
+    readCount: Math.max(0, Number(session.readCount || 0)) + 1,
+    lastReadAt: db(),
+    updatedAt: db()
+  };
+
+  await saveNfcReceiveSession(updated, client);
+  return updated;
+}
+
+async function syncSigmoTapChargeStatus(charge, client = pool) {
+  if (!charge?.id) return charge;
+
+  const currentStatus = normalizeSigmoTapChargeStatus(charge.status);
+
+  if (currentStatus === "paid" || currentStatus === "cancelled" || currentStatus === "expired") {
+    return charge;
+  }
+
+  let nextStatus = "pending";
+
+  if (isTimestampExpired(charge.expiresAt)) {
+    nextStatus = "expired";
+  } else if (String(charge.nfcSessionId || "").trim()) {
+    const session = await getNfcReceiveSessionById(charge.nfcSessionId, client);
+    if (session && session.status === "pending" && !isTimestampExpired(session.expiresAt)) {
+      nextStatus = "armed";
+    }
+  }
+
+  if (nextStatus === currentStatus) {
+    return charge;
+  }
+
+  const updated = {
+    ...charge,
+    status: nextStatus,
+    updatedAt: db()
+  };
+
+  await saveSigmoTapCharge(updated, client);
+  return updated;
+}
+
 async function saveUser(user, client = pool) {
   await client.query(
     `
@@ -1514,9 +2399,10 @@ async function saveUser(user, client = pool) {
       id, nome, email, senha, saldo, criado_em,
       nome_atualizado_em, saldo_atualizado_em, senha_atualizada_em,
       status_conta, conta_banida_em, motivo_banimento,
-      bonus_boas_vindas, bonus_boas_vindas_concedido_em
+      bonus_boas_vindas, bonus_boas_vindas_concedido_em,
+      pin_transacao_hash, pin_transacao_atualizado_em
     )
-    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
     ON CONFLICT (id) DO UPDATE SET
       nome = EXCLUDED.nome,
       email = EXCLUDED.email,
@@ -1530,7 +2416,9 @@ async function saveUser(user, client = pool) {
       conta_banida_em = EXCLUDED.conta_banida_em,
       motivo_banimento = EXCLUDED.motivo_banimento,
       bonus_boas_vindas = EXCLUDED.bonus_boas_vindas,
-      bonus_boas_vindas_concedido_em = EXCLUDED.bonus_boas_vindas_concedido_em
+      bonus_boas_vindas_concedido_em = EXCLUDED.bonus_boas_vindas_concedido_em,
+      pin_transacao_hash = EXCLUDED.pin_transacao_hash,
+      pin_transacao_atualizado_em = EXCLUDED.pin_transacao_atualizado_em
     `,
     [
       user.id,
@@ -1546,7 +2434,9 @@ async function saveUser(user, client = pool) {
       user.contaBanidaEm || null,
       user.motivoBanimento || "",
       toMoney(user.bonusBoasVindas),
-      user.bonusBoasVindasConcedidoEm || null
+      user.bonusBoasVindasConcedidoEm || null,
+      user.pinTransacaoHash || "",
+      user.pinTransacaoAtualizadoEm || null
     ]
   );
 }
@@ -2487,6 +3377,197 @@ async function applyLedgerChange(
   return user;
 }
 
+async function executeSigmoTransfer(
+  client,
+  {
+    fromUserId,
+    toUserId = "",
+    toEmail = "",
+    amount,
+    channel = "app",
+    metadata = {}
+  }
+) {
+  const valorNum = toMoney(amount);
+
+  if (!String(fromUserId || "").trim()) {
+    throw new Error("Remetente nao encontrado");
+  }
+
+  if (!String(toUserId || "").trim() && !String(toEmail || "").trim()) {
+    throw new Error("Usuario destino nao encontrado");
+  }
+
+  if (!Number.isFinite(valorNum) || valorNum <= 0) {
+    throw new Error("Valor invalido");
+  }
+
+  const remetente = await getUserByIdForUpdate(fromUserId, client);
+  const destino = String(toUserId || "").trim()
+    ? await getUserById(String(toUserId || "").trim(), client)
+    : await getUserByEmail(toEmail, client);
+
+  if (!remetente) {
+    throw new Error("Remetente nao encontrado");
+  }
+
+  if (!destino) {
+    throw new Error("Usuario destino nao encontrado");
+  }
+
+  if (isContaBanida(remetente)) {
+    const error = new Error(getMensagemContaBanida());
+    error.statusCode = 403;
+    error.payload = buildContaBanidaPayload(remetente);
+    throw error;
+  }
+
+  if (isContaBanida(destino)) {
+    const error = new Error("Conta destino indisponivel");
+    error.statusCode = 403;
+    error.payload = {
+      error: "Conta destino indisponivel"
+    };
+    throw error;
+  }
+
+  if (remetente.id === destino.id) {
+    throw new Error("Nao pode transferir para si mesmo");
+  }
+
+  if (toMoney(remetente.saldo) < valorNum) {
+    throw new Error("Saldo insuficiente");
+  }
+
+  const remetenteContexto = await getUserFinancialContext(remetente, client);
+  const bonusTransferido = Math.min(
+    toMoney(remetenteContexto.saldoBonusAtual),
+    valorNum
+  );
+  const realTransferido = toMoney(valorNum - bonusTransferido);
+  const transferId = buildId("transfer");
+  const now = db();
+  const descricaoPrefixo = channel === "nfc" ? "Transferencia NFC" : "Transferencia";
+  const metadataBase = {
+    channel,
+    bonusAmount: bonusTransferido,
+    realAmount: realTransferido,
+    ...metadata
+  };
+
+  const txSaida = await createFinancialTransaction(client, {
+    userId: remetente.id,
+    referenceKey: `transfer:${transferId}:debit`,
+    sourceType: "transfer",
+    sourceId: transferId,
+    operationType: "transfer_out",
+    direction: "debit",
+    amount: valorNum,
+    status: "completed",
+    description: `${descricaoPrefixo} enviada para ${destino.email}`,
+    metadata: {
+      fromUserId: remetente.id,
+      toUserId: destino.id,
+      toEmail: destino.email,
+      ...metadataBase
+    }
+  });
+
+  const remetenteAtualizado = await applyLedgerChange(client, {
+    userId: remetente.id,
+    financialTransactionId: txSaida.id,
+    entryType: "debit",
+    amount: valorNum,
+    description: `${descricaoPrefixo} enviada para ${destino.email}`,
+    metadata: {
+      transferId,
+      counterpartUserId: destino.id,
+      counterpartEmail: destino.email,
+      ...metadataBase
+    }
+  });
+
+  const txEntrada = await createFinancialTransaction(client, {
+    userId: destino.id,
+    referenceKey: `transfer:${transferId}:credit`,
+    sourceType: "transfer",
+    sourceId: transferId,
+    operationType: "transfer_in",
+    direction: "credit",
+    amount: valorNum,
+    status: "completed",
+    description: `${descricaoPrefixo} recebida de ${remetente.email}`,
+    metadata: {
+      fromUserId: remetente.id,
+      fromEmail: remetente.email,
+      toUserId: destino.id,
+      ...metadataBase
+    }
+  });
+
+  const destinatarioAtualizado = await applyLedgerChange(client, {
+    userId: destino.id,
+    financialTransactionId: txEntrada.id,
+    entryType: "credit",
+    amount: valorNum,
+    description: `${descricaoPrefixo} recebida de ${remetente.email}`,
+    metadata: {
+      transferId,
+      counterpartUserId: remetente.id,
+      counterpartEmail: remetente.email,
+      ...metadataBase
+    }
+  });
+
+  await saveDeposito(
+    {
+      id: buildId("dep"),
+      userId: remetente.id,
+      valor: valorNum,
+      chavePix: "",
+      tipoChave: "",
+      tipoTransacao: "saida",
+      status: "aprovado",
+      comprovanteUrl: "",
+      descricao: `${descricaoPrefixo} enviada para ${destino.email}`,
+      criadoEm: now,
+      aprovadoEm: now,
+      recusadoEm: null,
+      comprovanteEnviadoEm: null
+    },
+    client
+  );
+
+  await saveDeposito(
+    {
+      id: buildId("dep"),
+      userId: destino.id,
+      valor: valorNum,
+      chavePix: "",
+      tipoChave: "",
+      tipoTransacao: "entrada",
+      status: "aprovado",
+      comprovanteUrl: "",
+      descricao: `${descricaoPrefixo} recebida de ${remetente.email}`,
+      criadoEm: now,
+      aprovadoEm: now,
+      recusadoEm: null,
+      comprovanteEnviadoEm: null
+    },
+    client
+  );
+
+  return {
+    transferId,
+    remetente,
+    destino,
+    saldoAtualRemetente: toMoney(remetenteAtualizado.saldo),
+    saldoAtualDestinatario: toMoney(destinatarioAtualizado.saldo),
+    txSaida,
+    txEntrada
+  };
+}
+
 function authAdmin(req, res, next) {
   try {
     const auth = String(req.headers.authorization || "").trim();
@@ -2506,6 +3587,29 @@ function authAdmin(req, res, next) {
     next();
   } catch {
     return res.status(401).json({ error: "Não autorizado" });
+  }
+}
+
+function authUser(req, res, next) {
+  try {
+    const auth = String(req.headers.authorization || "").trim();
+
+    if (!auth.startsWith("Bearer ")) {
+      return res.status(401).json({ error: "Nao autorizado" });
+    }
+
+    const token = auth.slice(7).trim();
+    const data = jwt.verify(token, JWT_SECRET);
+
+    if (data.type !== "user" || !String(data.sub || "").trim()) {
+      return res.status(401).json({ error: "Nao autorizado" });
+    }
+
+    req.userAuth = data;
+    req.deviceId = getRequestDeviceId(req);
+    next();
+  } catch {
+    return res.status(401).json({ error: "Nao autorizado" });
   }
 }
 
@@ -2676,6 +3780,842 @@ app.post("/login", loginLimiter, async (req, res) => {
   } catch (error) {
     console.error(error);
     res.status(500).json({ error: "Erro no login" });
+  }
+});
+
+app.post("/mobile/login", loginLimiter, async (req, res) => {
+  try {
+    const { email, senha } = req.body;
+
+    if (!email || !senha) {
+      return sendJsonError(
+        res,
+        400,
+        "AUTH_REQUIRED_FIELDS",
+        "Email e senha sao obrigatorios"
+      );
+    }
+
+    const user = await getUserByEmail(email);
+
+    if (!user) {
+      return sendJsonError(res, 401, "AUTH_INVALID", "Login invalido");
+    }
+
+    const ok = await bcrypt.compare(String(senha), String(user.senha));
+
+    if (!ok) {
+      return sendJsonError(res, 401, "AUTH_INVALID", "Login invalido");
+    }
+
+    const token = signUserToken(user);
+    const userResponse = await buildUserPublicResponseWithPix(user, pool, {
+      deviceId: getRequestDeviceId(req)
+    });
+
+    res.json(
+      buildUserMobileAuthResponse(userResponse, token, {
+        serverTime: db()
+      })
+    );
+  } catch (error) {
+    console.error(error);
+    sendJsonError(res, 500, "AUTH_ERROR", "Erro no login mobile");
+  }
+});
+
+app.get("/mobile/me", authUser, async (req, res) => {
+  try {
+    const user = await getUserById(req.userAuth.sub);
+
+    if (!user) {
+      return sendJsonError(res, 404, "USER_NOT_FOUND", "Usuario nao encontrado");
+    }
+
+    res.json({
+      user: await buildUserPublicResponseWithPix(user, pool, {
+        deviceId: req.deviceId
+      }),
+      serverTime: db()
+    });
+  } catch (error) {
+    console.error(error);
+    sendJsonError(res, 500, "USER_FETCH_ERROR", "Erro ao buscar usuario mobile");
+  }
+});
+
+app.get("/sigmo-cards", async (req, res) => {
+  try {
+    const ownerUserId = String(req.query?.userId || "").trim();
+
+    if (!ownerUserId) {
+      return sendJsonError(res, 400, "CARD_OWNER_REQUIRED", "Usuario nao informado");
+    }
+
+    const cards = await runInTransaction(async (client) => {
+      const owner = await getUserByIdForUpdate(ownerUserId, client);
+
+      if (!owner) {
+        return { statusCode: 404, code: "USER_NOT_FOUND", error: "Usuario nao encontrado" };
+      }
+
+      if (isContaBanida(owner)) {
+        return { statusCode: 403, payload: buildContaBanidaPayload(owner) };
+      }
+
+      await ensurePrimarySigmoCard(owner, client);
+      return listSigmoCardsByOwner(owner.id, client);
+    });
+
+    if (cards?.statusCode) {
+      if (cards.payload) {
+        return res.status(cards.statusCode).json(cards.payload);
+      }
+      return sendJsonError(res, cards.statusCode, cards.code, cards.error);
+    }
+
+    const relatedUsers = await listUsersByIds(
+      cards.flatMap((card) => [card.ownerUserId, card.holderUserId])
+    );
+    const userMap = new Map(relatedUsers.map((item) => [item.id, item]));
+
+    res.json(
+      cards.map((card) =>
+        buildSigmoCardResponse(
+          card,
+          userMap.get(card.ownerUserId),
+          userMap.get(card.holderUserId)
+        )
+      )
+    );
+  } catch (error) {
+    console.error(error);
+    sendJsonError(res, 500, "CARD_LIST_ERROR", "Erro ao carregar cartoes");
+  }
+});
+
+app.post("/sigmo-cards/primary", async (req, res) => {
+  try {
+    const ownerUserId = String(req.body?.userId || "").trim();
+    const label = String(req.body?.label || "").trim();
+    const spendingLimit = Math.max(0, toMoney(req.body?.spendingLimit));
+
+    if (!ownerUserId) {
+      return sendJsonError(res, 400, "CARD_OWNER_REQUIRED", "Usuario nao informado");
+    }
+
+    const result = await runInTransaction(async (client) => {
+      const owner = await getUserByIdForUpdate(ownerUserId, client);
+
+      if (!owner) {
+        return { statusCode: 404, code: "USER_NOT_FOUND", error: "Usuario nao encontrado" };
+      }
+
+      if (isContaBanida(owner)) {
+        return { statusCode: 403, payload: buildContaBanidaPayload(owner) };
+      }
+
+      let card = await ensurePrimarySigmoCard(owner, client);
+      card = {
+        ...card,
+        label: label || card.label || "Cartao principal",
+        spendingLimit,
+        updatedAt: db()
+      };
+
+      await saveSigmoCard(card, client);
+
+      return {
+        owner,
+        card
+      };
+    });
+
+    if (result?.statusCode) {
+      if (result.payload) {
+        return res.status(result.statusCode).json(result.payload);
+      }
+      return sendJsonError(res, result.statusCode, result.code, result.error);
+    }
+
+    res.json(buildSigmoCardResponse(result.card, result.owner, result.owner));
+  } catch (error) {
+    console.error(error);
+    sendJsonError(res, 500, "CARD_PRIMARY_ERROR", "Erro ao atualizar cartao principal");
+  }
+});
+
+app.post("/sigmo-cards/additional", async (req, res) => {
+  try {
+    const ownerUserId = String(req.body?.userId || "").trim();
+    const holderEmail = String(req.body?.holderEmail || "").trim();
+    const label = String(req.body?.label || "").trim();
+    const spendingLimit = Math.max(0, toMoney(req.body?.spendingLimit));
+
+    if (!ownerUserId || !holderEmail) {
+      return sendJsonError(
+        res,
+        400,
+        "CARD_REQUIRED_FIELDS",
+        "Usuario e email do portador sao obrigatorios"
+      );
+    }
+
+    const result = await runInTransaction(async (client) => {
+      const owner = await getUserByIdForUpdate(ownerUserId, client);
+      const holder = await getUserByEmail(holderEmail, client);
+
+      if (!owner) {
+        return { statusCode: 404, code: "USER_NOT_FOUND", error: "Usuario nao encontrado" };
+      }
+
+      if (isContaBanida(owner)) {
+        return { statusCode: 403, payload: buildContaBanidaPayload(owner) };
+      }
+
+      if (!holder) {
+        return {
+          statusCode: 404,
+          code: "CARD_HOLDER_NOT_FOUND",
+          error: "Usuario portador nao encontrado"
+        };
+      }
+
+      if (isContaBanida(holder)) {
+        return {
+          statusCode: 403,
+          code: "CARD_HOLDER_UNAVAILABLE",
+          error: "Conta do portador indisponivel"
+        };
+      }
+
+      if (holder.id === owner.id) {
+        return {
+          statusCode: 400,
+          code: "CARD_PRIMARY_ALREADY_EXISTS",
+          error: "Use o cartao principal para o proprio titular"
+        };
+      }
+
+      const card = {
+        id: buildId("card"),
+        ownerUserId: owner.id,
+        holderUserId: holder.id,
+        cardType: "additional",
+        label: label || `Cartao de ${getUserDisplayName(holder)}`,
+        status: "active",
+        spendingLimit,
+        deviceId: "",
+        claimToken: buildSigmoCardClaimToken(),
+        boundAt: null,
+        lastUsedAt: null,
+        metadata: {
+          createdBy: owner.id
+        },
+        createdAt: db(),
+        updatedAt: db()
+      };
+
+      await saveSigmoCard(card, client);
+
+      return { owner, holder, card };
+    });
+
+    if (result?.statusCode) {
+      if (result.payload) {
+        return res.status(result.statusCode).json(result.payload);
+      }
+      return sendJsonError(res, result.statusCode, result.code, result.error);
+    }
+
+    res.status(201).json(buildSigmoCardResponse(result.card, result.owner, result.holder));
+  } catch (error) {
+    console.error(error);
+    sendJsonError(res, 500, "CARD_CREATE_ERROR", "Erro ao criar cartao adicional");
+  }
+});
+
+app.post("/sigmo-cards/:id", async (req, res) => {
+  try {
+    const ownerUserId = String(req.body?.userId || "").trim();
+
+    if (!ownerUserId) {
+      return sendJsonError(res, 400, "CARD_OWNER_REQUIRED", "Usuario nao informado");
+    }
+
+    const result = await runInTransaction(async (client) => {
+      const owner = await getUserByIdForUpdate(ownerUserId, client);
+      let card = await getSigmoCardByIdForUpdate(req.params.id, client);
+
+      if (!owner) {
+        return { statusCode: 404, code: "USER_NOT_FOUND", error: "Usuario nao encontrado" };
+      }
+
+      if (isContaBanida(owner)) {
+        return { statusCode: 403, payload: buildContaBanidaPayload(owner) };
+      }
+
+      if (!card || card.ownerUserId !== owner.id) {
+        return { statusCode: 404, code: "CARD_NOT_FOUND", error: "Cartao nao encontrado" };
+      }
+
+      const nextLabel = String(req.body?.label || "").trim();
+      const nextStatus = req.body?.status ? normalizeSigmoCardStatus(req.body.status) : card.status;
+      const hasLimit =
+        req.body?.spendingLimit !== undefined && req.body?.spendingLimit !== null && req.body?.spendingLimit !== "";
+
+      card = {
+        ...card,
+        label: nextLabel || card.label,
+        status: nextStatus,
+        spendingLimit: hasLimit ? Math.max(0, toMoney(req.body?.spendingLimit)) : card.spendingLimit,
+        updatedAt: db()
+      };
+
+      await saveSigmoCard(card, client);
+
+      return {
+        owner,
+        holder: await getUserById(card.holderUserId, client),
+        card
+      };
+    });
+
+    if (result?.statusCode) {
+      if (result.payload) {
+        return res.status(result.statusCode).json(result.payload);
+      }
+      return sendJsonError(res, result.statusCode, result.code, result.error);
+    }
+
+    res.json(buildSigmoCardResponse(result.card, result.owner, result.holder));
+  } catch (error) {
+    console.error(error);
+    sendJsonError(res, 500, "CARD_UPDATE_ERROR", "Erro ao atualizar cartao");
+  }
+});
+
+app.post("/sigmo-cards/:id/reissue", async (req, res) => {
+  try {
+    const ownerUserId = String(req.body?.userId || "").trim();
+
+    if (!ownerUserId) {
+      return sendJsonError(res, 400, "CARD_OWNER_REQUIRED", "Usuario nao informado");
+    }
+
+    const result = await runInTransaction(async (client) => {
+      const owner = await getUserByIdForUpdate(ownerUserId, client);
+      let card = await getSigmoCardByIdForUpdate(req.params.id, client);
+
+      if (!owner) {
+        return { statusCode: 404, code: "USER_NOT_FOUND", error: "Usuario nao encontrado" };
+      }
+
+      if (isContaBanida(owner)) {
+        return { statusCode: 403, payload: buildContaBanidaPayload(owner) };
+      }
+
+      if (!card || card.ownerUserId !== owner.id) {
+        return { statusCode: 404, code: "CARD_NOT_FOUND", error: "Cartao nao encontrado" };
+      }
+
+      card = {
+        ...card,
+        deviceId: "",
+        boundAt: null,
+        claimToken: buildSigmoCardClaimToken(),
+        updatedAt: db()
+      };
+
+      await saveSigmoCard(card, client);
+
+      return {
+        owner,
+        holder: await getUserById(card.holderUserId, client),
+        card
+      };
+    });
+
+    if (result?.statusCode) {
+      if (result.payload) {
+        return res.status(result.statusCode).json(result.payload);
+      }
+      return sendJsonError(res, result.statusCode, result.code, result.error);
+    }
+
+    res.json(buildSigmoCardResponse(result.card, result.owner, result.holder));
+  } catch (error) {
+    console.error(error);
+    sendJsonError(res, 500, "CARD_REISSUE_ERROR", "Erro ao liberar cartao para outro aparelho");
+  }
+});
+
+app.get("/mobile/card", authUser, async (req, res) => {
+  try {
+    const user = await getUserById(req.userAuth.sub);
+
+    if (!user) {
+      return sendJsonError(res, 404, "USER_NOT_FOUND", "Usuario nao encontrado");
+    }
+
+    if (isContaBanida(user)) {
+      return res.status(403).json(buildContaBanidaPayload(user));
+    }
+
+    res.json({
+      card: await buildUserActiveCardResponse(user, req.deviceId)
+    });
+  } catch (error) {
+    console.error(error);
+    sendJsonError(res, 500, "MOBILE_CARD_ERROR", "Erro ao carregar cartao do aparelho");
+  }
+});
+
+app.post("/mobile/cards/claim", authUser, async (req, res) => {
+  try {
+    const deviceId = String(req.deviceId || "").trim();
+    const cardId = String(req.body?.cardId || "").trim();
+    const claimToken = String(req.body?.claimToken || "").trim();
+
+    if (!deviceId) {
+      return sendJsonError(
+        res,
+        400,
+        "DEVICE_ID_REQUIRED",
+        "Este aparelho ainda nao foi identificado pela Sigmo"
+      );
+    }
+
+    if (!cardId || !claimToken) {
+      return sendJsonError(
+        res,
+        400,
+        "CARD_CLAIM_REQUIRED",
+        "Cartao e token de liberacao sao obrigatorios"
+      );
+    }
+
+    const result = await runInTransaction(async (client) => {
+      const holder = await getUserByIdForUpdate(req.userAuth.sub, client);
+      let card = await getSigmoCardByIdForUpdate(cardId, client);
+
+      if (!holder) {
+        return { statusCode: 404, code: "USER_NOT_FOUND", error: "Usuario nao encontrado" };
+      }
+
+      if (isContaBanida(holder)) {
+        return { statusCode: 403, payload: buildContaBanidaPayload(holder) };
+      }
+
+      if (!card) {
+        return { statusCode: 404, code: "CARD_NOT_FOUND", error: "Cartao nao encontrado" };
+      }
+
+      if (card.holderUserId !== holder.id) {
+        return {
+          statusCode: 403,
+          code: "CARD_HOLDER_MISMATCH",
+          error: "Este cartao nao foi liberado para esta conta"
+        };
+      }
+
+      if (card.claimToken !== claimToken) {
+        return {
+          statusCode: 403,
+          code: "CARD_CLAIM_INVALID",
+          error: "Link de liberacao invalido ou expirado"
+        };
+      }
+
+      if (card.status !== "active") {
+        return {
+          statusCode: 409,
+          code: "CARD_BLOCKED",
+          error: "Este cartao esta bloqueado"
+        };
+      }
+
+      if (card.deviceId && card.deviceId !== deviceId) {
+        return {
+          statusCode: 409,
+          code: "CARD_ALREADY_BOUND",
+          error: "Este cartao ja esta liberado em outro aparelho"
+        };
+      }
+
+      const owner = await getUserById(card.ownerUserId, client);
+
+      if (!owner) {
+        return {
+          statusCode: 404,
+          code: "CARD_OWNER_NOT_FOUND",
+          error: "Titular do cartao nao encontrado"
+        };
+      }
+
+      if (isContaBanida(owner)) {
+        return {
+          statusCode: 403,
+          code: "CARD_OWNER_UNAVAILABLE",
+          error: "Titular do cartao indisponivel"
+        };
+      }
+
+      const holderCards = await getSigmoCardsByHolder(holder.id, client);
+      for (const holderCard of holderCards) {
+        if (holderCard.id === card.id || holderCard.deviceId !== deviceId) continue;
+        await saveSigmoCard(
+          {
+            ...holderCard,
+            deviceId: "",
+            boundAt: null,
+            updatedAt: db()
+          },
+          client
+        );
+      }
+
+      card = {
+        ...card,
+        deviceId,
+        boundAt: db(),
+        updatedAt: db()
+      };
+
+      await saveSigmoCard(card, client);
+
+      return {
+        holder,
+        owner,
+        card
+      };
+    });
+
+    if (result?.statusCode) {
+      if (result.payload) {
+        return res.status(result.statusCode).json(result.payload);
+      }
+      return sendJsonError(res, result.statusCode, result.code, result.error);
+    }
+
+    res.json({
+      card: buildSigmoCardResponse(result.card, result.owner, result.holder),
+      user: await buildUserPublicResponseWithPix(result.holder, pool, {
+        deviceId
+      })
+    });
+  } catch (error) {
+    console.error(error);
+    sendJsonError(res, 500, "CARD_CLAIM_ERROR", "Erro ao liberar cartao neste aparelho");
+  }
+});
+
+app.post("/sigmo-tap-charges", async (req, res) => {
+  try {
+    const receiverUserId = String(req.body?.userId || req.body?.receiverUserId || "").trim();
+    const amount = toMoney(req.body?.amount);
+    const description = String(req.body?.description || "").trim();
+
+    if (!receiverUserId) {
+      return sendJsonError(res, 400, "TAP_CHARGE_USER_REQUIRED", "Usuario nao informado");
+    }
+
+    if (!Number.isFinite(amount) || amount <= 0) {
+      return sendJsonError(res, 400, "TAP_CHARGE_AMOUNT_INVALID", "Valor invalido");
+    }
+
+    const result = await runInTransaction(async (client) => {
+      const receiver = await getUserByIdForUpdate(receiverUserId, client);
+
+      if (!receiver) {
+        return { statusCode: 404, code: "USER_NOT_FOUND", error: "Usuario nao encontrado" };
+      }
+
+      if (isContaBanida(receiver)) {
+        return {
+          statusCode: 403,
+          payload: buildContaBanidaPayload(receiver)
+        };
+      }
+
+      const now = new Date();
+      const charge = {
+        id: buildId("tapcharge"),
+        publicCode: crypto.randomBytes(6).toString("hex").toUpperCase(),
+        receiverUserId: receiver.id,
+        status: "pending",
+        amount,
+        description,
+        expiresAt: db(addSeconds(now, SIGMO_TAP_CHARGE_TTL_SECONDS)),
+        nfcSessionId: "",
+        payerUserId: "",
+        financialTransactionId: "",
+        paidAt: null,
+        cancelledAt: null,
+        metadata: {
+          source: "web",
+          receiverName: getUserDisplayName(receiver),
+          receiverEmail: receiver.email
+        },
+        createdAt: db(now),
+        updatedAt: db(now)
+      };
+
+      await saveSigmoTapCharge(charge, client);
+      return { charge, receiver };
+    });
+
+    if (result?.payload || result?.statusCode) {
+      return res
+        .status(result.statusCode || 400)
+        .json(result.payload || { code: result.code, error: result.error });
+    }
+
+    res.status(201).json(buildSigmoTapChargeResponse(result.charge, result.receiver));
+  } catch (error) {
+    console.error(error);
+    sendJsonError(res, 500, "TAP_CHARGE_CREATE_ERROR", "Erro ao criar cobranca por aproximacao");
+  }
+});
+
+app.get("/sigmo-tap-charges/:id", async (req, res) => {
+  try {
+    const userId = String(req.query?.userId || "").trim();
+    const charge = await getSigmoTapChargeById(req.params.id);
+
+    if (!charge) {
+      return sendJsonError(res, 404, "TAP_CHARGE_NOT_FOUND", "Cobranca nao encontrada");
+    }
+
+    if (!userId || charge.receiverUserId !== userId) {
+      return sendJsonError(res, 403, "TAP_CHARGE_FORBIDDEN", "Cobranca indisponivel");
+    }
+
+    const syncedCharge = await syncSigmoTapChargeStatus(charge);
+    const receiver = await getUserById(syncedCharge.receiverUserId);
+    res.json(buildSigmoTapChargeResponse(syncedCharge, receiver));
+  } catch (error) {
+    console.error(error);
+    sendJsonError(res, 500, "TAP_CHARGE_FETCH_ERROR", "Erro ao consultar cobranca");
+  }
+});
+
+app.post("/sigmo-tap-charges/:id/cancel", async (req, res) => {
+  try {
+    const userId = String(req.body?.userId || "").trim();
+
+    if (!userId) {
+      return sendJsonError(res, 400, "TAP_CHARGE_USER_REQUIRED", "Usuario nao informado");
+    }
+
+    const result = await runInTransaction(async (client) => {
+      let charge = await getSigmoTapChargeByIdForUpdate(req.params.id, client);
+
+      if (!charge) {
+        return {
+          statusCode: 404,
+          code: "TAP_CHARGE_NOT_FOUND",
+          error: "Cobranca nao encontrada"
+        };
+      }
+
+      if (charge.receiverUserId !== userId) {
+        return {
+          statusCode: 403,
+          code: "TAP_CHARGE_FORBIDDEN",
+          error: "Cobranca indisponivel"
+        };
+      }
+
+      charge = await syncSigmoTapChargeStatus(charge, client);
+
+      if (charge.status === "paid") {
+        return {
+          statusCode: 409,
+          code: "TAP_CHARGE_ALREADY_PAID",
+          error: "Cobranca ja foi paga"
+        };
+      }
+
+      charge = {
+        ...charge,
+        status: "cancelled",
+        cancelledAt: db(),
+        updatedAt: db()
+      };
+
+      await saveSigmoTapCharge(charge, client);
+
+      if (charge.nfcSessionId) {
+        const session = await getNfcReceiveSessionByIdForUpdate(charge.nfcSessionId, client);
+        if (session && session.status === "pending") {
+          await saveNfcReceiveSession(
+            {
+              ...session,
+              status: "cancelled",
+              cancelledAt: db(),
+              updatedAt: db()
+            },
+            client
+          );
+        }
+      }
+
+      return { charge };
+    });
+
+    if (result?.statusCode) {
+      return sendJsonError(res, result.statusCode, result.code, result.error);
+    }
+
+    const receiver = await getUserById(result.charge.receiverUserId);
+    res.json(buildSigmoTapChargeResponse(result.charge, receiver));
+  } catch (error) {
+    console.error(error);
+    sendJsonError(res, 500, "TAP_CHARGE_CANCEL_ERROR", "Erro ao cancelar cobranca");
+  }
+});
+
+app.get("/mobile/tap-charges/:id", authUser, async (req, res) => {
+  try {
+    let charge = await getSigmoTapChargeById(req.params.id);
+
+    if (!charge) {
+      return sendJsonError(res, 404, "TAP_CHARGE_NOT_FOUND", "Cobranca nao encontrada");
+    }
+
+    if (charge.receiverUserId !== req.userAuth.sub) {
+      return sendJsonError(res, 403, "TAP_CHARGE_FORBIDDEN", "Cobranca indisponivel");
+    }
+
+    charge = await syncSigmoTapChargeStatus(charge);
+    const receiver = await getUserById(charge.receiverUserId);
+    res.json(buildSigmoTapChargeResponse(charge, receiver));
+  } catch (error) {
+    console.error(error);
+    sendJsonError(res, 500, "TAP_CHARGE_FETCH_ERROR", "Erro ao consultar cobranca");
+  }
+});
+
+app.post("/mobile/tap-charges/:id/arm", authUser, async (req, res) => {
+  try {
+    const ttlSeconds = Math.min(
+      120,
+      Math.max(15, Number(req.body?.ttlSeconds || NFC_RECEIVE_SESSION_TTL_SECONDS))
+    );
+
+    const result = await runInTransaction(async (client) => {
+      const receiver = await getUserByIdForUpdate(req.userAuth.sub, client);
+      let charge = await getSigmoTapChargeByIdForUpdate(req.params.id, client);
+
+      if (!receiver) {
+        return { statusCode: 404, code: "USER_NOT_FOUND", error: "Usuario nao encontrado" };
+      }
+
+      if (!charge) {
+        return {
+          statusCode: 404,
+          code: "TAP_CHARGE_NOT_FOUND",
+          error: "Cobranca nao encontrada"
+        };
+      }
+
+      if (charge.receiverUserId !== receiver.id) {
+        return {
+          statusCode: 403,
+          code: "TAP_CHARGE_FORBIDDEN",
+          error: "Cobranca indisponivel"
+        };
+      }
+
+      if (isContaBanida(receiver)) {
+        return {
+          statusCode: 403,
+          payload: buildContaBanidaPayload(receiver)
+        };
+      }
+
+      charge = await syncSigmoTapChargeStatus(charge, client);
+
+      if (charge.status === "paid") {
+        return {
+          statusCode: 409,
+          code: "TAP_CHARGE_ALREADY_PAID",
+          error: "Cobranca ja foi paga"
+        };
+      }
+
+      if (charge.status === "cancelled" || charge.status === "expired") {
+        return {
+          statusCode: 409,
+          code: "TAP_CHARGE_UNAVAILABLE",
+          error: "Cobranca indisponivel"
+        };
+      }
+
+      await cancelPendingNfcReceiveSessionsByReceiver(receiver.id, client);
+
+      const now = new Date();
+      const session = {
+        id: buildId("nfcsess"),
+        publicToken: crypto.randomBytes(16).toString("hex"),
+        receiverUserId: receiver.id,
+        status: "pending",
+        nonce: crypto.randomBytes(8).toString("hex"),
+        protocolVersion: NFC_PROTOCOL_VERSION,
+        expiresAt: db(addSeconds(now, ttlSeconds)),
+        consumedAt: null,
+        cancelledAt: null,
+        payerUserId: "",
+        amount: charge.amount,
+        financialTransactionId: "",
+        readCount: 0,
+        lastReadAt: null,
+        metadata: {
+          receiverName: getUserDisplayName(receiver),
+          receiverEmail: receiver.email,
+          channel: "nfc",
+          chargeId: charge.id,
+          chargePublicCode: charge.publicCode,
+          fixedAmount: charge.amount,
+          chargeDescription: charge.description || ""
+        },
+        createdAt: db(now),
+        updatedAt: db(now)
+      };
+
+      await saveNfcReceiveSession(session, client);
+
+      charge = {
+        ...charge,
+        status: "armed",
+        nfcSessionId: session.id,
+        updatedAt: db(now)
+      };
+
+      await saveSigmoTapCharge(charge, client);
+      return { charge, session, receiver };
+    });
+
+    if (result?.payload || result?.statusCode) {
+      return res
+        .status(result.statusCode || 400)
+        .json(result.payload || { code: result.code, error: result.error });
+    }
+
+    res.json({
+      charge: buildSigmoTapChargeResponse(result.charge, result.receiver),
+      session: buildNfcReceiveSessionResponse(result.session, result.receiver, {
+        charge: buildSigmoTapChargeResponse(result.charge, result.receiver),
+        fixedAmount: toMoney(result.charge.amount),
+        requiresPin: false,
+        requiresDeviceAuth: true,
+        confirmationMode: "device_auth"
+      })
+    });
+  } catch (error) {
+    console.error(error);
+    sendJsonError(res, 500, "TAP_CHARGE_ARM_ERROR", "Erro ao ativar cobranca por aproximacao");
   }
 });
 
@@ -3182,6 +5122,681 @@ app.post("/transferir-sigmo", async (req, res) => {
     res
       .status(error.statusCode || 400)
       .json(error.payload || { error: error.message || "Erro na transferência" });
+  }
+});
+
+app.post("/nfc/receive-session", authUser, async (req, res) => {
+  try {
+    const ttlSeconds = Math.min(
+      120,
+      Math.max(15, Number(req.body?.ttlSeconds || NFC_RECEIVE_SESSION_TTL_SECONDS))
+    );
+
+    const result = await runInTransaction(async (client) => {
+      const receiver = await getUserByIdForUpdate(req.userAuth.sub, client);
+
+      if (!receiver) {
+        return { error: "Usuario nao encontrado", statusCode: 404, code: "USER_NOT_FOUND" };
+      }
+
+      if (isContaBanida(receiver)) {
+        return {
+          error: getMensagemContaBanida(),
+          statusCode: 403,
+          payload: buildContaBanidaPayload(receiver)
+        };
+      }
+
+      await cancelPendingNfcReceiveSessionsByReceiver(receiver.id, client);
+
+      const now = new Date();
+      const session = {
+        id: buildId("nfcsess"),
+        publicToken: crypto.randomBytes(16).toString("hex"),
+        receiverUserId: receiver.id,
+        status: "pending",
+        nonce: crypto.randomBytes(8).toString("hex"),
+        protocolVersion: NFC_PROTOCOL_VERSION,
+        expiresAt: db(addSeconds(now, ttlSeconds)),
+        consumedAt: null,
+        cancelledAt: null,
+        payerUserId: "",
+        amount: 0,
+        financialTransactionId: "",
+        readCount: 0,
+        lastReadAt: null,
+        metadata: {
+          receiverName: getUserDisplayName(receiver),
+          receiverEmail: receiver.email,
+          channel: "nfc"
+        },
+        createdAt: db(now),
+        updatedAt: db(now)
+      };
+
+      await saveNfcReceiveSession(session, client);
+      return { session, receiver };
+    });
+
+    if (result?.payload || result?.statusCode) {
+      return res
+        .status(result.statusCode || 400)
+        .json(result.payload || { code: result.code, error: result.error });
+    }
+
+    res.status(201).json(
+      buildNfcReceiveSessionResponse(result.session, result.receiver, {
+        ttlSeconds
+      })
+    );
+  } catch (error) {
+    console.error(error);
+    sendJsonError(
+      res,
+      500,
+      "NFC_RECEIVE_SESSION_CREATE_ERROR",
+      "Erro ao criar sessao NFC"
+    );
+  }
+});
+
+app.get("/nfc/receive-session/:id", authUser, async (req, res) => {
+  try {
+    const user = await getUserById(req.userAuth.sub);
+
+    if (!user) {
+      return sendJsonError(res, 404, "USER_NOT_FOUND", "Usuario nao encontrado");
+    }
+
+    let session = await getNfcReceiveSessionById(req.params.id);
+
+    if (!session) {
+      return sendJsonError(
+        res,
+        404,
+        "NFC_RECEIVE_SESSION_NOT_FOUND",
+        "Sessao NFC nao encontrada"
+      );
+    }
+
+    if (session.receiverUserId !== user.id) {
+      return sendJsonError(
+        res,
+        403,
+        "NFC_RECEIVE_SESSION_FORBIDDEN",
+        "Sessao NFC indisponivel"
+      );
+    }
+
+    session = await expireNfcReceiveSessionIfNeeded(session);
+
+    const payer =
+      session.payerUserId && session.payerUserId !== user.id
+        ? await getUserById(session.payerUserId)
+        : null;
+    const charge = session.metadata?.chargeId
+      ? await syncSigmoTapChargeStatus(
+          await getSigmoTapChargeById(session.metadata.chargeId)
+        )
+      : null;
+
+    res.json(
+      buildNfcReceiveSessionResponse(session, user, {
+        payer: payer
+          ? {
+              id: payer.id,
+              nome: getUserDisplayName(payer),
+              email: payer.email
+            }
+          : session.metadata?.payerEmail
+            ? {
+                id: session.payerUserId || "",
+                nome: session.metadata?.payerName || "",
+                email: session.metadata?.payerEmail || ""
+              }
+            : null,
+        financialTransactionId: session.financialTransactionId || "",
+        fixedAmount: toMoney(charge?.amount || session.metadata?.fixedAmount || 0),
+        requiresPin: false,
+        requiresDeviceAuth: true,
+        confirmationMode: "device_auth",
+        charge: charge ? buildSigmoTapChargeResponse(charge, user) : null
+      })
+    );
+  } catch (error) {
+    console.error(error);
+    sendJsonError(
+      res,
+      500,
+      "NFC_RECEIVE_SESSION_FETCH_ERROR",
+      "Erro ao consultar sessao NFC"
+    );
+  }
+});
+
+app.post("/nfc/receive-session/:id/cancel", authUser, async (req, res) => {
+  try {
+    const result = await runInTransaction(async (client) => {
+      const user = await getUserById(req.userAuth.sub, client);
+
+      if (!user) {
+        return { statusCode: 404, code: "USER_NOT_FOUND", error: "Usuario nao encontrado" };
+      }
+
+      let session = await getNfcReceiveSessionByIdForUpdate(req.params.id, client);
+
+      if (!session) {
+        return {
+          statusCode: 404,
+          code: "NFC_RECEIVE_SESSION_NOT_FOUND",
+          error: "Sessao NFC nao encontrada"
+        };
+      }
+
+      if (session.receiverUserId !== user.id) {
+        return {
+          statusCode: 403,
+          code: "NFC_RECEIVE_SESSION_FORBIDDEN",
+          error: "Sessao NFC indisponivel"
+        };
+      }
+
+      session = await expireNfcReceiveSessionIfNeeded(session, client);
+
+      if (session.status === "pending") {
+        session = {
+          ...session,
+          status: "cancelled",
+          cancelledAt: db(),
+          updatedAt: db()
+        };
+        await saveNfcReceiveSession(session, client);
+      }
+
+      if (session.metadata?.chargeId) {
+        const charge = await getSigmoTapChargeByIdForUpdate(session.metadata.chargeId, client);
+        if (charge && charge.status !== "paid" && charge.status !== "cancelled") {
+          await saveSigmoTapCharge(
+            {
+              ...charge,
+              status: "pending",
+              updatedAt: db()
+            },
+            client
+          );
+        }
+      }
+
+      return { session, user };
+    });
+
+    if (result?.statusCode) {
+      return sendJsonError(res, result.statusCode, result.code, result.error);
+    }
+
+    res.json(buildNfcReceiveSessionResponse(result.session, result.user));
+  } catch (error) {
+    console.error(error);
+    sendJsonError(
+      res,
+      500,
+      "NFC_RECEIVE_SESSION_CANCEL_ERROR",
+      "Erro ao cancelar sessao NFC"
+    );
+  }
+});
+
+app.post("/nfc/session/resolve", authUser, async (req, res) => {
+  try {
+    const payload = parseNfcReceiveSessionPayload(req.body?.payload || req.body || {});
+
+    if (!payload.publicToken || !payload.nonce) {
+      return sendJsonError(
+        res,
+        400,
+        "NFC_PAYLOAD_INVALID",
+        "Payload NFC invalido"
+      );
+    }
+
+    const result = await runInTransaction(async (client) => {
+      let session = await getNfcReceiveSessionByPublicTokenForUpdate(
+        payload.publicToken,
+        client
+      );
+
+      if (!session) {
+        return {
+          statusCode: 404,
+          code: "NFC_RECEIVE_SESSION_NOT_FOUND",
+          error: "Sessao NFC nao encontrada"
+        };
+      }
+
+      session = await expireNfcReceiveSessionIfNeeded(session, client);
+
+      if (session.status === "expired") {
+        return {
+          statusCode: 410,
+          code: "NFC_RECEIVE_SESSION_EXPIRED",
+          error: "Sessao NFC expirada"
+        };
+      }
+
+      if (session.status !== "pending") {
+        return {
+          statusCode: 409,
+          code: "NFC_RECEIVE_SESSION_NOT_PENDING",
+          error: "Sessao NFC indisponivel"
+        };
+      }
+
+      if (session.nonce !== payload.nonce) {
+        return {
+          statusCode: 400,
+          code: "NFC_PAYLOAD_INVALID",
+          error: "Payload NFC invalido"
+        };
+      }
+
+      if (session.receiverUserId === req.userAuth.sub) {
+        return {
+          statusCode: 400,
+          code: "SELF_TRANSFER_NOT_ALLOWED",
+          error: "Nao pode pagar para si mesmo"
+        };
+      }
+
+      const receiver = await getUserById(session.receiverUserId, client);
+
+      if (!receiver) {
+        return {
+          statusCode: 404,
+          code: "NFC_RECEIVER_NOT_FOUND",
+          error: "Recebedor nao encontrado"
+        };
+      }
+
+      if (isContaBanida(receiver)) {
+        return {
+          statusCode: 403,
+          code: "NFC_RECEIVER_UNAVAILABLE",
+          error: "Conta destino indisponivel"
+        };
+      }
+
+      let charge = null;
+
+      if (session.metadata?.chargeId) {
+        charge = await getSigmoTapChargeById(session.metadata.chargeId, client);
+
+        if (!charge) {
+          return {
+            statusCode: 404,
+            code: "TAP_CHARGE_NOT_FOUND",
+            error: "Cobranca por aproximacao nao encontrada"
+          };
+        }
+
+        charge = await syncSigmoTapChargeStatus(charge, client);
+
+        if (charge.status === "paid" || charge.status === "cancelled" || charge.status === "expired") {
+          return {
+            statusCode: 409,
+            code: "TAP_CHARGE_UNAVAILABLE",
+            error: "Cobranca por aproximacao indisponivel"
+          };
+        }
+      }
+
+      session = await touchNfcReceiveSessionRead(session, client);
+      return { session, receiver, charge };
+    });
+
+    if (result?.statusCode) {
+      return sendJsonError(res, result.statusCode, result.code, result.error);
+    }
+
+    res.json(
+      buildNfcReceiveSessionResponse(result.session, result.receiver, {
+        canPay: true,
+        fixedAmount: toMoney(result.charge?.amount || result.session.metadata?.fixedAmount || 0),
+        requiresPin: false,
+        requiresDeviceAuth: true,
+        confirmationMode: "device_auth",
+        charge: result.charge
+          ? buildSigmoTapChargeResponse(result.charge, result.receiver)
+          : null
+      })
+    );
+  } catch (error) {
+    console.error(error);
+    sendJsonError(res, 500, "NFC_RESOLVE_ERROR", "Erro ao resolver sessao NFC");
+  }
+});
+
+app.post("/nfc/pay", authUser, async (req, res) => {
+  try {
+    const payload = parseNfcReceiveSessionPayload(req.body?.payload || req.body || {});
+    const authMethod = String(req.body?.authMethod || "device_auth").trim();
+    const deviceId = String(req.deviceId || "").trim();
+
+    if (!payload.publicToken || !payload.nonce) {
+      return sendJsonError(
+        res,
+        400,
+        "NFC_PAYLOAD_INVALID",
+        "Payload NFC invalido"
+      );
+    }
+
+    if (!deviceId) {
+      return sendJsonError(
+        res,
+        400,
+        "DEVICE_ID_REQUIRED",
+        "Este aparelho ainda nao foi identificado pela Sigmo"
+      );
+    }
+
+    const result = await runInTransaction(async (client) => {
+      let session = await getNfcReceiveSessionByPublicTokenForUpdate(
+        payload.publicToken,
+        client
+      );
+
+      if (!session) {
+        const error = new Error("Sessao NFC nao encontrada");
+        error.statusCode = 404;
+        error.payload = {
+          code: "NFC_RECEIVE_SESSION_NOT_FOUND",
+          error: "Sessao NFC nao encontrada"
+        };
+        throw error;
+      }
+
+      session = await expireNfcReceiveSessionIfNeeded(session, client);
+
+      if (session.status === "expired") {
+        const error = new Error("Sessao NFC expirada");
+        error.statusCode = 410;
+        error.payload = {
+          code: "NFC_RECEIVE_SESSION_EXPIRED",
+          error: "Sessao NFC expirada"
+        };
+        throw error;
+      }
+
+      if (session.status !== "pending") {
+        const error = new Error("Sessao NFC indisponivel");
+        error.statusCode = 409;
+        error.payload = {
+          code: "NFC_RECEIVE_SESSION_NOT_PENDING",
+          error: "Sessao NFC indisponivel"
+        };
+        throw error;
+      }
+
+      if (session.nonce !== payload.nonce) {
+        const error = new Error("Payload NFC invalido");
+        error.statusCode = 400;
+        error.payload = {
+          code: "NFC_PAYLOAD_INVALID",
+          error: "Payload NFC invalido"
+        };
+        throw error;
+      }
+
+      const payer = await getUserById(req.userAuth.sub, client);
+      const receiver = await getUserById(session.receiverUserId, client);
+      const activeCard = payer
+        ? await getBoundSigmoCardByHolderAndDevice(payer.id, deviceId, client)
+        : null;
+      let charge = null;
+
+      if (!payer) {
+        const error = new Error("Usuario nao encontrado");
+        error.statusCode = 404;
+        error.payload = {
+          code: "USER_NOT_FOUND",
+          error: "Usuario nao encontrado"
+        };
+        throw error;
+      }
+
+      if (isContaBanida(payer)) {
+        const error = new Error(getMensagemContaBanida());
+        error.statusCode = 403;
+        error.payload = buildContaBanidaPayload(payer);
+        throw error;
+      }
+
+      if (!receiver) {
+        const error = new Error("Recebedor nao encontrado");
+        error.statusCode = 404;
+        error.payload = {
+          code: "NFC_RECEIVER_NOT_FOUND",
+          error: "Recebedor nao encontrado"
+        };
+        throw error;
+      }
+
+      if (!activeCard) {
+        const error = new Error("Nenhum cartao foi liberado neste aparelho");
+        error.statusCode = 403;
+        error.payload = {
+          code: "CARD_NOT_RELEASED_FOR_DEVICE",
+          error: "Nenhum cartao foi liberado neste aparelho"
+        };
+        throw error;
+      }
+
+      const fundingUser =
+        activeCard.ownerUserId === payer.id
+          ? payer
+          : await getUserById(activeCard.ownerUserId, client);
+
+      if (!fundingUser) {
+        const error = new Error("Titular do cartao nao encontrado");
+        error.statusCode = 404;
+        error.payload = {
+          code: "CARD_OWNER_NOT_FOUND",
+          error: "Titular do cartao nao encontrado"
+        };
+        throw error;
+      }
+
+      if (isContaBanida(fundingUser)) {
+        const error = new Error("Titular do cartao indisponivel");
+        error.statusCode = 403;
+        error.payload = {
+          code: "CARD_OWNER_UNAVAILABLE",
+          error: "Titular do cartao indisponivel"
+        };
+        throw error;
+      }
+
+      if (session.metadata?.chargeId) {
+        charge = await getSigmoTapChargeByIdForUpdate(session.metadata.chargeId, client);
+
+        if (!charge) {
+          const error = new Error("Cobranca por aproximacao nao encontrada");
+          error.statusCode = 404;
+          error.payload = {
+            code: "TAP_CHARGE_NOT_FOUND",
+            error: "Cobranca por aproximacao nao encontrada"
+          };
+          throw error;
+        }
+
+        charge = await syncSigmoTapChargeStatus(charge, client);
+
+        if (charge.status === "paid" || charge.status === "cancelled" || charge.status === "expired") {
+          const error = new Error("Cobranca por aproximacao indisponivel");
+          error.statusCode = 409;
+          error.payload = {
+            code: "TAP_CHARGE_UNAVAILABLE",
+            error: "Cobranca por aproximacao indisponivel"
+          };
+          throw error;
+        }
+      }
+
+      const valorNum = charge
+        ? toMoney(charge.amount)
+        : toMoney(req.body?.amount);
+
+      if (!Number.isFinite(valorNum) || valorNum <= 0) {
+        const error = new Error("Valor invalido");
+        error.statusCode = 400;
+        error.payload = {
+          code: "NFC_AMOUNT_INVALID",
+          error: "Valor invalido"
+        };
+        throw error;
+      }
+
+      const availableCardBalance = Math.max(
+        0,
+        Math.min(toMoney(activeCard.spendingLimit), toMoney(fundingUser.saldo))
+      );
+
+      if (availableCardBalance <= 0 || valorNum > availableCardBalance) {
+        const error = new Error("O valor excede o limite liberado para este cartao");
+        error.statusCode = 403;
+        error.payload = {
+          code: "CARD_LIMIT_EXCEEDED",
+          error: "O valor excede o limite liberado para este cartao",
+          cardLimit: toMoney(activeCard.spendingLimit),
+          availableToSpend: availableCardBalance
+        };
+        throw error;
+      }
+
+      const transferencia = await executeSigmoTransfer(client, {
+        fromUserId: fundingUser.id,
+        toUserId: receiver.id,
+        amount: valorNum,
+        channel: "nfc",
+        metadata: {
+          nfcSessionId: session.id,
+          nfcPublicToken: session.publicToken,
+          tapChargeId: charge?.id || "",
+          authMethod,
+          sigmoCardId: activeCard.id,
+          sigmoCardLabel: activeCard.label,
+          cardOwnerUserId: fundingUser.id,
+          cardHolderUserId: payer.id,
+          cardType: activeCard.cardType,
+          cardLimit: toMoney(activeCard.spendingLimit),
+          deviceId
+        }
+      });
+
+      const now = db();
+      session = {
+        ...session,
+        status: "consumed",
+        consumedAt: now,
+        updatedAt: now,
+        payerUserId: payer.id,
+        amount: valorNum,
+        financialTransactionId: transferencia.txSaida.id,
+        metadata: {
+          ...(session.metadata || {}),
+          channel: "nfc",
+          receiverName: getUserDisplayName(receiver),
+          receiverEmail: receiver.email,
+          payerName: getUserDisplayName(payer),
+          payerEmail: payer.email,
+          cardOwnerName: getUserDisplayName(fundingUser),
+          cardOwnerEmail: fundingUser.email,
+          sigmoCardId: activeCard.id,
+          sigmoCardLabel: activeCard.label,
+          transferId: transferencia.transferId,
+          authMethod
+        }
+      };
+
+      await saveNfcReceiveSession(session, client);
+
+      const updatedCard = {
+        ...activeCard,
+        lastUsedAt: now,
+        updatedAt: now
+      };
+      await saveSigmoCard(updatedCard, client);
+
+      if (charge) {
+        charge = {
+          ...charge,
+          status: "paid",
+          payerUserId: payer.id,
+          financialTransactionId: transferencia.txSaida.id,
+          paidAt: now,
+          updatedAt: now,
+          metadata: {
+            ...(charge.metadata || {}),
+            payerName: getUserDisplayName(payer),
+            payerEmail: payer.email,
+            transferId: transferencia.transferId,
+            authMethod
+          }
+        };
+
+        await saveSigmoTapCharge(charge, client);
+      }
+
+      return {
+        session,
+        payer,
+        fundingUser,
+        receiver,
+        transferencia,
+        charge,
+        card: updatedCard,
+        userResponse: await buildUserPublicResponseWithPix(payer, client, {
+          deviceId,
+          activeCard: buildSigmoCardResponse(updatedCard, fundingUser, payer)
+        })
+      };
+    });
+
+    res.json({
+      code: "NFC_PAYMENT_SUCCESS",
+      message: "Pagamento por aproximacao realizado com sucesso",
+      saldoAtual: result.transferencia.saldoAtualRemetente,
+      user: result.userResponse,
+      receiver: {
+        id: result.receiver.id,
+        nome: getUserDisplayName(result.receiver),
+        email: result.receiver.email
+      },
+      card: buildSigmoCardResponse(result.card, result.fundingUser, result.payer),
+      charge: result.charge
+        ? buildSigmoTapChargeResponse(result.charge, result.receiver)
+        : null,
+      session: buildNfcReceiveSessionResponse(result.session, result.receiver, {
+        payer: {
+          id: result.payer.id,
+          nome: getUserDisplayName(result.payer),
+          email: result.payer.email
+        },
+        financialTransactionId: result.session.financialTransactionId || "",
+        fixedAmount: toMoney(result.charge?.amount || result.session.metadata?.fixedAmount || 0),
+        requiresPin: false,
+        requiresDeviceAuth: true,
+        confirmationMode: "device_auth",
+        charge: result.charge
+          ? buildSigmoTapChargeResponse(result.charge, result.receiver)
+          : null
+      })
+    });
+  } catch (error) {
+    console.error(error);
+    res
+      .status(error.statusCode || 400)
+      .json(error.payload || { code: "NFC_PAY_ERROR", error: error.message || "Erro no pagamento NFC" });
   }
 });
 
