@@ -72,6 +72,12 @@ const SIGMO_APP_TAP_RECEIVE_SCHEME = String(
 const SIGMO_APP_CARD_CLAIM_SCHEME = String(
   process.env.SIGMO_APP_CARD_CLAIM_SCHEME || "sigmo://card-claim"
 ).trim();
+const BANNER_ROTATION_DEFAULT_MS = 7000;
+const BANNER_ROTATION_MIN_MS = 2500;
+const BANNER_ROTATION_MAX_MS = 30000;
+const BANNER_DURATION_DEFAULT_MS = 7000;
+const BANNER_SETTINGS_ID = "main";
+const BANNER_IMAGE_MAX_BYTES = 10 * 1024 * 1024;
 const STATUS_CONTA_ATIVA = "ativa";
 const STATUS_CONTA_BANIDA = "banida";
 const MOTIVO_BANIMENTO_FRAUDE_BONUS = "tentativa_fraude_bonus";
@@ -1189,6 +1195,44 @@ await ensureColumn("depositos", "comprovante_texto", "TEXT DEFAULT ''");
   `);
 
   await pool.query(`
+    CREATE TABLE IF NOT EXISTS banner_settings (
+      id TEXT PRIMARY KEY,
+      rotation_ms INTEGER NOT NULL DEFAULT ${BANNER_ROTATION_DEFAULT_MS},
+      updated_at TIMESTAMP
+    );
+  `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS banner_assets (
+      id TEXT PRIMARY KEY,
+      mime_type TEXT NOT NULL,
+      image_data BYTEA NOT NULL,
+      alt_text TEXT DEFAULT '',
+      click_url TEXT DEFAULT '',
+      is_active BOOLEAN NOT NULL DEFAULT true,
+      duration_ms INTEGER NOT NULL DEFAULT ${BANNER_DURATION_DEFAULT_MS},
+      sort_order INTEGER NOT NULL DEFAULT 0,
+      created_at TIMESTAMP,
+      updated_at TIMESTAMP
+    );
+  `);
+
+  await ensureColumn(
+    "banner_assets",
+    "duration_ms",
+    `INTEGER NOT NULL DEFAULT ${BANNER_DURATION_DEFAULT_MS}`
+  );
+
+  await pool.query(
+    `
+    INSERT INTO banner_settings (id, rotation_ms, updated_at)
+    VALUES ($1, $2, $3)
+    ON CONFLICT (id) DO NOTHING
+    `,
+    [BANNER_SETTINGS_ID, BANNER_ROTATION_DEFAULT_MS, db()]
+  );
+
+  await pool.query(`
     CREATE TABLE IF NOT EXISTS financial_transactions (
       id TEXT PRIMARY KEY,
       user_id TEXT NOT NULL,
@@ -1308,6 +1352,11 @@ await ensureColumn("depositos", "comprovante_texto", "TEXT DEFAULT ''");
   await ensureIndex(
     "idx_audit_logs_admin_id",
     "CREATE INDEX idx_audit_logs_admin_id ON audit_logs (admin_id)"
+  );
+
+  await ensureIndex(
+    "idx_banner_assets_sort_order",
+    "CREATE INDEX idx_banner_assets_sort_order ON banner_assets (sort_order)"
   );
 
   await ensureIndex(
@@ -1485,6 +1534,20 @@ const upload = multer({
   }
 });
 
+const bannerUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: BANNER_IMAGE_MAX_BYTES, files: 12 },
+  fileFilter: (_, file, cb) => {
+    const allowed = ["image/png", "image/jpeg", "image/jpg", "image/webp"];
+
+    if (!allowed.includes(String(file.mimetype || "").toLowerCase())) {
+      return cb(new Error("Formato de banner invalido"));
+    }
+
+    cb(null, true);
+  }
+});
+
 function signToken(admin) {
   return jwt.sign(
     {
@@ -1496,6 +1559,57 @@ function signToken(admin) {
     JWT_SECRET,
     { expiresIn: "12h" }
   );
+}
+
+function clampBannerRotationMs(value) {
+  const parsed = Number(value);
+
+  if (!Number.isFinite(parsed)) {
+    return BANNER_ROTATION_DEFAULT_MS;
+  }
+
+  return Math.min(
+    BANNER_ROTATION_MAX_MS,
+    Math.max(BANNER_ROTATION_MIN_MS, Math.round(parsed))
+  );
+}
+
+function clampBannerDurationMs(value) {
+  return clampBannerRotationMs(value);
+}
+
+function normalizeBannerAlt(value) {
+  return String(value || "").trim().slice(0, 180) || "Banner Sigmo";
+}
+
+function normalizeBannerHref(value) {
+  const href = String(value || "").trim();
+
+  if (!href) return "";
+  if (/^https?:\/\//i.test(href)) return href;
+  if (href.startsWith("/")) return href;
+
+  return "";
+}
+
+function buildBannerImageUrl(id) {
+  return `/public/banner-images/${encodeURIComponent(String(id || "").trim())}`;
+}
+
+function mapBannerAsset(row) {
+  if (!row) return null;
+
+  return {
+    id: row.id,
+    imageUrl: buildBannerImageUrl(row.id),
+    alt: normalizeBannerAlt(row.alt_text || ""),
+    href: normalizeBannerHref(row.click_url || ""),
+    active: row.is_active !== false,
+    durationMs: clampBannerDurationMs(row.duration_ms),
+    sortOrder: Number(row.sort_order || 0),
+    createdAt: row.created_at || null,
+    updatedAt: row.updated_at || null
+  };
 }
 
 function signUserToken(user) {
@@ -2552,6 +2666,233 @@ async function listDepositosByUser(userId) {
     [userId]
   );
   return result.rows.map(mapDeposito);
+}
+
+async function getBannerSettings(client = pool) {
+  const result = await client.query(
+    `
+    SELECT rotation_ms, updated_at
+    FROM banner_settings
+    WHERE id = $1
+    LIMIT 1
+    `,
+    [BANNER_SETTINGS_ID]
+  );
+
+  if (!result.rows.length) {
+    const fallback = {
+      rotationMs: BANNER_ROTATION_DEFAULT_MS,
+      updatedAt: db()
+    };
+
+    await client.query(
+      `
+      INSERT INTO banner_settings (id, rotation_ms, updated_at)
+      VALUES ($1, $2, $3)
+      ON CONFLICT (id) DO NOTHING
+      `,
+      [BANNER_SETTINGS_ID, fallback.rotationMs, fallback.updatedAt]
+    );
+
+    return fallback;
+  }
+
+  return {
+    rotationMs: clampBannerRotationMs(result.rows[0].rotation_ms),
+    updatedAt: result.rows[0].updated_at || null
+  };
+}
+
+async function setBannerSettings(rotationMs, client = pool) {
+  const nextRotationMs = clampBannerRotationMs(rotationMs);
+  const updatedAt = db();
+
+  await client.query(
+    `
+    INSERT INTO banner_settings (id, rotation_ms, updated_at)
+    VALUES ($1, $2, $3)
+    ON CONFLICT (id) DO UPDATE SET
+      rotation_ms = EXCLUDED.rotation_ms,
+      updated_at = EXCLUDED.updated_at
+    `,
+    [BANNER_SETTINGS_ID, nextRotationMs, updatedAt]
+  );
+
+  return {
+    rotationMs: nextRotationMs,
+    updatedAt
+  };
+}
+
+async function listBannerAssets(client = pool, { activeOnly = false } = {}) {
+  const clauses = [];
+  const params = [];
+
+  if (activeOnly) {
+    clauses.push(`is_active = true`);
+  }
+
+  const whereSql = clauses.length ? `WHERE ${clauses.join(" AND ")}` : "";
+  const result = await client.query(
+    `
+    SELECT
+      id,
+      mime_type,
+      alt_text,
+      click_url,
+      is_active,
+      duration_ms,
+      sort_order,
+      created_at,
+      updated_at
+    FROM banner_assets
+    ${whereSql}
+    ORDER BY sort_order ASC, created_at ASC, id ASC
+    `,
+    params
+  );
+
+  return result.rows.map(mapBannerAsset).filter(Boolean);
+}
+
+async function getBannerAssetBinary(id, client = pool) {
+  const result = await client.query(
+    `
+    SELECT id, mime_type, image_data, updated_at
+    FROM banner_assets
+    WHERE id = $1
+    LIMIT 1
+    `,
+    [String(id || "").trim()]
+  );
+
+  if (!result.rows.length) return null;
+
+  return {
+    id: result.rows[0].id,
+    mimeType: result.rows[0].mime_type || "image/jpeg",
+    imageData: result.rows[0].image_data,
+    updatedAt: result.rows[0].updated_at || null
+  };
+}
+
+async function createBannerAssets(files = [], client = pool) {
+  if (!Array.isArray(files) || !files.length) {
+    return [];
+  }
+
+  const existing = await listBannerAssets(client);
+  let nextOrder = existing.reduce(
+    (maxValue, item) => Math.max(maxValue, Number(item?.sortOrder || 0)),
+    -1
+  ) + 1;
+  const createdAt = db();
+  const created = [];
+
+  for (const file of files) {
+    if (!file?.buffer?.length) continue;
+
+    const id = buildId("banner");
+    const asset = {
+      id,
+      mimeType: String(file.mimetype || "image/jpeg").toLowerCase(),
+      alt: normalizeBannerAlt(file.originalname || "Banner Sigmo"),
+      href: "",
+      active: true,
+      durationMs: BANNER_DURATION_DEFAULT_MS,
+      sortOrder: nextOrder++,
+      createdAt
+    };
+
+    await client.query(
+      `
+      INSERT INTO banner_assets (
+        id, mime_type, image_data, alt_text, click_url, is_active, duration_ms, sort_order, created_at, updated_at
+      )
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+      `,
+      [
+        asset.id,
+        asset.mimeType,
+        file.buffer,
+        asset.alt,
+        asset.href,
+        asset.active,
+        asset.durationMs,
+        asset.sortOrder,
+        asset.createdAt,
+        asset.createdAt
+      ]
+    );
+
+    created.push({
+      id: asset.id,
+      imageUrl: buildBannerImageUrl(asset.id),
+      alt: asset.alt,
+      href: asset.href,
+      active: asset.active,
+      durationMs: asset.durationMs,
+      sortOrder: asset.sortOrder,
+      createdAt: asset.createdAt,
+      updatedAt: asset.createdAt
+    });
+  }
+
+  return created;
+}
+
+async function updateBannerAssetMetadata(items = [], client = pool) {
+  const existing = await listBannerAssets(client);
+  const existingById = new Map(existing.map((item) => [item.id, item]));
+  const nextItems = [];
+
+  for (let index = 0; index < items.length; index += 1) {
+    const raw = items[index];
+    const id = String(raw?.id || "").trim();
+    const current = existingById.get(id);
+
+    if (!current) {
+      continue;
+    }
+
+    nextItems.push({
+      id,
+      alt: normalizeBannerAlt(raw?.alt || current.alt),
+      href: normalizeBannerHref(raw?.href || current.href),
+      active: raw?.active !== false,
+      durationMs: clampBannerDurationMs(raw?.durationMs || current.durationMs),
+      sortOrder: index
+    });
+  }
+
+  for (const item of nextItems) {
+    await client.query(
+      `
+      UPDATE banner_assets
+      SET alt_text = $2,
+          click_url = $3,
+          is_active = $4,
+          duration_ms = $5,
+          sort_order = $6,
+          updated_at = $7
+      WHERE id = $1
+      `,
+      [item.id, item.alt, item.href, item.active, item.durationMs, item.sortOrder, db()]
+    );
+  }
+}
+
+async function deleteBannerAsset(id, client = pool) {
+  const bannerId = String(id || "").trim();
+
+  if (!bannerId) return false;
+
+  const result = await client.query(
+    "DELETE FROM banner_assets WHERE id = $1",
+    [bannerId]
+  );
+
+  return result.rowCount > 0;
 }
 
 async function saveDeposito(dep, client = pool) {
@@ -3699,6 +4040,45 @@ app.get("/", (req, res) => {
   res.json({ ok: true });
 });
 
+app.get("/public/banner-config", async (req, res) => {
+  try {
+    const [settings, banners] = await Promise.all([
+      getBannerSettings(),
+      listBannerAssets(pool, { activeOnly: true })
+    ]);
+
+    res.set("Cache-Control", "no-store");
+    res.json({
+      rotationMs: settings.rotationMs,
+      banners
+    });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: "Erro ao carregar banners" });
+  }
+});
+
+app.get("/public/banner-images/:id", async (req, res) => {
+  try {
+    const banner = await getBannerAssetBinary(req.params.id);
+
+    if (!banner) {
+      return res.status(404).send("Banner nao encontrado");
+    }
+
+    if (banner.updatedAt) {
+      res.set("Last-Modified", new Date(banner.updatedAt).toUTCString());
+    }
+
+    res.set("Cache-Control", "public, max-age=300");
+    res.type(banner.mimeType);
+    res.send(banner.imageData);
+  } catch (error) {
+    console.error(error);
+    res.status(500).send("Erro ao carregar imagem");
+  }
+});
+
 app.post("/admin/login", adminLoginLimiter, async (req, res) => {
   try {
     const { email, senha } = req.body;
@@ -3729,6 +4109,163 @@ app.post("/admin/login", adminLoginLimiter, async (req, res) => {
   } catch (error) {
     console.error(error);
     res.status(500).json({ error: "Erro no login admin" });
+  }
+});
+
+app.get("/admin/banner-config", authAdmin, async (req, res) => {
+  try {
+    const [settings, banners] = await Promise.all([
+      getBannerSettings(),
+      listBannerAssets()
+    ]);
+
+    res.set("Cache-Control", "no-store");
+    res.json({
+      rotationMs: settings.rotationMs,
+      banners
+    });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: "Erro ao carregar configuracao de banners" });
+  }
+});
+
+app.post(
+  "/admin/banner-images/upload",
+  authAdmin,
+  bannerUpload.array("banners", 12),
+  async (req, res) => {
+    try {
+      const files = Array.isArray(req.files) ? req.files : [];
+
+      if (!files.length) {
+        return res.status(400).json({ error: "Nenhuma imagem enviada" });
+      }
+
+      const result = await runInTransaction(async (client) => {
+        const created = await createBannerAssets(files, client);
+
+        await createAuditLog(client, {
+          adminId: req.admin.sub,
+          action: "upload_banner_images",
+          targetType: "banner",
+          targetId: created.map((item) => item.id).join(","),
+          details: {
+            total: created.length
+          },
+          ipAddress: getRequestIp(req)
+        });
+
+        return created;
+      });
+
+      const [settings, banners] = await Promise.all([
+        getBannerSettings(),
+        listBannerAssets()
+      ]);
+
+      res.json({
+        message: "Banners enviados com sucesso",
+        uploaded: result,
+        rotationMs: settings.rotationMs,
+        banners
+      });
+    } catch (error) {
+      console.error(error);
+      res.status(500).json({ error: "Erro ao enviar banners" });
+    }
+  }
+);
+
+app.post("/admin/banner-images/delete", authAdmin, async (req, res) => {
+  try {
+    const bannerId = String(req.body?.id || "").trim();
+
+    if (!bannerId) {
+      return res.status(400).json({ error: "id obrigatorio" });
+    }
+
+    const deleted = await runInTransaction(async (client) => {
+      const removed = await deleteBannerAsset(bannerId, client);
+
+      if (!removed) {
+        throw new Error("Banner nao encontrado");
+      }
+
+      await createAuditLog(client, {
+        adminId: req.admin.sub,
+        action: "delete_banner_image",
+        targetType: "banner",
+        targetId: bannerId,
+        details: {},
+        ipAddress: getRequestIp(req)
+      });
+
+      return removed;
+    });
+
+    if (!deleted) {
+      return res.status(404).json({ error: "Banner nao encontrado" });
+    }
+
+    const [settings, banners] = await Promise.all([
+      getBannerSettings(),
+      listBannerAssets()
+    ]);
+
+    res.json({
+      message: "Banner removido com sucesso",
+      rotationMs: settings.rotationMs,
+      banners
+    });
+  } catch (error) {
+    console.error(error);
+    res.status(400).json({
+      error: error.message || "Erro ao remover banner"
+    });
+  }
+});
+
+app.post("/admin/banner-config", authAdmin, async (req, res) => {
+  try {
+    const banners = Array.isArray(req.body?.banners) ? req.body.banners : null;
+
+    if (!banners) {
+      return res.status(400).json({ error: "banners obrigatorio" });
+    }
+
+    const rotationMs = clampBannerRotationMs(req.body?.rotationMs);
+
+    await runInTransaction(async (client) => {
+      await updateBannerAssetMetadata(banners, client);
+      await setBannerSettings(rotationMs, client);
+
+      await createAuditLog(client, {
+        adminId: req.admin.sub,
+        action: "update_banner_config",
+        targetType: "banner_config",
+        targetId: BANNER_SETTINGS_ID,
+        details: {
+          total: banners.length,
+          rotationMs
+        },
+        ipAddress: getRequestIp(req)
+      });
+    });
+
+    const [settings, nextBanners] = await Promise.all([
+      getBannerSettings(),
+      listBannerAssets()
+    ]);
+
+    res.json({
+      message: "Configuracao de banners atualizada",
+      rotationMs: settings.rotationMs,
+      banners: nextBanners
+    });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: "Erro ao salvar configuracao de banners" });
   }
 });
 
