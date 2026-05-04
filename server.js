@@ -2175,6 +2175,34 @@ async function getBoundSigmoCardByHolderAndDevice(holderUserId, deviceId, client
   return mapSigmoCard(result.rows[0]);
 }
 
+async function getLatestAutoAssignableAdditionalSigmoCardByHolderForUpdate(
+  holderUserId,
+  client
+) {
+  const holderId = String(holderUserId || "").trim();
+
+  if (!holderId) {
+    return null;
+  }
+
+  const result = await client.query(
+    `
+    SELECT *
+    FROM sigmo_cards
+    WHERE holder_user_id = $1
+      AND card_type = 'additional'
+      AND status = 'active'
+      AND COALESCE(device_id, '') = ''
+    ORDER BY created_at DESC NULLS LAST, id DESC
+    LIMIT 1
+    FOR UPDATE
+    `,
+    [holderId]
+  );
+
+  return mapSigmoCard(result.rows[0]);
+}
+
 async function getSigmoCardsByHolder(holderUserId, client = pool) {
   const result = await client.query(
     `
@@ -2186,6 +2214,10 @@ async function getSigmoCardsByHolder(holderUserId, client = pool) {
     [String(holderUserId || "").trim()]
   );
   return result.rows.map(mapSigmoCard);
+}
+
+async function deleteSigmoCardById(id, client = pool) {
+  await client.query("DELETE FROM sigmo_cards WHERE id = $1", [String(id || "").trim()]);
 }
 
 async function saveSigmoCard(card, client = pool) {
@@ -2276,12 +2308,62 @@ async function ensurePrimarySigmoCard(user, client = pool) {
   return card;
 }
 
+async function autoBindAdditionalSigmoCardForDevice(holderUserId, deviceId, client = pool) {
+  const holderId = String(holderUserId || "").trim();
+  const normalizedDeviceId = String(deviceId || "").trim();
+
+  if (!holderId || !normalizedDeviceId) {
+    return null;
+  }
+
+  const execute = async (txClient) => {
+    const alreadyBound = await getBoundSigmoCardByHolderAndDevice(
+      holderId,
+      normalizedDeviceId,
+      txClient
+    );
+
+    if (alreadyBound) {
+      return alreadyBound;
+    }
+
+    const card = await getLatestAutoAssignableAdditionalSigmoCardByHolderForUpdate(
+      holderId,
+      txClient
+    );
+
+    if (!card) {
+      return null;
+    }
+
+    const nextCard = {
+      ...card,
+      deviceId: normalizedDeviceId,
+      boundAt: card.boundAt || db(),
+      updatedAt: db()
+    };
+
+    await saveSigmoCard(nextCard, txClient);
+    return nextCard;
+  };
+
+  if (client === pool) {
+    return runInTransaction((txClient) => execute(txClient));
+  }
+
+  return execute(client);
+}
+
 async function buildUserActiveCardResponse(user, deviceId, client = pool) {
   if (!user?.id || !String(deviceId || "").trim()) {
     return null;
   }
 
-  const card = await getBoundSigmoCardByHolderAndDevice(user.id, deviceId, client);
+  let card = await getBoundSigmoCardByHolderAndDevice(user.id, deviceId, client);
+
+  if (!card) {
+    card = await autoBindAdditionalSigmoCardForDevice(user.id, deviceId, client);
+  }
 
   if (!card) {
     return null;
@@ -4150,6 +4232,62 @@ app.post("/sigmo-cards/:id/reissue", async (req, res) => {
   }
 });
 
+app.post("/sigmo-cards/:id/delete", async (req, res) => {
+  try {
+    const ownerUserId = String(req.body?.userId || "").trim();
+
+    if (!ownerUserId) {
+      return sendJsonError(res, 400, "CARD_OWNER_REQUIRED", "Usuario nao informado");
+    }
+
+    const result = await runInTransaction(async (client) => {
+      const owner = await getUserByIdForUpdate(ownerUserId, client);
+      const card = await getSigmoCardByIdForUpdate(req.params.id, client);
+
+      if (!owner) {
+        return { statusCode: 404, code: "USER_NOT_FOUND", error: "Usuario nao encontrado" };
+      }
+
+      if (isContaBanida(owner)) {
+        return { statusCode: 403, payload: buildContaBanidaPayload(owner) };
+      }
+
+      if (!card || card.ownerUserId !== owner.id) {
+        return { statusCode: 404, code: "CARD_NOT_FOUND", error: "Cartao nao encontrado" };
+      }
+
+      if (card.cardType === "primary") {
+        return {
+          statusCode: 400,
+          code: "CARD_PRIMARY_DELETE_FORBIDDEN",
+          error: "O cartao principal nao pode ser deletado"
+        };
+      }
+
+      await deleteSigmoCardById(card.id, client);
+
+      return {
+        deletedCardId: card.id
+      };
+    });
+
+    if (result?.statusCode) {
+      if (result.payload) {
+        return res.status(result.statusCode).json(result.payload);
+      }
+      return sendJsonError(res, result.statusCode, result.code, result.error);
+    }
+
+    res.json({
+      ok: true,
+      deletedCardId: result.deletedCardId
+    });
+  } catch (error) {
+    console.error(error);
+    sendJsonError(res, 500, "CARD_DELETE_ERROR", "Erro ao deletar cartao");
+  }
+});
+
 app.get("/mobile/card", authUser, async (req, res) => {
   try {
     const user = await getUserById(req.userAuth.sub);
@@ -4307,6 +4445,81 @@ app.post("/mobile/cards/claim", authUser, async (req, res) => {
   } catch (error) {
     console.error(error);
     sendJsonError(res, 500, "CARD_CLAIM_ERROR", "Erro ao liberar cartao neste aparelho");
+  }
+});
+
+app.post("/mobile/cards/:id/delete", authUser, async (req, res) => {
+  try {
+    const deviceId = String(req.deviceId || "").trim();
+    const cardId = String(req.params.id || "").trim();
+
+    if (!cardId) {
+      return sendJsonError(res, 400, "CARD_ID_REQUIRED", "Cartao nao informado");
+    }
+
+    const result = await runInTransaction(async (client) => {
+      const holder = await getUserByIdForUpdate(req.userAuth.sub, client);
+      const card = await getSigmoCardByIdForUpdate(cardId, client);
+
+      if (!holder) {
+        return { statusCode: 404, code: "USER_NOT_FOUND", error: "Usuario nao encontrado" };
+      }
+
+      if (isContaBanida(holder)) {
+        return { statusCode: 403, payload: buildContaBanidaPayload(holder) };
+      }
+
+      if (!card) {
+        return { statusCode: 404, code: "CARD_NOT_FOUND", error: "Cartao nao encontrado" };
+      }
+
+      if (card.holderUserId !== holder.id) {
+        return {
+          statusCode: 403,
+          code: "CARD_HOLDER_MISMATCH",
+          error: "Este cartao nao pertence a esta conta"
+        };
+      }
+
+      if (card.cardType === "primary") {
+        return {
+          statusCode: 400,
+          code: "CARD_PRIMARY_DELETE_FORBIDDEN",
+          error: "O cartao principal nao pode ser deletado neste app"
+        };
+      }
+
+      if (deviceId && String(card.deviceId || "").trim() && String(card.deviceId || "").trim() !== deviceId) {
+        return {
+          statusCode: 409,
+          code: "CARD_DEVICE_MISMATCH",
+          error: "Este cartao esta liberado em outro aparelho"
+        };
+      }
+
+      await deleteSigmoCardById(card.id, client);
+
+      return {
+        deletedCardId: card.id,
+        user: await buildUserPublicResponseWithPix(holder, client, { deviceId })
+      };
+    });
+
+    if (result?.statusCode) {
+      if (result.payload) {
+        return res.status(result.statusCode).json(result.payload);
+      }
+      return sendJsonError(res, result.statusCode, result.code, result.error);
+    }
+
+    res.json({
+      ok: true,
+      deletedCardId: result.deletedCardId,
+      user: result.user
+    });
+  } catch (error) {
+    console.error(error);
+    sendJsonError(res, 500, "MOBILE_CARD_DELETE_ERROR", "Erro ao deletar cartao");
   }
 });
 
