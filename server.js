@@ -1447,7 +1447,11 @@ async function ensureAdmin() {
   }
 }
 
-app.use(helmet());
+app.use(
+  helmet({
+    crossOriginResourcePolicy: false
+  })
+);
 app.use(express.json());
 
 app.use(
@@ -4071,6 +4075,7 @@ app.get("/public/banner-images/:id", async (req, res) => {
     }
 
     res.set("Cache-Control", "public, max-age=300");
+    res.set("Cross-Origin-Resource-Policy", "cross-origin");
     res.type(banner.mimeType);
     res.send(banner.imageData);
   } catch (error) {
