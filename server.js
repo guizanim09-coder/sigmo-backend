@@ -42,6 +42,15 @@ const LIMITE_SAQUE_PIX_MAX = Number(process.env.LIMITE_SAQUE_PIX_MAX || 5900);
 const TAXA_SAQUE_PIX_PERCENTUAL = Number(
   process.env.TAXA_SAQUE_PIX_PERCENTUAL || 0.10
 );
+const TAXA_RECARGA_CELULAR_PERCENTUAL = Number(
+  process.env.TAXA_RECARGA_CELULAR_PERCENTUAL || 0.10
+);
+const LIMITE_RECARGA_CELULAR_MIN = Number(
+  process.env.LIMITE_RECARGA_CELULAR_MIN || 10
+);
+const LIMITE_RECARGA_CELULAR_MAX = Number(
+  process.env.LIMITE_RECARGA_CELULAR_MAX || 300
+);
 const COMPROVANTE_UPLOAD_WINDOW_MINUTES = Number(
   process.env.COMPROVANTE_UPLOAD_WINDOW_MINUTES || 60
 );
@@ -81,6 +90,21 @@ const BANNER_IMAGE_MAX_BYTES = 10 * 1024 * 1024;
 const STATUS_CONTA_ATIVA = "ativa";
 const STATUS_CONTA_BANIDA = "banida";
 const MOTIVO_BANIMENTO_FRAUDE_BONUS = "tentativa_fraude_bonus";
+const RECARGA_CELULAR_OPERADORAS = [
+  { id: "tim", label: "TIM" },
+  { id: "claro", label: "Claro" },
+  { id: "vivo", label: "Vivo" }
+];
+const RECARGA_CELULAR_OPERADORAS_IDS = new Set(
+  RECARGA_CELULAR_OPERADORAS.map((item) => item.id)
+);
+const RECARGA_CELULAR_OPERADORAS_LABELS = RECARGA_CELULAR_OPERADORAS.reduce(
+  (acc, item) => {
+    acc[item.id] = item.label;
+    return acc;
+  },
+  {}
+);
 
 if (!DATABASE_URL) {
   console.error("DATABASE_URL não configurada.");
@@ -262,6 +286,7 @@ async function createDatabaseBackup(trigger = "automatic") {
       const [
         usuarios,
         depositos,
+        recargasCelular,
         admins,
         financialTransactions,
         ledgerEntries,
@@ -269,6 +294,9 @@ async function createDatabaseBackup(trigger = "automatic") {
       ] = await Promise.all([
         client.query("SELECT * FROM usuarios ORDER BY criado_em ASC NULLS LAST, id ASC"),
         client.query("SELECT * FROM depositos ORDER BY criado_em ASC NULLS LAST, id ASC"),
+        client.query(
+          "SELECT * FROM topup_orders ORDER BY criado_em ASC NULLS LAST, id ASC"
+        ),
         client.query("SELECT * FROM admins ORDER BY criado_em ASC NULLS LAST, id ASC"),
         client.query(
           "SELECT * FROM financial_transactions ORDER BY created_at ASC NULLS LAST, id ASC"
@@ -286,10 +314,11 @@ async function createDatabaseBackup(trigger = "automatic") {
         meta: {
           generatedAt: now.toISOString(),
           trigger,
-          version: 2,
+          version: 3,
           tables: {
             usuarios: usuarios.rowCount,
             depositos: depositos.rowCount,
+            topup_orders: recargasCelular.rowCount,
             admins: admins.rowCount,
             financial_transactions: financialTransactions.rowCount,
             ledger_entries: ledgerEntries.rowCount,
@@ -299,6 +328,7 @@ async function createDatabaseBackup(trigger = "automatic") {
         data: {
           usuarios: usuarios.rows,
           depositos: depositos.rows,
+          topup_orders: recargasCelular.rows,
           admins: admins.rows,
           financial_transactions: financialTransactions.rows,
           ledger_entries: ledgerEntries.rows,
@@ -437,6 +467,12 @@ function isValidTransactionPin(value) {
   return /^\d{4}$/.test(normalizeTransactionPin(value));
 }
 
+function normalizeDigits(value, maxLength = 32) {
+  return String(value || "")
+    .replace(/\D/g, "")
+    .slice(0, Math.max(0, Number(maxLength || 0) || 0));
+}
+
 function normalizeEmail(email) {
   return String(email || "").trim().toLowerCase();
 }
@@ -455,6 +491,87 @@ function isContaBanida(user) {
 
 function getMensagemContaBanida() {
   return "Conta banida permanentemente por tentativa de fraude. Esta acao e irreversivel e o saldo ficou congelado.";
+}
+
+function normalizeRecargaCelularOperadora(value) {
+  const normalized = String(value || "").trim().toLowerCase();
+  return RECARGA_CELULAR_OPERADORAS_IDS.has(normalized) ? normalized : "";
+}
+
+function getRecargaCelularOperadoraLabel(value) {
+  const normalized = normalizeRecargaCelularOperadora(value);
+  return RECARGA_CELULAR_OPERADORAS_LABELS[normalized] || String(value || "").trim();
+}
+
+function normalizeRecargaCelularStatus(value) {
+  const normalized = String(value || "").trim().toLowerCase();
+  if (["pendente", "aprovado", "recusado"].includes(normalized)) {
+    return normalized;
+  }
+  return "pendente";
+}
+
+function normalizeRecargaCelularDdd(value) {
+  return normalizeDigits(value, 2);
+}
+
+function normalizeRecargaCelularNumero(value) {
+  return normalizeDigits(value, 9);
+}
+
+function isValidRecargaCelularTelefone(ddd, numero) {
+  return /^\d{2}$/.test(ddd) && /^\d{8,9}$/.test(numero);
+}
+
+function buildRecargaCelularTelefone(ddd, numero) {
+  const normalizedDdd = normalizeRecargaCelularDdd(ddd);
+  const normalizedNumero = normalizeRecargaCelularNumero(numero);
+  return `${normalizedDdd}${normalizedNumero}`;
+}
+
+function formatRecargaCelularTelefone(ddd, numero) {
+  const normalizedDdd = normalizeRecargaCelularDdd(ddd);
+  const normalizedNumero = normalizeRecargaCelularNumero(numero);
+
+  if (!normalizedDdd && !normalizedNumero) {
+    return "";
+  }
+
+  return `(${normalizedDdd}) ${normalizedNumero}`;
+}
+
+function normalizeRecargaCelularMotivoRecusa(value) {
+  return String(value || "")
+    .trim()
+    .replace(/\s+/g, " ")
+    .slice(0, 220);
+}
+
+function calcularDetalhesRecargaCelular(valorRecarga) {
+  const valor = toMoney(valorRecarga);
+  const taxa = toMoney(valor * TAXA_RECARGA_CELULAR_PERCENTUAL);
+  const valorTotalDebitado = toMoney(valor + taxa);
+
+  return {
+    valorRecarga: valor,
+    taxaValor: taxa,
+    valorTotalDebitado
+  };
+}
+
+function montarDescricaoRecargaCelular(recarga = {}) {
+  const operadoraLabel = getRecargaCelularOperadoraLabel(recarga.operadora);
+  const telefone = formatRecargaCelularTelefone(recarga.ddd, recarga.numero);
+
+  return [
+    `Recarga ${operadoraLabel}`.trim(),
+    telefone ? `para ${telefone}` : "",
+    `| Valor da recarga: R$${toMoney(recarga.valorRecarga).toFixed(2)}`,
+    `| Taxa: R$${toMoney(recarga.taxaValor).toFixed(2)}`,
+    `| Total debitado: R$${toMoney(recarga.valorTotalDebitado).toFixed(2)}`
+  ]
+    .filter(Boolean)
+    .join(" ");
 }
 
 function buildContaBanidaPayload(user, code = "ACCOUNT_BANNED") {
@@ -1279,6 +1396,32 @@ await ensureColumn("depositos", "comprovante_texto", "TEXT DEFAULT ''");
   `);
 
   await pool.query(`
+    CREATE TABLE IF NOT EXISTS topup_orders (
+      id TEXT PRIMARY KEY,
+      user_id TEXT NOT NULL,
+      operadora TEXT NOT NULL,
+      ddd TEXT NOT NULL DEFAULT '',
+      numero TEXT NOT NULL DEFAULT '',
+      telefone TEXT NOT NULL DEFAULT '',
+      valor_recarga NUMERIC NOT NULL DEFAULT 0,
+      taxa_valor NUMERIC NOT NULL DEFAULT 0,
+      valor_total_debitado NUMERIC NOT NULL DEFAULT 0,
+      bonus_debitado NUMERIC NOT NULL DEFAULT 0,
+      real_debitado NUMERIC NOT NULL DEFAULT 0,
+      status TEXT NOT NULL DEFAULT 'pendente',
+      motivo_recusa TEXT DEFAULT '',
+      financial_transaction_id_debito TEXT DEFAULT '',
+      financial_transaction_id_estorno TEXT DEFAULT '',
+      admin_id TEXT DEFAULT '',
+      criado_em TIMESTAMP,
+      atualizado_em TIMESTAMP,
+      aprovado_em TIMESTAMP,
+      recusado_em TIMESTAMP,
+      estornado_em TIMESTAMP
+    );
+  `);
+
+  await pool.query(`
     CREATE TABLE IF NOT EXISTS nfc_receive_sessions (
       id TEXT PRIMARY KEY,
       public_token TEXT UNIQUE NOT NULL,
@@ -1352,6 +1495,16 @@ await ensureColumn("depositos", "comprovante_texto", "TEXT DEFAULT ''");
   await ensureIndex(
     "idx_audit_logs_admin_id",
     "CREATE INDEX idx_audit_logs_admin_id ON audit_logs (admin_id)"
+  );
+
+  await ensureIndex(
+    "idx_topup_orders_user_id",
+    "CREATE INDEX idx_topup_orders_user_id ON topup_orders (user_id)"
+  );
+
+  await ensureIndex(
+    "idx_topup_orders_status",
+    "CREATE INDEX idx_topup_orders_status ON topup_orders (status)"
   );
 
   await ensureIndex(
@@ -1870,6 +2023,56 @@ comprovanteUrl: row.comprovante_url || "",
     aprovadoEm: row.aprovado_em || null,
     recusadoEm: row.recusado_em || null,
     comprovanteEnviadoEm: row.comprovante_enviado_em || null
+  };
+}
+
+function mapRecargaCelularPedido(row) {
+  if (!row) return null;
+
+  const operadora = normalizeRecargaCelularOperadora(row.operadora);
+  const ddd = normalizeRecargaCelularDdd(row.ddd);
+  const numero = normalizeRecargaCelularNumero(row.numero);
+
+  return {
+    id: row.id,
+    userId: row.user_id,
+    operadora,
+    operadoraLabel: getRecargaCelularOperadoraLabel(operadora),
+    ddd,
+    numero,
+    telefone: buildRecargaCelularTelefone(ddd, numero),
+    telefoneFormatado: formatRecargaCelularTelefone(ddd, numero),
+    valorRecarga: toMoney(row.valor_recarga),
+    taxaValor: toMoney(row.taxa_valor),
+    valorTotalDebitado: toMoney(row.valor_total_debitado),
+    bonusDebitado: toMoney(row.bonus_debitado),
+    realDebitado: toMoney(row.real_debitado),
+    status: normalizeRecargaCelularStatus(row.status),
+    motivoRecusa: row.motivo_recusa || "",
+    financialTransactionIdDebito: row.financial_transaction_id_debito || "",
+    financialTransactionIdEstorno: row.financial_transaction_id_estorno || "",
+    adminId: row.admin_id || "",
+    criadoEm: row.criado_em || null,
+    atualizadoEm: row.atualizado_em || null,
+    aprovadoEm: row.aprovado_em || null,
+    recusadoEm: row.recusado_em || null,
+    estornadoEm: row.estornado_em || null,
+    descricao: montarDescricaoRecargaCelular({
+      operadora,
+      ddd,
+      numero,
+      valorRecarga: row.valor_recarga,
+      taxaValor: row.taxa_valor,
+      valorTotalDebitado: row.valor_total_debitado
+    }),
+    user:
+      row.user_email || row.user_nome
+        ? {
+            id: row.user_id,
+            nome: row.user_nome || row.user_email?.split("@")[0] || "",
+            email: row.user_email || ""
+          }
+        : null
   };
 }
 
@@ -2951,6 +3154,121 @@ async function saveDeposito(dep, client = pool) {
   );
 }
 
+async function saveRecargaCelularPedido(pedido, client = pool) {
+  const operadora = normalizeRecargaCelularOperadora(pedido.operadora);
+  const ddd = normalizeRecargaCelularDdd(pedido.ddd);
+  const numero = normalizeRecargaCelularNumero(pedido.numero);
+  const status = normalizeRecargaCelularStatus(pedido.status);
+
+  await client.query(
+    `
+    INSERT INTO topup_orders (
+      id, user_id, operadora, ddd, numero, telefone, valor_recarga, taxa_valor,
+      valor_total_debitado, bonus_debitado, real_debitado, status, motivo_recusa,
+      financial_transaction_id_debito, financial_transaction_id_estorno, admin_id,
+      criado_em, atualizado_em, aprovado_em, recusado_em, estornado_em
+    )
+    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21)
+    ON CONFLICT (id) DO UPDATE SET
+      user_id = EXCLUDED.user_id,
+      operadora = EXCLUDED.operadora,
+      ddd = EXCLUDED.ddd,
+      numero = EXCLUDED.numero,
+      telefone = EXCLUDED.telefone,
+      valor_recarga = EXCLUDED.valor_recarga,
+      taxa_valor = EXCLUDED.taxa_valor,
+      valor_total_debitado = EXCLUDED.valor_total_debitado,
+      bonus_debitado = EXCLUDED.bonus_debitado,
+      real_debitado = EXCLUDED.real_debitado,
+      status = EXCLUDED.status,
+      motivo_recusa = EXCLUDED.motivo_recusa,
+      financial_transaction_id_debito = EXCLUDED.financial_transaction_id_debito,
+      financial_transaction_id_estorno = EXCLUDED.financial_transaction_id_estorno,
+      admin_id = EXCLUDED.admin_id,
+      criado_em = COALESCE(topup_orders.criado_em, EXCLUDED.criado_em),
+      atualizado_em = EXCLUDED.atualizado_em,
+      aprovado_em = EXCLUDED.aprovado_em,
+      recusado_em = EXCLUDED.recusado_em,
+      estornado_em = EXCLUDED.estornado_em
+    `,
+    [
+      pedido.id,
+      pedido.userId,
+      operadora,
+      ddd,
+      numero,
+      buildRecargaCelularTelefone(ddd, numero),
+      toMoney(pedido.valorRecarga),
+      toMoney(pedido.taxaValor),
+      toMoney(pedido.valorTotalDebitado),
+      toMoney(pedido.bonusDebitado),
+      toMoney(pedido.realDebitado),
+      status,
+      normalizeRecargaCelularMotivoRecusa(pedido.motivoRecusa),
+      String(pedido.financialTransactionIdDebito || "").trim(),
+      String(pedido.financialTransactionIdEstorno || "").trim(),
+      String(pedido.adminId || "").trim(),
+      pedido.criadoEm || db(),
+      pedido.atualizadoEm || db(),
+      pedido.aprovadoEm || null,
+      pedido.recusadoEm || null,
+      pedido.estornadoEm || null
+    ]
+  );
+}
+
+async function getRecargaCelularPedidoById(id, client = pool) {
+  const result = await client.query(
+    "SELECT * FROM topup_orders WHERE id = $1 LIMIT 1",
+    [String(id || "").trim()]
+  );
+  return mapRecargaCelularPedido(result.rows[0]);
+}
+
+async function getRecargaCelularPedidoByIdForUpdate(id, client) {
+  const result = await client.query(
+    "SELECT * FROM topup_orders WHERE id = $1 LIMIT 1 FOR UPDATE",
+    [String(id || "").trim()]
+  );
+  return mapRecargaCelularPedido(result.rows[0]);
+}
+
+async function listRecargaCelularPedidosByUser(userId, client = pool) {
+  const result = await client.query(
+    `
+    SELECT *
+    FROM topup_orders
+    WHERE user_id = $1
+    ORDER BY criado_em DESC NULLS LAST, id DESC
+    `,
+    [String(userId || "").trim()]
+  );
+
+  return result.rows.map(mapRecargaCelularPedido);
+}
+
+async function listRecargaCelularPedidos(status = "", client = pool) {
+  const rawStatus = String(status || "").trim().toLowerCase();
+  const shouldFilter = ["pendente", "aprovado", "recusado"].includes(rawStatus);
+  const whereSql = shouldFilter ? "WHERE t.status = $1" : "";
+  const params = shouldFilter ? [rawStatus] : [];
+  const result = await client.query(
+    `
+    SELECT
+      t.*,
+      u.nome AS user_nome,
+      u.email AS user_email
+    FROM topup_orders t
+    LEFT JOIN usuarios u ON u.id = t.user_id
+    ${whereSql}
+    ORDER BY t.criado_em DESC NULLS LAST, t.id DESC
+    `,
+    params
+  );
+
+  return result.rows.map(mapRecargaCelularPedido);
+}
+
 async function getAdminByEmail(email) {
   const result = await pool.query(
     "SELECT * FROM admins WHERE email = $1 LIMIT 1",
@@ -3103,6 +3421,16 @@ function computeUserFinancialContext(transactions, currentBalance = 0) {
       ) {
         saldoBonusAtual = toMoney(saldoBonusAtual + amount);
         continue;
+      }
+
+      if (tx.sourceType === "topup_order" && tx.operationType === "topup_refund") {
+        const split = getBalanceSplitFromMetadata(tx.metadata, amount);
+
+        if (split) {
+          saldoBonusAtual = toMoney(saldoBonusAtual + split.bonusAmount);
+          saldoRealAtual = toMoney(saldoRealAtual + split.realAmount);
+          continue;
+        }
       }
 
       if (tx.sourceType === "transfer" && tx.operationType === "transfer_in") {
@@ -4042,6 +4370,15 @@ function authUser(req, res, next) {
 
 app.get("/", (req, res) => {
   res.json({ ok: true });
+});
+
+app.get("/public/topup-config", async (req, res) => {
+  res.json({
+    operadoras: RECARGA_CELULAR_OPERADORAS,
+    taxaPercentual: TAXA_RECARGA_CELULAR_PERCENTUAL,
+    valorMinimo: LIMITE_RECARGA_CELULAR_MIN,
+    valorMaximo: LIMITE_RECARGA_CELULAR_MAX
+  });
 });
 
 app.get("/public/banner-config", async (req, res) => {
@@ -5449,6 +5786,7 @@ app.post("/usuario/delete", async (req, res) => {
 
     await runInTransaction(async (client) => {
       await client.query("DELETE FROM depositos WHERE user_id = $1", [userId]);
+      await client.query("DELETE FROM topup_orders WHERE user_id = $1", [userId]);
       await client.query("DELETE FROM financial_transactions WHERE user_id = $1", [userId]);
       await client.query("DELETE FROM ledger_entries WHERE user_id = $1", [userId]);
       await client.query("DELETE FROM audit_logs WHERE target_id = $1", [userId]);
@@ -5695,6 +6033,149 @@ app.get("/depositos/user/:id", async (req, res) => {
   } catch (error) {
     console.error(error);
     res.status(500).json({ error: "Erro ao buscar depósitos do usuário" });
+  }
+});
+
+app.get("/topups/user/:id", async (req, res) => {
+  try {
+    const lista = await listRecargaCelularPedidosByUser(req.params.id);
+    res.json(lista);
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: "Erro ao buscar recargas do usuÃ¡rio" });
+  }
+});
+
+app.post("/topups", async (req, res) => {
+  try {
+    const { userId, operadora, ddd, numero, valorRecarga } = req.body;
+    const operadoraNormalizada = normalizeRecargaCelularOperadora(operadora);
+    const dddNormalizado = normalizeRecargaCelularDdd(ddd);
+    const numeroNormalizado = normalizeRecargaCelularNumero(numero);
+    const detalhes = calcularDetalhesRecargaCelular(valorRecarga);
+
+    if (!userId || !operadoraNormalizada || !dddNormalizado || !numeroNormalizado) {
+      return res.status(400).json({ error: "Dados obrigatÃ³rios para a recarga" });
+    }
+
+    if (!isValidRecargaCelularTelefone(dddNormalizado, numeroNormalizado)) {
+      return res.status(400).json({ error: "DDD ou nÃºmero de celular invÃ¡lido" });
+    }
+
+    if (
+      !Number.isFinite(detalhes.valorRecarga) ||
+      detalhes.valorRecarga < LIMITE_RECARGA_CELULAR_MIN ||
+      detalhes.valorRecarga > LIMITE_RECARGA_CELULAR_MAX
+    ) {
+      return res.status(400).json({
+        error: `Recarga disponÃ­vel entre R$${LIMITE_RECARGA_CELULAR_MIN.toFixed(2)} e R$${LIMITE_RECARGA_CELULAR_MAX.toFixed(2)}`
+      });
+    }
+
+    const result = await runInTransaction(async (client) => {
+      const user = await getUserByIdForUpdate(userId, client);
+
+      if (!user) {
+        throw new Error("UsuÃ¡rio nÃ£o encontrado");
+      }
+
+      if (isContaBanida(user)) {
+        const error = new Error(getMensagemContaBanida());
+        error.statusCode = 403;
+        error.payload = buildContaBanidaPayload(user);
+        throw error;
+      }
+
+      if (toMoney(user.saldo) < detalhes.valorTotalDebitado) {
+        throw new Error("Saldo insuficiente");
+      }
+
+      const contexto = await getUserFinancialContext(user, client);
+      const bonusDebitado = Math.min(
+        toMoney(contexto.saldoBonusAtual),
+        detalhes.valorTotalDebitado
+      );
+      const realDebitado = toMoney(detalhes.valorTotalDebitado - bonusDebitado);
+      const pedidoId = buildId("topup");
+      const now = db();
+      const pedido = {
+        id: pedidoId,
+        userId: user.id,
+        operadora: operadoraNormalizada,
+        ddd: dddNormalizado,
+        numero: numeroNormalizado,
+        valorRecarga: detalhes.valorRecarga,
+        taxaValor: detalhes.taxaValor,
+        valorTotalDebitado: detalhes.valorTotalDebitado,
+        bonusDebitado,
+        realDebitado,
+        status: "pendente",
+        motivoRecusa: "",
+        financialTransactionIdDebito: "",
+        financialTransactionIdEstorno: "",
+        adminId: "",
+        criadoEm: now,
+        atualizadoEm: now,
+        aprovadoEm: null,
+        recusadoEm: null,
+        estornadoEm: null
+      };
+      const descricao = montarDescricaoRecargaCelular(pedido);
+      const metadataBase = {
+        operadora: operadoraNormalizada,
+        operadoraLabel: getRecargaCelularOperadoraLabel(operadoraNormalizada),
+        ddd: dddNormalizado,
+        numero: numeroNormalizado,
+        telefone: buildRecargaCelularTelefone(dddNormalizado, numeroNormalizado),
+        valorRecarga: detalhes.valorRecarga,
+        taxaValor: detalhes.taxaValor,
+        bonusAmount: bonusDebitado,
+        realAmount: realDebitado
+      };
+
+      const financialTx = await createFinancialTransaction(client, {
+        userId: user.id,
+        referenceKey: `topup:${pedidoId}:debit`,
+        sourceType: "topup_order",
+        sourceId: pedidoId,
+        operationType: "topup_purchase",
+        direction: "debit",
+        amount: detalhes.valorTotalDebitado,
+        status: "completed",
+        description: descricao,
+        metadata: metadataBase
+      });
+
+      const usuarioAtualizado = await applyLedgerChange(client, {
+        userId: user.id,
+        financialTransactionId: financialTx.id,
+        entryType: "debit",
+        amount: detalhes.valorTotalDebitado,
+        description: descricao,
+        metadata: {
+          pedidoId,
+          ...metadataBase
+        }
+      });
+
+      pedido.financialTransactionIdDebito = financialTx.id;
+      await saveRecargaCelularPedido(pedido, client);
+
+      return {
+        pedido: await getRecargaCelularPedidoById(pedido.id, client),
+        saldoAtual: toMoney(usuarioAtualizado.saldo)
+      };
+    });
+
+    res.status(201).json(result);
+  } catch (error) {
+    console.error(error);
+
+    if (error?.statusCode && error?.payload) {
+      return res.status(error.statusCode).json(error.payload);
+    }
+
+    res.status(400).json({ error: error.message || "Erro ao criar recarga" });
   }
 });
 
@@ -6552,6 +7033,190 @@ app.post("/nfc/pay", authUser, async (req, res) => {
     res
       .status(error.statusCode || 400)
       .json(error.payload || { code: "NFC_PAY_ERROR", error: error.message || "Erro no pagamento NFC" });
+  }
+});
+
+app.get("/admin/topups", authAdmin, async (req, res) => {
+  try {
+    const lista = await listRecargaCelularPedidos(String(req.query.status || ""));
+    res.json(lista);
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: "Erro ao buscar recargas" });
+  }
+});
+
+app.post("/admin/topups/:id/approve", authAdmin, async (req, res) => {
+  try {
+    const topupId = String(req.params.id || "").trim();
+
+    if (!topupId) {
+      return res.status(400).json({ error: "Pedido de recarga obrigatÃ³rio" });
+    }
+
+    const result = await runInTransaction(async (client) => {
+      const pedido = await getRecargaCelularPedidoByIdForUpdate(topupId, client);
+
+      if (!pedido) {
+        throw new Error("Pedido de recarga nÃ£o encontrado");
+      }
+
+      if (pedido.status === "aprovado") {
+        throw new Error("Pedido de recarga jÃ¡ aprovado");
+      }
+
+      if (pedido.status === "recusado") {
+        throw new Error("Pedido de recarga jÃ¡ recusado");
+      }
+
+      const now = db();
+      pedido.status = "aprovado";
+      pedido.adminId = req.admin.sub;
+      pedido.aprovadoEm = now;
+      pedido.atualizadoEm = now;
+
+      await saveRecargaCelularPedido(pedido, client);
+
+      await createAuditLog(client, {
+        adminId: req.admin.sub,
+        action: "approve_topup_order",
+        targetType: "topup_order",
+        targetId: pedido.id,
+        details: {
+          userId: pedido.userId,
+          operadora: pedido.operadora,
+          ddd: pedido.ddd,
+          numero: pedido.numero,
+          valorRecarga: pedido.valorRecarga,
+          valorTotalDebitado: pedido.valorTotalDebitado
+        },
+        ipAddress: getRequestIp(req)
+      });
+
+      return {
+        pedido: await getRecargaCelularPedidoById(pedido.id, client)
+      };
+    });
+
+    res.json({
+      message: "Recarga aprovada com sucesso",
+      pedido: result.pedido
+    });
+  } catch (error) {
+    console.error(error);
+    res.status(400).json({ error: error.message || "Erro ao aprovar recarga" });
+  }
+});
+
+app.post("/admin/topups/:id/refuse", authAdmin, async (req, res) => {
+  try {
+    const topupId = String(req.params.id || "").trim();
+    const motivoRecusa = normalizeRecargaCelularMotivoRecusa(req.body?.motivoRecusa);
+
+    if (!topupId) {
+      return res.status(400).json({ error: "Pedido de recarga obrigatÃ³rio" });
+    }
+
+    if (!motivoRecusa) {
+      return res.status(400).json({ error: "Motivo da recusa obrigatÃ³rio" });
+    }
+
+    const result = await runInTransaction(async (client) => {
+      const pedido = await getRecargaCelularPedidoByIdForUpdate(topupId, client);
+
+      if (!pedido) {
+        throw new Error("Pedido de recarga nÃ£o encontrado");
+      }
+
+      if (pedido.status === "aprovado") {
+        throw new Error("Pedido de recarga jÃ¡ aprovado");
+      }
+
+      if (pedido.status === "recusado") {
+        throw new Error("Pedido de recarga jÃ¡ recusado");
+      }
+
+      const now = db();
+      const descricaoEstorno = `Estorno ${montarDescricaoRecargaCelular(pedido)}`;
+      const metadataBase = {
+        operadora: pedido.operadora,
+        operadoraLabel: getRecargaCelularOperadoraLabel(pedido.operadora),
+        ddd: pedido.ddd,
+        numero: pedido.numero,
+        telefone: pedido.telefone,
+        valorRecarga: pedido.valorRecarga,
+        taxaValor: pedido.taxaValor,
+        motivoRecusa,
+        bonusAmount: pedido.bonusDebitado,
+        realAmount: pedido.realDebitado
+      };
+
+      const financialTx = await createFinancialTransaction(client, {
+        userId: pedido.userId,
+        referenceKey: `topup:${pedido.id}:refund`,
+        sourceType: "topup_order",
+        sourceId: pedido.id,
+        operationType: "topup_refund",
+        direction: "credit",
+        amount: pedido.valorTotalDebitado,
+        status: "completed",
+        description: descricaoEstorno,
+        metadata: metadataBase
+      });
+
+      const usuarioAtualizado = await applyLedgerChange(client, {
+        userId: pedido.userId,
+        financialTransactionId: financialTx.id,
+        entryType: "credit",
+        amount: pedido.valorTotalDebitado,
+        description: descricaoEstorno,
+        metadata: {
+          pedidoId: pedido.id,
+          ...metadataBase
+        }
+      });
+
+      pedido.status = "recusado";
+      pedido.motivoRecusa = motivoRecusa;
+      pedido.adminId = req.admin.sub;
+      pedido.financialTransactionIdEstorno = financialTx.id;
+      pedido.recusadoEm = now;
+      pedido.estornadoEm = now;
+      pedido.atualizadoEm = now;
+
+      await saveRecargaCelularPedido(pedido, client);
+
+      await createAuditLog(client, {
+        adminId: req.admin.sub,
+        action: "refuse_topup_order",
+        targetType: "topup_order",
+        targetId: pedido.id,
+        details: {
+          userId: pedido.userId,
+          operadora: pedido.operadora,
+          ddd: pedido.ddd,
+          numero: pedido.numero,
+          valorRecarga: pedido.valorRecarga,
+          valorTotalDebitado: pedido.valorTotalDebitado,
+          motivoRecusa
+        },
+        ipAddress: getRequestIp(req)
+      });
+
+      return {
+        pedido: await getRecargaCelularPedidoById(pedido.id, client),
+        saldoAtual: toMoney(usuarioAtualizado.saldo)
+      };
+    });
+
+    res.json({
+      message: "Recarga recusada e estornada com sucesso",
+      pedido: result.pedido,
+      saldoAtual: result.saldoAtual
+    });
+  } catch (error) {
+    console.error(error);
+    res.status(400).json({ error: error.message || "Erro ao recusar recarga" });
   }
 });
 
