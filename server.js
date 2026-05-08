@@ -547,6 +547,13 @@ function normalizeRecargaCelularMotivoRecusa(value) {
     .slice(0, 220);
 }
 
+function normalizeRecargaCelularClientRequestId(value) {
+  return String(value || "")
+    .trim()
+    .replace(/[^A-Za-z0-9_-]/g, "")
+    .slice(0, 72);
+}
+
 function calcularDetalhesRecargaCelular(valorRecarga) {
   const valor = toMoney(valorRecarga);
   const taxa = toMoney(valor * TAXA_RECARGA_CELULAR_PERCENTUAL);
@@ -1849,6 +1856,15 @@ function buildUserMobileAuthResponse(user, token, extras = {}) {
     tokenTtl: USER_MOBILE_TOKEN_TTL,
     user,
     ...extras
+  };
+}
+
+function attachUserAuthToPayload(payload, token) {
+  return {
+    ...payload,
+    authToken: token,
+    authTokenType: "Bearer",
+    authTokenTtl: USER_MOBILE_TOKEN_TTL
   };
 }
 
@@ -4021,19 +4037,6 @@ async function createFinancialTransaction(
     metadata = {}
   }
 ) {
-  const existing = await client.query(
-    `
-    SELECT * FROM financial_transactions
-    WHERE reference_key = $1
-    LIMIT 1
-    `,
-    [referenceKey]
-  );
-
-  if (existing.rows.length > 0) {
-    return mapFinancialTransaction(existing.rows[0]);
-  }
-
   const now = db();
   const result = await client.query(
     `
@@ -4043,6 +4046,8 @@ async function createFinancialTransaction(
       created_at, updated_at
     )
     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+    ON CONFLICT (reference_key) DO UPDATE SET
+      reference_key = financial_transactions.reference_key
     RETURNING *
     `,
     [
@@ -4368,6 +4373,15 @@ function authUser(req, res, next) {
   }
 }
 
+function getAuthenticatedUserId(req) {
+  return String(req.userAuth?.sub || "").trim();
+}
+
+function isAuthenticatedUserMismatch(authenticatedUserId, candidateUserId) {
+  const candidate = String(candidateUserId || "").trim();
+  return Boolean(candidate) && candidate !== String(authenticatedUserId || "").trim();
+}
+
 app.get("/", (req, res) => {
   res.json({ ok: true });
 });
@@ -4616,6 +4630,10 @@ app.post("/register", async (req, res) => {
     const { email, senha } = req.body;
 
     if (!email || !senha) {
+      return res.status(400).json({ error: "Email e senha sao obrigatorios" });
+    }
+
+    if (!email || !senha) {
       return res.status(400).json({ error: "Email e senha são obrigatórios" });
     }
 
@@ -4625,6 +4643,10 @@ app.post("/register", async (req, res) => {
       "SELECT id FROM usuarios WHERE email = $1 LIMIT 1",
       [emailNorm]
     );
+
+    if (exists.rows.length > 0) {
+      return res.status(400).json({ error: "Usuario ja existe" });
+    }
 
     if (exists.rows.length > 0) {
       return res.status(400).json({ error: "Usuário já existe" });
@@ -4703,13 +4725,18 @@ app.post("/register", async (req, res) => {
       return userAtualizado;
     });
 
+    const token = signUserToken(novoUsuario);
+
     res.status(201).json(
-      buildUserPublicResponse(novoUsuario, {
-        pixDesbloqueado: false,
-        valorRecebidoViaPix: 0,
-        valorMinimoDesbloqueioPix: PIX_SAQUE_DESBLOQUEIO_MIN,
-        welcomeBonusGranted: true
-      })
+      attachUserAuthToPayload(
+        buildUserPublicResponse(novoUsuario, {
+          pixDesbloqueado: false,
+          valorRecebidoViaPix: 0,
+          valorMinimoDesbloqueioPix: PIX_SAQUE_DESBLOQUEIO_MIN,
+          welcomeBonusGranted: true
+        }),
+        token
+      )
     );
   } catch (error) {
     console.error(error);
@@ -4720,6 +4747,29 @@ app.post("/register", async (req, res) => {
 app.post("/login", loginLimiter, async (req, res) => {
   try {
     const { email, senha } = req.body;
+
+    if (!email || !senha) {
+      return res.status(400).json({ error: "Email e senha sao obrigatorios" });
+    }
+
+    const authUserRecord = await getUserByEmail(email);
+
+    if (!authUserRecord) {
+      return res.status(401).json({ error: "Login invalido" });
+    }
+
+    const senhaOk = await bcrypt.compare(String(senha), String(authUserRecord.senha));
+
+    if (!senhaOk) {
+      return res.status(401).json({ error: "Login invalido" });
+    }
+
+    const token = signUserToken(authUserRecord);
+    const payload = await buildUserPublicResponseWithPix(authUserRecord, pool, {
+      deviceId: getRequestDeviceId(req)
+    });
+
+    return res.json(attachUserAuthToPayload(payload, token));
 
     if (!email || !senha) {
       return res.status(400).json({ error: "Email e senha são obrigatórios" });
@@ -4805,12 +4855,16 @@ app.get("/mobile/me", authUser, async (req, res) => {
   }
 });
 
-app.get("/sigmo-cards", async (req, res) => {
+app.get("/sigmo-cards", authUser, async (req, res) => {
   try {
-    const ownerUserId = String(req.query?.userId || "").trim();
+    const ownerUserId = getAuthenticatedUserId(req);
 
     if (!ownerUserId) {
       return sendJsonError(res, 400, "CARD_OWNER_REQUIRED", "Usuario nao informado");
+    }
+
+    if (isAuthenticatedUserMismatch(ownerUserId, req.query?.userId)) {
+      return sendJsonError(res, 403, "CARD_FORBIDDEN", "Acesso negado para estes cartoes");
     }
 
     const cards = await runInTransaction(async (client) => {
@@ -4855,14 +4909,18 @@ app.get("/sigmo-cards", async (req, res) => {
   }
 });
 
-app.post("/sigmo-cards/primary", async (req, res) => {
+app.post("/sigmo-cards/primary", authUser, async (req, res) => {
   try {
-    const ownerUserId = String(req.body?.userId || "").trim();
+    const ownerUserId = getAuthenticatedUserId(req);
     const label = String(req.body?.label || "").trim();
     const spendingLimit = Math.max(0, toMoney(req.body?.spendingLimit));
 
     if (!ownerUserId) {
       return sendJsonError(res, 400, "CARD_OWNER_REQUIRED", "Usuario nao informado");
+    }
+
+    if (isAuthenticatedUserMismatch(ownerUserId, req.body?.userId)) {
+      return sendJsonError(res, 403, "CARD_FORBIDDEN", "Acesso negado para este cartao");
     }
 
     const result = await runInTransaction(async (client) => {
@@ -4906,9 +4964,9 @@ app.post("/sigmo-cards/primary", async (req, res) => {
   }
 });
 
-app.post("/sigmo-cards/additional", async (req, res) => {
+app.post("/sigmo-cards/additional", authUser, async (req, res) => {
   try {
-    const ownerUserId = String(req.body?.userId || "").trim();
+    const ownerUserId = getAuthenticatedUserId(req);
     const holderEmail = String(req.body?.holderEmail || "").trim();
     const label = String(req.body?.label || "").trim();
     const spendingLimit = Math.max(0, toMoney(req.body?.spendingLimit));
@@ -4920,6 +4978,10 @@ app.post("/sigmo-cards/additional", async (req, res) => {
         "CARD_REQUIRED_FIELDS",
         "Usuario e email do portador sao obrigatorios"
       );
+    }
+
+    if (isAuthenticatedUserMismatch(ownerUserId, req.body?.userId)) {
+      return sendJsonError(res, 403, "CARD_FORBIDDEN", "Acesso negado para este cartao");
     }
 
     const result = await runInTransaction(async (client) => {
@@ -4996,12 +5058,16 @@ app.post("/sigmo-cards/additional", async (req, res) => {
   }
 });
 
-app.post("/sigmo-cards/:id", async (req, res) => {
+app.post("/sigmo-cards/:id", authUser, async (req, res) => {
   try {
-    const ownerUserId = String(req.body?.userId || "").trim();
+    const ownerUserId = getAuthenticatedUserId(req);
 
     if (!ownerUserId) {
       return sendJsonError(res, 400, "CARD_OWNER_REQUIRED", "Usuario nao informado");
+    }
+
+    if (isAuthenticatedUserMismatch(ownerUserId, req.body?.userId)) {
+      return sendJsonError(res, 403, "CARD_FORBIDDEN", "Acesso negado para este cartao");
     }
 
     const result = await runInTransaction(async (client) => {
@@ -5056,12 +5122,16 @@ app.post("/sigmo-cards/:id", async (req, res) => {
   }
 });
 
-app.post("/sigmo-cards/:id/reissue", async (req, res) => {
+app.post("/sigmo-cards/:id/reissue", authUser, async (req, res) => {
   try {
-    const ownerUserId = String(req.body?.userId || "").trim();
+    const ownerUserId = getAuthenticatedUserId(req);
 
     if (!ownerUserId) {
       return sendJsonError(res, 400, "CARD_OWNER_REQUIRED", "Usuario nao informado");
+    }
+
+    if (isAuthenticatedUserMismatch(ownerUserId, req.body?.userId)) {
+      return sendJsonError(res, 403, "CARD_FORBIDDEN", "Acesso negado para este cartao");
     }
 
     const result = await runInTransaction(async (client) => {
@@ -5111,12 +5181,16 @@ app.post("/sigmo-cards/:id/reissue", async (req, res) => {
   }
 });
 
-app.post("/sigmo-cards/:id/delete", async (req, res) => {
+app.post("/sigmo-cards/:id/delete", authUser, async (req, res) => {
   try {
-    const ownerUserId = String(req.body?.userId || "").trim();
+    const ownerUserId = getAuthenticatedUserId(req);
 
     if (!ownerUserId) {
       return sendJsonError(res, 400, "CARD_OWNER_REQUIRED", "Usuario nao informado");
+    }
+
+    if (isAuthenticatedUserMismatch(ownerUserId, req.body?.userId)) {
+      return sendJsonError(res, 403, "CARD_FORBIDDEN", "Acesso negado para este cartao");
     }
 
     const result = await runInTransaction(async (client) => {
@@ -5402,14 +5476,26 @@ app.post("/mobile/cards/:id/delete", authUser, async (req, res) => {
   }
 });
 
-app.post("/sigmo-tap-charges", async (req, res) => {
+app.post("/sigmo-tap-charges", authUser, async (req, res) => {
   try {
-    const receiverUserId = String(req.body?.userId || req.body?.receiverUserId || "").trim();
+    const receiverUserId = getAuthenticatedUserId(req);
     const amount = toMoney(req.body?.amount);
     const description = String(req.body?.description || "").trim();
 
     if (!receiverUserId) {
       return sendJsonError(res, 400, "TAP_CHARGE_USER_REQUIRED", "Usuario nao informado");
+    }
+
+    if (
+      isAuthenticatedUserMismatch(receiverUserId, req.body?.userId) ||
+      isAuthenticatedUserMismatch(receiverUserId, req.body?.receiverUserId)
+    ) {
+      return sendJsonError(
+        res,
+        403,
+        "TAP_CHARGE_FORBIDDEN",
+        "Acesso negado para esta cobranca"
+      );
     }
 
     if (!Number.isFinite(amount) || amount <= 0) {
@@ -5470,13 +5556,17 @@ app.post("/sigmo-tap-charges", async (req, res) => {
   }
 });
 
-app.get("/sigmo-tap-charges/:id", async (req, res) => {
+app.get("/sigmo-tap-charges/:id", authUser, async (req, res) => {
   try {
-    const userId = String(req.query?.userId || "").trim();
+    const userId = getAuthenticatedUserId(req);
     const charge = await getSigmoTapChargeById(req.params.id);
 
     if (!charge) {
       return sendJsonError(res, 404, "TAP_CHARGE_NOT_FOUND", "Cobranca nao encontrada");
+    }
+
+    if (isAuthenticatedUserMismatch(userId, req.query?.userId)) {
+      return sendJsonError(res, 403, "TAP_CHARGE_FORBIDDEN", "Cobranca indisponivel");
     }
 
     if (!userId || charge.receiverUserId !== userId) {
@@ -5492,12 +5582,21 @@ app.get("/sigmo-tap-charges/:id", async (req, res) => {
   }
 });
 
-app.post("/sigmo-tap-charges/:id/cancel", async (req, res) => {
+app.post("/sigmo-tap-charges/:id/cancel", authUser, async (req, res) => {
   try {
-    const userId = String(req.body?.userId || "").trim();
+    const userId = getAuthenticatedUserId(req);
 
     if (!userId) {
       return sendJsonError(res, 400, "TAP_CHARGE_USER_REQUIRED", "Usuario nao informado");
+    }
+
+    if (isAuthenticatedUserMismatch(userId, req.body?.userId)) {
+      return sendJsonError(
+        res,
+        403,
+        "TAP_CHARGE_FORBIDDEN",
+        "Acesso negado para esta cobranca"
+      );
     }
 
     const result = await runInTransaction(async (client) => {
@@ -5711,9 +5810,16 @@ app.post("/mobile/tap-charges/:id/arm", authUser, async (req, res) => {
   }
 });
 
-app.get("/usuario/:id", async (req, res) => {
+app.get("/usuario/:id", authUser, async (req, res) => {
   try {
-    const user = await getUserById(req.params.id);
+    const authenticatedUserId = getAuthenticatedUserId(req);
+    const requestedUserId = String(req.params.id || "").trim();
+
+    if (!authenticatedUserId || requestedUserId !== authenticatedUserId) {
+      return sendJsonError(res, 403, "USER_FORBIDDEN", "Acesso negado para esta conta");
+    }
+
+    const user = await getUserById(authenticatedUserId);
 
     if (!user) {
       return res.status(404).json({ error: "Usuário não encontrado" });
@@ -5726,15 +5832,20 @@ app.get("/usuario/:id", async (req, res) => {
   }
 });
 
-app.post("/usuario/update-nome", async (req, res) => {
+app.post("/usuario/update-nome", authUser, async (req, res) => {
   try {
+    const authenticatedUserId = getAuthenticatedUserId(req);
     const { userId, nome } = req.body;
 
-    if (!userId || !nome) {
+    if (isAuthenticatedUserMismatch(authenticatedUserId, userId)) {
+      return sendJsonError(res, 403, "USER_FORBIDDEN", "Acesso negado para esta conta");
+    }
+
+    if (!authenticatedUserId || !userId || !nome) {
       return res.status(400).json({ error: "Dados inválidos" });
     }
 
-    const user = await getUserById(userId);
+    const user = await getUserById(authenticatedUserId);
 
     if (!user) {
       return res.status(404).json({ error: "Usuário não encontrado" });
@@ -5756,15 +5867,20 @@ app.post("/usuario/update-nome", async (req, res) => {
   }
 });
 
-app.post("/usuario/delete", async (req, res) => {
+app.post("/usuario/delete", authUser, async (req, res) => {
   try {
+    const authenticatedUserId = getAuthenticatedUserId(req);
     const { userId, email, senha } = req.body;
 
-    if (!userId || !email || !senha) {
+    if (isAuthenticatedUserMismatch(authenticatedUserId, userId)) {
+      return sendJsonError(res, 403, "USER_FORBIDDEN", "Acesso negado para esta conta");
+    }
+
+    if (!authenticatedUserId || !userId || !email || !senha) {
       return res.status(400).json({ error: "Dados obrigatórios" });
     }
 
-    const user = await getUserById(userId);
+    const user = await getUserById(authenticatedUserId);
 
     if (!user) {
       return res.status(404).json({ error: "Usuário não encontrado" });
@@ -5785,12 +5901,12 @@ app.post("/usuario/delete", async (req, res) => {
     }
 
     await runInTransaction(async (client) => {
-      await client.query("DELETE FROM depositos WHERE user_id = $1", [userId]);
-      await client.query("DELETE FROM topup_orders WHERE user_id = $1", [userId]);
-      await client.query("DELETE FROM financial_transactions WHERE user_id = $1", [userId]);
-      await client.query("DELETE FROM ledger_entries WHERE user_id = $1", [userId]);
-      await client.query("DELETE FROM audit_logs WHERE target_id = $1", [userId]);
-      await client.query("DELETE FROM usuarios WHERE id = $1", [userId]);
+      await client.query("DELETE FROM depositos WHERE user_id = $1", [authenticatedUserId]);
+      await client.query("DELETE FROM topup_orders WHERE user_id = $1", [authenticatedUserId]);
+      await client.query("DELETE FROM financial_transactions WHERE user_id = $1", [authenticatedUserId]);
+      await client.query("DELETE FROM ledger_entries WHERE user_id = $1", [authenticatedUserId]);
+      await client.query("DELETE FROM audit_logs WHERE target_id = $1", [authenticatedUserId]);
+      await client.query("DELETE FROM usuarios WHERE id = $1", [authenticatedUserId]);
     });
 
     res.json({ message: "Conta deletada com sucesso" });
@@ -5800,8 +5916,9 @@ app.post("/usuario/delete", async (req, res) => {
   }
 });
 
-app.post("/deposito", async (req, res) => {
+app.post("/deposito", authUser, async (req, res) => {
   try {
+    const authenticatedUserId = getAuthenticatedUserId(req);
     const {
       userId,
       valor,
@@ -5811,7 +5928,11 @@ app.post("/deposito", async (req, res) => {
       repassarTaxa
     } = req.body;
 
-    if (!userId || valor === undefined || valor === null) {
+    if (isAuthenticatedUserMismatch(authenticatedUserId, userId)) {
+      return sendJsonError(res, 403, "DEPOSITO_FORBIDDEN", "Acesso negado para esta conta");
+    }
+
+    if (!authenticatedUserId || !userId || valor === undefined || valor === null) {
       return res.status(400).json({ error: "userId e valor são obrigatórios" });
     }
 
@@ -5845,7 +5966,7 @@ app.post("/deposito", async (req, res) => {
       });
     }
 
-    const user = await getUserById(userId);
+    const user = await getUserById(authenticatedUserId);
 
     if (!user) {
       return res.status(404).json({ error: "Usuário não encontrado" });
@@ -5899,7 +6020,7 @@ app.post("/deposito", async (req, res) => {
 
     const pedido = {
       id: buildId("dep"),
-      userId,
+      userId: authenticatedUserId,
       valor: valorNumero,
       chavePix: chavePix || "",
       tipoChave: tipoChave || "",
@@ -5934,11 +6055,16 @@ app.post("/deposito", async (req, res) => {
   }
 });
 
-app.post("/deposito/pix-code", async (req, res) => {
+app.post("/deposito/pix-code", authUser, async (req, res) => {
   try {
+    const authenticatedUserId = getAuthenticatedUserId(req);
     const { userId, valor } = req.body;
 
-    if (!userId || valor === undefined || valor === null) {
+    if (isAuthenticatedUserMismatch(authenticatedUserId, userId)) {
+      return sendJsonError(res, 403, "DEPOSITO_FORBIDDEN", "Acesso negado para esta conta");
+    }
+
+    if (!authenticatedUserId || !userId || valor === undefined || valor === null) {
       return res.status(400).json({ error: "userId e valor são obrigatórios" });
     }
 
@@ -5954,7 +6080,7 @@ app.post("/deposito/pix-code", async (req, res) => {
       });
     }
 
-    const user = await getUserById(userId);
+    const user = await getUserById(authenticatedUserId);
 
     if (!user) {
       return res.status(404).json({ error: "Usuário não encontrado" });
@@ -5979,12 +6105,17 @@ app.post("/deposito/pix-code", async (req, res) => {
   }
 });
 
-app.post("/deposito/:id/comprovante", upload.single("comprovante"), async (req, res) => {
+app.post("/deposito/:id/comprovante", authUser, upload.single("comprovante"), async (req, res) => {
   try {
+    const authenticatedUserId = getAuthenticatedUserId(req);
     const pedido = await getDepositoById(req.params.id);
 
     if (!pedido) {
       return res.status(404).json({ error: "Pedido não encontrado" });
+    }
+
+    if (!authenticatedUserId || pedido.userId !== authenticatedUserId) {
+      return sendJsonError(res, 403, "DEPOSITO_FORBIDDEN", "Acesso negado para este deposito");
     }
 
     if (!req.file) {
@@ -6026,9 +6157,21 @@ app.post("/deposito/:id/comprovante", upload.single("comprovante"), async (req, 
   }
 });
 
-app.get("/depositos/user/:id", async (req, res) => {
+app.get("/depositos/user/:id", authUser, async (req, res) => {
   try {
-    const lista = await listDepositosByUser(req.params.id);
+    const authenticatedUserId = getAuthenticatedUserId(req);
+    const requestedUserId = String(req.params.id || "").trim();
+
+    if (!authenticatedUserId || requestedUserId !== authenticatedUserId) {
+      return sendJsonError(
+        res,
+        403,
+        "DEPOSITO_FORBIDDEN",
+        "Acesso negado para estes depositos"
+      );
+    }
+
+    const lista = await listDepositosByUser(authenticatedUserId);
     res.json(lista);
   } catch (error) {
     console.error(error);
@@ -6036,9 +6179,16 @@ app.get("/depositos/user/:id", async (req, res) => {
   }
 });
 
-app.get("/topups/user/:id", async (req, res) => {
+app.get("/topups/user/:id", authUser, async (req, res) => {
   try {
-    const lista = await listRecargaCelularPedidosByUser(req.params.id);
+    const authenticatedUserId = String(req.userAuth?.sub || "").trim();
+    const requestedUserId = String(req.params.id || "").trim();
+
+    if (!authenticatedUserId || requestedUserId !== authenticatedUserId) {
+      return sendJsonError(res, 403, "TOPUP_FORBIDDEN", "Acesso negado para estas recargas");
+    }
+
+    const lista = await listRecargaCelularPedidosByUser(authenticatedUserId);
     res.json(lista);
   } catch (error) {
     console.error(error);
@@ -6046,15 +6196,44 @@ app.get("/topups/user/:id", async (req, res) => {
   }
 });
 
-app.post("/topups", async (req, res) => {
+app.post("/topups", authUser, async (req, res) => {
   try {
-    const { userId, operadora, ddd, numero, valorRecarga } = req.body;
+    const { userId, operadora, ddd, numero, valorRecarga, clientRequestId } = req.body;
+    const authenticatedUserId = String(req.userAuth?.sub || "").trim();
+    const normalizedClientRequestId =
+      normalizeRecargaCelularClientRequestId(clientRequestId);
     const operadoraNormalizada = normalizeRecargaCelularOperadora(operadora);
     const dddNormalizado = normalizeRecargaCelularDdd(ddd);
     const numeroNormalizado = normalizeRecargaCelularNumero(numero);
     const detalhes = calcularDetalhesRecargaCelular(valorRecarga);
 
-    if (!userId || !operadoraNormalizada || !dddNormalizado || !numeroNormalizado) {
+    if (!authenticatedUserId || !operadoraNormalizada || !dddNormalizado || !numeroNormalizado) {
+      return res.status(400).json({ error: "Dados obrigatorios para a recarga" });
+    }
+
+    if (!isValidRecargaCelularTelefone(dddNormalizado, numeroNormalizado)) {
+      return res.status(400).json({ error: "DDD ou numero de celular invalido" });
+    }
+
+    if (
+      !Number.isFinite(detalhes.valorRecarga) ||
+      detalhes.valorRecarga < LIMITE_RECARGA_CELULAR_MIN ||
+      detalhes.valorRecarga > LIMITE_RECARGA_CELULAR_MAX
+    ) {
+      return res.status(400).json({
+        error: `Recarga disponivel entre R$${LIMITE_RECARGA_CELULAR_MIN.toFixed(2)} e R$${LIMITE_RECARGA_CELULAR_MAX.toFixed(2)}`
+      });
+    }
+
+    if (!authenticatedUserId) {
+      return sendJsonError(res, 401, "TOPUP_UNAUTHORIZED", "Nao autorizado");
+    }
+
+    if (userId && String(userId).trim() !== authenticatedUserId) {
+      return sendJsonError(res, 403, "TOPUP_FORBIDDEN", "Acesso negado para esta recarga");
+    }
+
+    if (!authenticatedUserId || !operadoraNormalizada || !dddNormalizado || !numeroNormalizado) {
       return res.status(400).json({ error: "Dados obrigatÃ³rios para a recarga" });
     }
 
@@ -6073,7 +6252,11 @@ app.post("/topups", async (req, res) => {
     }
 
     const result = await runInTransaction(async (client) => {
-      const user = await getUserByIdForUpdate(userId, client);
+      const user = await getUserByIdForUpdate(authenticatedUserId, client);
+
+      if (!user) {
+        throw new Error("Usuario nao encontrado");
+      }
 
       if (!user) {
         throw new Error("UsuÃ¡rio nÃ£o encontrado");
@@ -6097,6 +6280,9 @@ app.post("/topups", async (req, res) => {
       );
       const realDebitado = toMoney(detalhes.valorTotalDebitado - bonusDebitado);
       const pedidoId = buildId("topup");
+      const referenceKey = normalizedClientRequestId
+        ? `topup:${authenticatedUserId}:${normalizedClientRequestId}:debit`
+        : `topup:${pedidoId}:debit`;
       const now = db();
       const pedido = {
         id: pedidoId,
@@ -6129,13 +6315,14 @@ app.post("/topups", async (req, res) => {
         telefone: buildRecargaCelularTelefone(dddNormalizado, numeroNormalizado),
         valorRecarga: detalhes.valorRecarga,
         taxaValor: detalhes.taxaValor,
+        clientRequestId: normalizedClientRequestId,
         bonusAmount: bonusDebitado,
         realAmount: realDebitado
       };
 
       const financialTx = await createFinancialTransaction(client, {
         userId: user.id,
-        referenceKey: `topup:${pedidoId}:debit`,
+        referenceKey,
         sourceType: "topup_order",
         sourceId: pedidoId,
         operationType: "topup_purchase",
@@ -6145,6 +6332,26 @@ app.post("/topups", async (req, res) => {
         description: descricao,
         metadata: metadataBase
       });
+
+      if (
+        normalizedClientRequestId &&
+        String(financialTx.sourceId || "").trim() !== pedidoId
+      ) {
+        const pedidoExistente = await getRecargaCelularPedidoById(
+          financialTx.sourceId,
+          client
+        );
+
+        if (pedidoExistente) {
+          return {
+            pedido: pedidoExistente,
+            saldoAtual: toMoney(user.saldo),
+            duplicate: true
+          };
+        }
+
+        throw new Error("Pedido de recarga duplicado sem registro associado");
+      }
 
       const usuarioAtualizado = await applyLedgerChange(client, {
         userId: user.id,
@@ -6167,7 +6374,7 @@ app.post("/topups", async (req, res) => {
       };
     });
 
-    res.status(201).json(result);
+    res.status(result.duplicate ? 200 : 201).json(result);
   } catch (error) {
     console.error(error);
 
@@ -6179,11 +6386,21 @@ app.post("/topups", async (req, res) => {
   }
 });
 
-app.post("/transferir-sigmo", async (req, res) => {
+app.post("/transferir-sigmo", authUser, async (req, res) => {
   try {
+    const authenticatedUserId = getAuthenticatedUserId(req);
     const { fromUserId, emailDestino, valor } = req.body;
 
-    if (!fromUserId || !emailDestino || valor === undefined || valor === null) {
+    if (isAuthenticatedUserMismatch(authenticatedUserId, fromUserId)) {
+      return sendJsonError(
+        res,
+        403,
+        "TRANSFER_FORBIDDEN",
+        "Acesso negado para esta transferencia"
+      );
+    }
+
+    if (!authenticatedUserId || !fromUserId || !emailDestino || valor === undefined || valor === null) {
       return res.status(400).json({ error: "Dados obrigatórios" });
     }
 
@@ -6194,7 +6411,7 @@ app.post("/transferir-sigmo", async (req, res) => {
     }
 
     const result = await runInTransaction(async (client) => {
-      const remetente = await getUserByIdForUpdate(fromUserId, client);
+      const remetente = await getUserByIdForUpdate(authenticatedUserId, client);
       const destino = await getUserByEmail(emailDestino, client);
 
       if (!remetente) {
