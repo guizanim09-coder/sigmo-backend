@@ -45,11 +45,16 @@ const TAXA_SAQUE_PIX_PERCENTUAL = Number(
 const TAXA_RECARGA_CELULAR_PERCENTUAL = Number(
   process.env.TAXA_RECARGA_CELULAR_PERCENTUAL || 0.10
 );
-const LIMITE_RECARGA_CELULAR_MIN = Number(
-  process.env.LIMITE_RECARGA_CELULAR_MIN || 10
+const RECARGA_CELULAR_VALORES_POR_OPERADORA = {
+  tim: [20, 30, 40, 50, 60, 100],
+  claro: [20, 25, 30, 35, 40, 50, 100],
+  vivo: [20, 25, 30, 35, 40, 50, 100, 200, 300]
+};
+const LIMITE_RECARGA_CELULAR_MIN = Math.min(
+  ...Object.values(RECARGA_CELULAR_VALORES_POR_OPERADORA).flat()
 );
-const LIMITE_RECARGA_CELULAR_MAX = Number(
-  process.env.LIMITE_RECARGA_CELULAR_MAX || 300
+const LIMITE_RECARGA_CELULAR_MAX = Math.max(
+  ...Object.values(RECARGA_CELULAR_VALORES_POR_OPERADORA).flat()
 );
 const COMPROVANTE_UPLOAD_WINDOW_MINUTES = Number(
   process.env.COMPROVANTE_UPLOAD_WINDOW_MINUTES || 60
@@ -91,9 +96,9 @@ const STATUS_CONTA_ATIVA = "ativa";
 const STATUS_CONTA_BANIDA = "banida";
 const MOTIVO_BANIMENTO_FRAUDE_BONUS = "tentativa_fraude_bonus";
 const RECARGA_CELULAR_OPERADORAS = [
-  { id: "tim", label: "TIM" },
-  { id: "claro", label: "Claro" },
-  { id: "vivo", label: "Vivo" }
+  { id: "tim", label: "TIM", values: RECARGA_CELULAR_VALORES_POR_OPERADORA.tim },
+  { id: "claro", label: "Claro", values: RECARGA_CELULAR_VALORES_POR_OPERADORA.claro },
+  { id: "vivo", label: "Vivo", values: RECARGA_CELULAR_VALORES_POR_OPERADORA.vivo }
 ];
 const RECARGA_CELULAR_OPERADORAS_IDS = new Set(
   RECARGA_CELULAR_OPERADORAS.map((item) => item.id)
@@ -552,6 +557,24 @@ function normalizeRecargaCelularClientRequestId(value) {
     .trim()
     .replace(/[^A-Za-z0-9_-]/g, "")
     .slice(0, 72);
+}
+
+function getRecargaCelularValoresPermitidos(operadora) {
+  const normalized = normalizeRecargaCelularOperadora(operadora);
+  return Array.isArray(RECARGA_CELULAR_VALORES_POR_OPERADORA[normalized])
+    ? RECARGA_CELULAR_VALORES_POR_OPERADORA[normalized]
+    : [];
+}
+
+function isRecargaCelularValorPermitido(operadora, valorRecarga) {
+  const valor = toMoney(valorRecarga);
+  return getRecargaCelularValoresPermitidos(operadora).includes(valor);
+}
+
+function formatRecargaCelularValoresPermitidos(operadora) {
+  return getRecargaCelularValoresPermitidos(operadora)
+    .map((valor) => `R$${toMoney(valor).toFixed(2)}`)
+    .join(", ");
 }
 
 function calcularDetalhesRecargaCelular(valorRecarga) {
@@ -6194,11 +6217,12 @@ app.post("/topups", authUser, async (req, res) => {
 
     if (
       !Number.isFinite(detalhes.valorRecarga) ||
-      detalhes.valorRecarga < LIMITE_RECARGA_CELULAR_MIN ||
-      detalhes.valorRecarga > LIMITE_RECARGA_CELULAR_MAX
+      !isRecargaCelularValorPermitido(operadoraNormalizada, detalhes.valorRecarga)
     ) {
+      const operadoraLabel = getRecargaCelularOperadoraLabel(operadoraNormalizada);
+      const valoresPermitidos = formatRecargaCelularValoresPermitidos(operadoraNormalizada);
       return res.status(400).json({
-        error: `Recarga disponivel entre R$${LIMITE_RECARGA_CELULAR_MIN.toFixed(2)} e R$${LIMITE_RECARGA_CELULAR_MAX.toFixed(2)}`
+        error: `Selecione um valor disponivel para ${operadoraLabel}: ${valoresPermitidos}`
       });
     }
 
