@@ -1,4 +1,4 @@
-const express = require("express");
+﻿const express = require("express");
 const crypto = require("crypto");
 const fs = require("fs");
 const path = require("path");
@@ -4633,9 +4633,6 @@ app.post("/register", async (req, res) => {
       return res.status(400).json({ error: "Email e senha sao obrigatorios" });
     }
 
-    if (!email || !senha) {
-      return res.status(400).json({ error: "Email e senha são obrigatórios" });
-    }
 
     const emailNorm = normalizeEmail(email);
 
@@ -4648,9 +4645,6 @@ app.post("/register", async (req, res) => {
       return res.status(400).json({ error: "Usuario ja existe" });
     }
 
-    if (exists.rows.length > 0) {
-      return res.status(400).json({ error: "Usuário já existe" });
-    }
 
     const hash = await bcrypt.hash(String(senha), 10);
     const novoUsuario = await runInTransaction(async (client) => {
@@ -4771,23 +4765,6 @@ app.post("/login", loginLimiter, async (req, res) => {
 
     return res.json(attachUserAuthToPayload(payload, token));
 
-    if (!email || !senha) {
-      return res.status(400).json({ error: "Email e senha são obrigatórios" });
-    }
-
-    const user = await getUserByEmail(email);
-
-    if (!user) {
-      return res.status(401).json({ error: "Login inválido" });
-    }
-
-    const ok = await bcrypt.compare(String(senha), String(user.senha));
-
-    if (!ok) {
-      return res.status(401).json({ error: "Login inválido" });
-    }
-
-    res.json(await buildUserPublicResponseWithPix(user));
   } catch (error) {
     console.error(error);
     res.status(500).json({ error: "Erro no login" });
@@ -6192,7 +6169,7 @@ app.get("/topups/user/:id", authUser, async (req, res) => {
     res.json(lista);
   } catch (error) {
     console.error(error);
-    res.status(500).json({ error: "Erro ao buscar recargas do usuÃ¡rio" });
+    res.status(500).json({ error: "Erro ao buscar recargas do usuario" });
   }
 });
 
@@ -6233,23 +6210,6 @@ app.post("/topups", authUser, async (req, res) => {
       return sendJsonError(res, 403, "TOPUP_FORBIDDEN", "Acesso negado para esta recarga");
     }
 
-    if (!authenticatedUserId || !operadoraNormalizada || !dddNormalizado || !numeroNormalizado) {
-      return res.status(400).json({ error: "Dados obrigatÃ³rios para a recarga" });
-    }
-
-    if (!isValidRecargaCelularTelefone(dddNormalizado, numeroNormalizado)) {
-      return res.status(400).json({ error: "DDD ou nÃºmero de celular invÃ¡lido" });
-    }
-
-    if (
-      !Number.isFinite(detalhes.valorRecarga) ||
-      detalhes.valorRecarga < LIMITE_RECARGA_CELULAR_MIN ||
-      detalhes.valorRecarga > LIMITE_RECARGA_CELULAR_MAX
-    ) {
-      return res.status(400).json({
-        error: `Recarga disponÃ­vel entre R$${LIMITE_RECARGA_CELULAR_MIN.toFixed(2)} e R$${LIMITE_RECARGA_CELULAR_MAX.toFixed(2)}`
-      });
-    }
 
     const result = await runInTransaction(async (client) => {
       const user = await getUserByIdForUpdate(authenticatedUserId, client);
@@ -6258,9 +6218,6 @@ app.post("/topups", authUser, async (req, res) => {
         throw new Error("Usuario nao encontrado");
       }
 
-      if (!user) {
-        throw new Error("UsuÃ¡rio nÃ£o encontrado");
-      }
 
       if (isContaBanida(user)) {
         const error = new Error(getMensagemContaBanida());
@@ -7268,22 +7225,22 @@ app.post("/admin/topups/:id/approve", authAdmin, async (req, res) => {
     const topupId = String(req.params.id || "").trim();
 
     if (!topupId) {
-      return res.status(400).json({ error: "Pedido de recarga obrigatÃ³rio" });
+      return res.status(400).json({ error: "Pedido de recarga obrigatorio" });
     }
 
     const result = await runInTransaction(async (client) => {
       const pedido = await getRecargaCelularPedidoByIdForUpdate(topupId, client);
 
       if (!pedido) {
-        throw new Error("Pedido de recarga nÃ£o encontrado");
+        throw new Error("Pedido de recarga nao encontrado");
       }
 
       if (pedido.status === "aprovado") {
-        throw new Error("Pedido de recarga jÃ¡ aprovado");
+        throw new Error("Pedido de recarga ja aprovado");
       }
 
       if (pedido.status === "recusado") {
-        throw new Error("Pedido de recarga jÃ¡ recusado");
+        throw new Error("Pedido de recarga ja recusado");
       }
 
       const now = db();
@@ -7331,26 +7288,26 @@ app.post("/admin/topups/:id/refuse", authAdmin, async (req, res) => {
     const motivoRecusa = normalizeRecargaCelularMotivoRecusa(req.body?.motivoRecusa);
 
     if (!topupId) {
-      return res.status(400).json({ error: "Pedido de recarga obrigatÃ³rio" });
+      return res.status(400).json({ error: "Pedido de recarga obrigatorio" });
     }
 
     if (!motivoRecusa) {
-      return res.status(400).json({ error: "Motivo da recusa obrigatÃ³rio" });
+      return res.status(400).json({ error: "Motivo da recusa obrigatorio" });
     }
 
     const result = await runInTransaction(async (client) => {
       const pedido = await getRecargaCelularPedidoByIdForUpdate(topupId, client);
 
       if (!pedido) {
-        throw new Error("Pedido de recarga nÃ£o encontrado");
+        throw new Error("Pedido de recarga nao encontrado");
       }
 
       if (pedido.status === "aprovado") {
-        throw new Error("Pedido de recarga jÃ¡ aprovado");
+        throw new Error("Pedido de recarga ja aprovado");
       }
 
       if (pedido.status === "recusado") {
-        throw new Error("Pedido de recarga jÃ¡ recusado");
+        throw new Error("Pedido de recarga ja recusado");
       }
 
       const now = db();
@@ -8760,3 +8717,4 @@ initDB()
     console.error("Erro ao iniciar banco:", error);
     process.exit(1);
   });
+
