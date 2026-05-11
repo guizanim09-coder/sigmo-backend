@@ -59,11 +59,23 @@ const LIMITE_RECARGA_CELULAR_MAX = Math.max(
 const COMPROVANTE_UPLOAD_WINDOW_MINUTES = Number(
   process.env.COMPROVANTE_UPLOAD_WINDOW_MINUTES || 60
 );
-const BONUS_BOAS_VINDAS_VALOR = Number(
-  process.env.BONUS_BOAS_VINDAS_VALOR || 5
+const BONUS_INDICACAO_VALOR = Number(
+  process.env.BONUS_INDICACAO_VALOR || process.env.BONUS_BOAS_VINDAS_VALOR || 5
+);
+const INDICACAO_PIX_QUALIFICACAO_MIN = Number(
+  process.env.INDICACAO_PIX_QUALIFICACAO_MIN || 100
 );
 const PIX_SAQUE_DESBLOQUEIO_MIN = Number(
   process.env.PIX_SAQUE_DESBLOQUEIO_MIN || 100
+);
+const INVESTIMENTOS_PIX_DESBLOQUEIO_MIN = Number(
+  process.env.INVESTIMENTOS_PIX_DESBLOQUEIO_MIN || 10000
+);
+const INVESTIMENTOS_CDI_ANUAL_REFERENCIA = Number(
+  process.env.INVESTIMENTOS_CDI_ANUAL_REFERENCIA || 0.105
+);
+const INVESTIMENTOS_JUNIOR_MOVIMENTACAO_MENSAL_MIN = Number(
+  process.env.INVESTIMENTOS_JUNIOR_MOVIMENTACAO_MENSAL_MIN || 1500
 );
 const USER_MOBILE_TOKEN_TTL = String(
   process.env.USER_MOBILE_TOKEN_TTL || "30d"
@@ -95,6 +107,79 @@ const BANNER_IMAGE_MAX_BYTES = 10 * 1024 * 1024;
 const STATUS_CONTA_ATIVA = "ativa";
 const STATUS_CONTA_BANIDA = "banida";
 const MOTIVO_BANIMENTO_FRAUDE_BONUS = "tentativa_fraude_bonus";
+const USER_NOTIFICATION_TYPE_LIMIT_REQUEST_PIX_KEY = "limit_request_pix_key";
+const MOVEMENT_LIMIT_REQUEST_STATUS_PENDING = "pending";
+const MOVEMENT_LIMIT_REQUEST_STATUS_RESPONDED = "responded";
+const MOVEMENT_LIMIT_REQUEST_STATUS_CLOSED = "closed";
+const INVESTMENT_RESERVE_STATUS_ACTIVE = "active";
+const INVESTMENT_RESERVE_STATUS_PARTIAL = "partial";
+const INVESTMENT_RESERVE_STATUS_CLOSED = "closed";
+const INVESTMENT_PRODUCT_DEFINITIONS = {
+  junior: {
+    key: "junior",
+    name: "JUNIOR",
+    headline: "150% do CDI",
+    cdiMultiplier: 1.5,
+    minAmount: LIMITE_DEPOSITO_MIN,
+    maxAmount: 10000,
+    minDisplayCapacity: 10000,
+    lockMonths: 0,
+    minHoldDaysForProfit: 30,
+    withdrawLock: false,
+    allowPartialWithdraw: true,
+    movementRequiredPerMonth: INVESTIMENTOS_JUNIOR_MOVIMENTACAO_MENSAL_MIN,
+    description:
+      "Liquidez diaria com rendimento liberado no resgate para valores mantidos por pelo menos 30 dias consecutivos."
+  },
+  pleno: {
+    key: "pleno",
+    name: "PLENO",
+    headline: "200% do CDI",
+    cdiMultiplier: 2,
+    minAmount: LIMITE_DEPOSITO_MIN,
+    maxAmount: 50000,
+    minDisplayCapacity: 50000,
+    lockMonths: 6,
+    minHoldDaysForProfit: 0,
+    withdrawLock: true,
+    allowPartialWithdraw: false,
+    movementRequiredPerMonth: 0,
+    description:
+      "Reserva com prazo fixo de 6 meses. O principal fica travado ate a data de liberacao."
+  },
+  senior: {
+    key: "senior",
+    name: "SENIOR",
+    headline: "240% do CDI",
+    cdiMultiplier: 2.4,
+    minAmount: 100000,
+    maxAmount: 500000,
+    minDisplayCapacity: 500000,
+    lockMonths: 12,
+    minHoldDaysForProfit: 0,
+    withdrawLock: true,
+    allowPartialWithdraw: false,
+    movementRequiredPerMonth: 0,
+    description:
+      "Reserva anual premium com aporte inicial de R$100.000,00 e travamento completo ate a liberacao."
+  },
+  executive: {
+    key: "executive",
+    name: "Executive",
+    headline: "350% do CDI",
+    cdiMultiplier: 3.5,
+    minAmount: 1000000,
+    maxAmount: null,
+    minDisplayCapacity: 1000000,
+    lockMonths: 18,
+    minHoldDaysForProfit: 0,
+    withdrawLock: true,
+    allowPartialWithdraw: false,
+    movementRequiredPerMonth: 0,
+    description:
+      "Estrutura de alta renda para aportes acima de R$1.000.000,00 com liberacao apos 18 meses."
+  }
+};
 const RECARGA_CELULAR_OPERADORAS = [
   { id: "tim", label: "TIM", values: RECARGA_CELULAR_VALORES_POR_OPERADORA.tim },
   { id: "claro", label: "Claro", values: RECARGA_CELULAR_VALORES_POR_OPERADORA.claro },
@@ -1301,8 +1386,19 @@ async function initDB() {
   await ensureColumn("usuarios", "motivo_banimento", "TEXT DEFAULT ''");
   await ensureColumn("usuarios", "bonus_boas_vindas", "NUMERIC DEFAULT 0");
   await ensureColumn("usuarios", "bonus_boas_vindas_concedido_em", "TIMESTAMP");
+  await ensureColumn("usuarios", "indicado_por_user_id", "TEXT DEFAULT ''");
+  await ensureColumn("usuarios", "indicado_por_email", "TEXT DEFAULT ''");
+  await ensureColumn("usuarios", "indicacao_vinculada_em", "TIMESTAMP");
+  await ensureColumn("usuarios", "indicacao_qualificada_em", "TIMESTAMP");
+  await ensureColumn("usuarios", "indicacao_bonus_creditado_em", "TIMESTAMP");
+  await ensureColumn("usuarios", "indicacao_bonus_creditado_valor", "NUMERIC DEFAULT 0");
+  await ensureColumn("usuarios", "indicacao_bonus_transacao_id", "TEXT DEFAULT ''");
   await ensureColumn("usuarios", "pin_transacao_hash", "TEXT DEFAULT ''");
   await ensureColumn("usuarios", "pin_transacao_atualizado_em", "TIMESTAMP");
+  await ensureIndex(
+    "idx_usuarios_indicado_por_user_id",
+    "CREATE INDEX idx_usuarios_indicado_por_user_id ON usuarios(indicado_por_user_id)"
+  );
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS depositos (
@@ -1424,6 +1520,76 @@ await ensureColumn("depositos", "comprovante_texto", "TEXT DEFAULT ''");
       created_at TIMESTAMP
     );
   `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS user_notifications (
+      id TEXT PRIMARY KEY,
+      user_id TEXT NOT NULL,
+      type TEXT NOT NULL DEFAULT '',
+      title TEXT NOT NULL DEFAULT '',
+      body TEXT NOT NULL DEFAULT '',
+      metadata JSONB DEFAULT '{}'::jsonb,
+      read_at TIMESTAMP,
+      created_at TIMESTAMP
+    );
+  `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS movement_limit_requests (
+      id TEXT PRIMARY KEY,
+      user_id TEXT NOT NULL,
+      requested_amount NUMERIC NOT NULL DEFAULT 0,
+      status TEXT NOT NULL DEFAULT '${MOVEMENT_LIMIT_REQUEST_STATUS_PENDING}',
+      admin_message TEXT DEFAULT '',
+      pix_key TEXT DEFAULT '',
+      notification_id TEXT DEFAULT '',
+      created_at TIMESTAMP,
+      updated_at TIMESTAMP,
+      responded_at TIMESTAMP,
+      closed_at TIMESTAMP
+    );
+  `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS investment_reserves (
+      id TEXT PRIMARY KEY,
+      user_id TEXT NOT NULL,
+      product_key TEXT NOT NULL,
+      product_name TEXT NOT NULL DEFAULT '',
+      product_headline TEXT NOT NULL DEFAULT '',
+      cdi_multiplier NUMERIC NOT NULL DEFAULT 0,
+      annual_rate NUMERIC NOT NULL DEFAULT 0,
+      principal_invested_total NUMERIC NOT NULL DEFAULT 0,
+      principal_remaining NUMERIC NOT NULL DEFAULT 0,
+      profit_paid_total NUMERIC NOT NULL DEFAULT 0,
+      capacity_limit NUMERIC NOT NULL DEFAULT 0,
+      min_amount NUMERIC NOT NULL DEFAULT 0,
+      release_at TIMESTAMP,
+      profit_eligible_at TIMESTAMP,
+      lock_months INTEGER NOT NULL DEFAULT 0,
+      min_hold_days_for_profit INTEGER NOT NULL DEFAULT 0,
+      movement_required_per_month NUMERIC NOT NULL DEFAULT 0,
+      allow_partial_withdraw BOOLEAN NOT NULL DEFAULT false,
+      status TEXT NOT NULL DEFAULT '${INVESTMENT_RESERVE_STATUS_ACTIVE}',
+      created_at TIMESTAMP,
+      updated_at TIMESTAMP,
+      last_withdrawn_at TIMESTAMP,
+      closed_at TIMESTAMP
+    );
+  `);
+
+  await ensureIndex(
+    "idx_user_notifications_user_id",
+    "CREATE INDEX idx_user_notifications_user_id ON user_notifications(user_id)"
+  );
+  await ensureIndex(
+    "idx_movement_limit_requests_user_id",
+    "CREATE INDEX idx_movement_limit_requests_user_id ON movement_limit_requests(user_id)"
+  );
+  await ensureIndex(
+    "idx_investment_reserves_user_id",
+    "CREATE INDEX idx_investment_reserves_user_id ON investment_reserves(user_id)"
+  );
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS topup_orders (
@@ -1830,8 +1996,57 @@ function mapUser(row) {
     motivoBanimento: row.motivo_banimento || "",
     bonusBoasVindas: toMoney(row.bonus_boas_vindas),
     bonusBoasVindasConcedidoEm: row.bonus_boas_vindas_concedido_em || null,
+    indicadoPorUserId: row.indicado_por_user_id || "",
+    indicadoPorEmail: row.indicado_por_email || "",
+    indicacaoVinculadaEm: row.indicacao_vinculada_em || null,
+    indicacaoQualificadaEm: row.indicacao_qualificada_em || null,
+    indicacaoBonusCreditadoEm: row.indicacao_bonus_creditado_em || null,
+    indicacaoBonusCreditadoValor: toMoney(row.indicacao_bonus_creditado_valor),
+    indicacaoBonusTransacaoId: row.indicacao_bonus_transacao_id || "",
     pinTransacaoHash: row.pin_transacao_hash || "",
     pinTransacaoAtualizadoEm: row.pin_transacao_atualizado_em || null
+  };
+}
+
+function getIndicacaoStatus(user, qualifyingPixTotal = 0) {
+  if (!user?.indicadoPorUserId) return "sem_indicacao";
+  if (
+    user.indicacaoQualificadaEm ||
+    user.indicacaoBonusCreditadoEm ||
+    toMoney(qualifyingPixTotal) >= INDICACAO_PIX_QUALIFICACAO_MIN
+  ) {
+    return "concluido";
+  }
+  return "pendente";
+}
+
+function buildIndicacaoParticipacao(user, qualifyingPixTotal = 0, referrer = null) {
+  if (!user?.indicadoPorUserId) {
+    return {
+      possuiIndicador: false,
+      status: "sem_indicacao",
+      qualifyingPixTotal: toMoney(qualifyingPixTotal),
+      valorNecessario: INDICACAO_PIX_QUALIFICACAO_MIN,
+      bonusValor: BONUS_INDICACAO_VALOR,
+      indicadoPor: null
+    };
+  }
+
+  return {
+    possuiIndicador: true,
+    status: getIndicacaoStatus(user, qualifyingPixTotal),
+    qualifyingPixTotal: toMoney(qualifyingPixTotal),
+    valorNecessario: INDICACAO_PIX_QUALIFICACAO_MIN,
+    bonusValor: BONUS_INDICACAO_VALOR,
+    vinculadaEm: user.indicacaoVinculadaEm || null,
+    qualificadaEm: user.indicacaoQualificadaEm || null,
+    bonusCreditadoEm: user.indicacaoBonusCreditadoEm || null,
+    bonusCreditadoValor: toMoney(user.indicacaoBonusCreditadoValor),
+    indicadoPor: {
+      userId: user.indicadoPorUserId || "",
+      email: user.indicadoPorEmail || "",
+      nome: referrer?.nome || referrer?.email?.split("@")[0] || ""
+    }
   };
 }
 
@@ -1848,12 +2063,26 @@ function buildUserPublicResponse(user, extras = {}) {
     motivoBanimento: user.motivoBanimento || "",
     bonusBoasVindas: toMoney(user.bonusBoasVindas),
     bonusBoasVindasConcedidoEm: user.bonusBoasVindasConcedidoEm || null,
+    indicadoPorUserId: user.indicadoPorUserId || "",
+    indicadoPorEmail: user.indicadoPorEmail || "",
+    indicacaoVinculadaEm: user.indicacaoVinculadaEm || null,
+    indicacaoQualificadaEm: user.indicacaoQualificadaEm || null,
+    indicacaoBonusCreditadoEm: user.indicacaoBonusCreditadoEm || null,
+    indicacaoBonusCreditadoValor: toMoney(user.indicacaoBonusCreditadoValor),
     ...extras
   };
 }
 
 async function buildUserPublicResponseWithPix(user, client = pool, extras = {}) {
   const valorRecebidoViaPix = await getValorRecebidoViaPix(user.id, client);
+  const referrer = user?.indicadoPorUserId
+    ? await getUserById(user.indicadoPorUserId, client)
+    : null;
+  const indicacao = buildIndicacaoParticipacao(
+    user,
+    valorRecebidoViaPix,
+    referrer
+  );
   const deviceId = String(extras.deviceId || "").trim();
   const activeCard =
     Object.prototype.hasOwnProperty.call(extras, "activeCard")
@@ -1867,6 +2096,7 @@ async function buildUserPublicResponseWithPix(user, client = pool, extras = {}) 
     pixDesbloqueado: valorRecebidoViaPix >= PIX_SAQUE_DESBLOQUEIO_MIN,
     valorRecebidoViaPix,
     valorMinimoDesbloqueioPix: PIX_SAQUE_DESBLOQUEIO_MIN,
+    indicacao,
     activeCard,
     ...extraPayload
   });
@@ -2149,6 +2379,186 @@ function mapLedgerEntry(row) {
     description: row.description || "",
     metadata: row.metadata || {},
     createdAt: row.created_at || null
+  };
+}
+
+function mapUserNotification(row) {
+  if (!row) return null;
+
+  return {
+    id: row.id,
+    userId: row.user_id,
+    type: row.type || "",
+    title: row.title || "",
+    body: row.body || "",
+    metadata: row.metadata || {},
+    readAt: row.read_at || null,
+    createdAt: row.created_at || null
+  };
+}
+
+function mapMovementLimitRequest(row) {
+  if (!row) return null;
+
+  return {
+    id: row.id,
+    userId: row.user_id,
+    requestedAmount: toMoney(row.requested_amount),
+    status: row.status || MOVEMENT_LIMIT_REQUEST_STATUS_PENDING,
+    adminMessage: row.admin_message || "",
+    pixKey: row.pix_key || "",
+    notificationId: row.notification_id || "",
+    createdAt: row.created_at || null,
+    updatedAt: row.updated_at || null,
+    respondedAt: row.responded_at || null,
+    closedAt: row.closed_at || null
+  };
+}
+
+function mapInvestmentReserve(row) {
+  if (!row) return null;
+
+  return {
+    id: row.id,
+    userId: row.user_id,
+    productKey: String(row.product_key || "").trim().toLowerCase(),
+    productName: row.product_name || "",
+    productHeadline: row.product_headline || "",
+    cdiMultiplier: Number(row.cdi_multiplier || 0),
+    annualRate: Number(row.annual_rate || 0),
+    principalInvestedTotal: toMoney(row.principal_invested_total),
+    principalRemaining: toMoney(row.principal_remaining),
+    profitPaidTotal: toMoney(row.profit_paid_total),
+    capacityLimit: toMoney(row.capacity_limit),
+    minAmount: toMoney(row.min_amount),
+    releaseAt: row.release_at || null,
+    profitEligibleAt: row.profit_eligible_at || null,
+    lockMonths: Number(row.lock_months || 0),
+    minHoldDaysForProfit: Number(row.min_hold_days_for_profit || 0),
+    movementRequiredPerMonth: toMoney(row.movement_required_per_month),
+    allowPartialWithdraw: Boolean(row.allow_partial_withdraw),
+    status: row.status || INVESTMENT_RESERVE_STATUS_ACTIVE,
+    createdAt: row.created_at || null,
+    updatedAt: row.updated_at || null,
+    lastWithdrawnAt: row.last_withdrawn_at || null,
+    closedAt: row.closed_at || null
+  };
+}
+
+function normalizeInvestmentProductKey(value) {
+  const key = String(value || "").trim().toLowerCase();
+  return Object.prototype.hasOwnProperty.call(INVESTMENT_PRODUCT_DEFINITIONS, key)
+    ? key
+    : "";
+}
+
+function getInvestmentProductConfig(productKey) {
+  const key = normalizeInvestmentProductKey(productKey);
+  return key ? INVESTMENT_PRODUCT_DEFINITIONS[key] : null;
+}
+
+function getInvestmentReferenceAnnualRate(config) {
+  return Number(
+    (INVESTIMENTOS_CDI_ANUAL_REFERENCIA * Number(config?.cdiMultiplier || 0)).toFixed(6)
+  );
+}
+
+function addDaysToDate(dateValue, days = 0) {
+  const date = new Date(dateValue || Date.now());
+  if (Number.isNaN(date.getTime())) return null;
+  date.setUTCDate(date.getUTCDate() + Number(days || 0));
+  return date;
+}
+
+function addMonthsToDate(dateValue, months = 0) {
+  const date = new Date(dateValue || Date.now());
+  if (Number.isNaN(date.getTime())) return null;
+  const day = date.getUTCDate();
+  date.setUTCDate(1);
+  date.setUTCMonth(date.getUTCMonth() + Number(months || 0));
+  const lastDay = new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth() + 1, 0)).getUTCDate();
+  date.setUTCDate(Math.min(day, lastDay));
+  return date;
+}
+
+function toIsoOrNull(dateValue) {
+  if (!dateValue) return null;
+  const date = dateValue instanceof Date ? dateValue : new Date(dateValue);
+  if (Number.isNaN(date.getTime())) return null;
+  return date.toISOString();
+}
+
+function diffDaysFloor(startValue, endValue = new Date()) {
+  const start = new Date(startValue || 0);
+  const end = new Date(endValue || Date.now());
+  if (Number.isNaN(start.getTime()) || Number.isNaN(end.getTime())) return 0;
+  const diffMs = end.getTime() - start.getTime();
+  if (diffMs <= 0) return 0;
+  return Math.floor(diffMs / (24 * 60 * 60 * 1000));
+}
+
+function getMovementRequestStatusLabel(status) {
+  const normalized = String(status || "").trim().toLowerCase();
+  if (normalized === MOVEMENT_LIMIT_REQUEST_STATUS_RESPONDED) return "responded";
+  if (normalized === MOVEMENT_LIMIT_REQUEST_STATUS_CLOSED) return "closed";
+  return MOVEMENT_LIMIT_REQUEST_STATUS_PENDING;
+}
+
+function getInvestmentReserveStatus(value) {
+  const normalized = String(value || "").trim().toLowerCase();
+  if (normalized === INVESTMENT_RESERVE_STATUS_PARTIAL) return INVESTMENT_RESERVE_STATUS_PARTIAL;
+  if (normalized === INVESTMENT_RESERVE_STATUS_CLOSED) return INVESTMENT_RESERVE_STATUS_CLOSED;
+  return INVESTMENT_RESERVE_STATUS_ACTIVE;
+}
+
+function getStartOfMonthIso(referenceDate = new Date()) {
+  const date = new Date(referenceDate || Date.now());
+  return new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), 1)).toISOString();
+}
+
+function getStartOfNextMonthIso(referenceDate = new Date()) {
+  const date = new Date(referenceDate || Date.now());
+  return new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth() + 1, 1)).toISOString();
+}
+
+function calculateInvestmentProjectedProfit(principal, annualRate, holdingDays) {
+  const amount = toMoney(principal);
+  const rate = Number(annualRate || 0);
+  const days = Math.max(0, Number(holdingDays || 0));
+
+  if (!Number.isFinite(amount) || amount <= 0) return 0;
+  if (!Number.isFinite(rate) || rate <= 0) return 0;
+  if (!Number.isFinite(days) || days <= 0) return 0;
+
+  return toMoney(amount * rate * (days / 365));
+}
+
+function buildInvestmentProductPublicConfig(config) {
+  if (!config) return null;
+
+  return {
+    key: config.key,
+    name: config.name,
+    headline: config.headline,
+    cdiMultiplier: Number(config.cdiMultiplier || 0),
+    cdiReferenceAnnualPercent: Number(
+      (INVESTIMENTOS_CDI_ANUAL_REFERENCIA * 100).toFixed(2)
+    ),
+    effectiveAnnualPercent: Number(
+      (getInvestmentReferenceAnnualRate(config) * 100).toFixed(2)
+    ),
+    minAmount: toMoney(config.minAmount),
+    maxAmount:
+      config.maxAmount === null || config.maxAmount === undefined
+        ? null
+        : toMoney(config.maxAmount),
+    displayCapacityBase: toMoney(config.minDisplayCapacity || config.maxAmount || 0),
+    lockMonths: Number(config.lockMonths || 0),
+    minHoldDaysForProfit: Number(config.minHoldDaysForProfit || 0),
+    allowPartialWithdraw: Boolean(config.allowPartialWithdraw),
+    withdrawLock: Boolean(config.withdrawLock),
+    movementRequiredPerMonth: toMoney(config.movementRequiredPerMonth),
+    description: config.description || ""
   };
 }
 
@@ -2842,9 +3252,14 @@ async function saveUser(user, client = pool) {
       nome_atualizado_em, saldo_atualizado_em, senha_atualizada_em,
       status_conta, conta_banida_em, motivo_banimento,
       bonus_boas_vindas, bonus_boas_vindas_concedido_em,
+      indicado_por_user_id, indicado_por_email, indicacao_vinculada_em,
+      indicacao_qualificada_em, indicacao_bonus_creditado_em,
+      indicacao_bonus_creditado_valor, indicacao_bonus_transacao_id,
       pin_transacao_hash, pin_transacao_atualizado_em
     )
-    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
+    VALUES (
+      $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23
+    )
     ON CONFLICT (id) DO UPDATE SET
       nome = EXCLUDED.nome,
       email = EXCLUDED.email,
@@ -2859,6 +3274,13 @@ async function saveUser(user, client = pool) {
       motivo_banimento = EXCLUDED.motivo_banimento,
       bonus_boas_vindas = EXCLUDED.bonus_boas_vindas,
       bonus_boas_vindas_concedido_em = EXCLUDED.bonus_boas_vindas_concedido_em,
+      indicado_por_user_id = EXCLUDED.indicado_por_user_id,
+      indicado_por_email = EXCLUDED.indicado_por_email,
+      indicacao_vinculada_em = EXCLUDED.indicacao_vinculada_em,
+      indicacao_qualificada_em = EXCLUDED.indicacao_qualificada_em,
+      indicacao_bonus_creditado_em = EXCLUDED.indicacao_bonus_creditado_em,
+      indicacao_bonus_creditado_valor = EXCLUDED.indicacao_bonus_creditado_valor,
+      indicacao_bonus_transacao_id = EXCLUDED.indicacao_bonus_transacao_id,
       pin_transacao_hash = EXCLUDED.pin_transacao_hash,
       pin_transacao_atualizado_em = EXCLUDED.pin_transacao_atualizado_em
     `,
@@ -2877,10 +3299,288 @@ async function saveUser(user, client = pool) {
       user.motivoBanimento || "",
       toMoney(user.bonusBoasVindas),
       user.bonusBoasVindasConcedidoEm || null,
+      user.indicadoPorUserId || "",
+      user.indicadoPorEmail || "",
+      user.indicacaoVinculadaEm || null,
+      user.indicacaoQualificadaEm || null,
+      user.indicacaoBonusCreditadoEm || null,
+      toMoney(user.indicacaoBonusCreditadoValor),
+      user.indicacaoBonusTransacaoId || "",
       user.pinTransacaoHash || "",
       user.pinTransacaoAtualizadoEm || null
     ]
   );
+}
+
+async function saveUserNotification(notification, client = pool) {
+  await client.query(
+    `
+    INSERT INTO user_notifications (
+      id, user_id, type, title, body, metadata, read_at, created_at
+    )
+    VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+    ON CONFLICT (id) DO UPDATE SET
+      user_id = EXCLUDED.user_id,
+      type = EXCLUDED.type,
+      title = EXCLUDED.title,
+      body = EXCLUDED.body,
+      metadata = EXCLUDED.metadata,
+      read_at = EXCLUDED.read_at,
+      created_at = COALESCE(user_notifications.created_at, EXCLUDED.created_at)
+    `,
+    [
+      notification.id,
+      notification.userId,
+      notification.type || "",
+      notification.title || "",
+      notification.body || "",
+      JSON.stringify(notification.metadata || {}),
+      notification.readAt || null,
+      notification.createdAt || db()
+    ]
+  );
+}
+
+async function listUserNotificationsByUserId(userId, client = pool) {
+  const result = await client.query(
+    `
+    SELECT *
+    FROM user_notifications
+    WHERE user_id = $1
+    ORDER BY created_at DESC NULLS LAST, id DESC
+    LIMIT 100
+    `,
+    [userId]
+  );
+
+  return result.rows.map(mapUserNotification);
+}
+
+async function markUserNotificationsAsRead(userId, client = pool) {
+  const now = db();
+  await client.query(
+    `
+    UPDATE user_notifications
+    SET read_at = COALESCE(read_at, $2)
+    WHERE user_id = $1
+      AND read_at IS NULL
+    `,
+    [userId, now]
+  );
+}
+
+async function saveMovementLimitRequest(request, client = pool) {
+  await client.query(
+    `
+    INSERT INTO movement_limit_requests (
+      id, user_id, requested_amount, status, admin_message, pix_key,
+      notification_id, created_at, updated_at, responded_at, closed_at
+    )
+    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+    ON CONFLICT (id) DO UPDATE SET
+      user_id = EXCLUDED.user_id,
+      requested_amount = EXCLUDED.requested_amount,
+      status = EXCLUDED.status,
+      admin_message = EXCLUDED.admin_message,
+      pix_key = EXCLUDED.pix_key,
+      notification_id = EXCLUDED.notification_id,
+      updated_at = EXCLUDED.updated_at,
+      responded_at = EXCLUDED.responded_at,
+      closed_at = EXCLUDED.closed_at
+    `,
+    [
+      request.id,
+      request.userId,
+      toMoney(request.requestedAmount),
+      getMovementRequestStatusLabel(request.status),
+      request.adminMessage || "",
+      request.pixKey || "",
+      request.notificationId || "",
+      request.createdAt || db(),
+      request.updatedAt || db(),
+      request.respondedAt || null,
+      request.closedAt || null
+    ]
+  );
+}
+
+async function getMovementLimitRequestById(id, client = pool) {
+  const result = await client.query(
+    "SELECT * FROM movement_limit_requests WHERE id = $1 LIMIT 1",
+    [id]
+  );
+  return mapMovementLimitRequest(result.rows[0]);
+}
+
+async function getMovementLimitRequestByIdForUpdate(id, client) {
+  const result = await client.query(
+    "SELECT * FROM movement_limit_requests WHERE id = $1 LIMIT 1 FOR UPDATE",
+    [id]
+  );
+  return mapMovementLimitRequest(result.rows[0]);
+}
+
+async function getOpenMovementLimitRequestByUserId(userId, client = pool) {
+  const result = await client.query(
+    `
+    SELECT *
+    FROM movement_limit_requests
+    WHERE user_id = $1
+      AND status IN ($2, $3)
+    ORDER BY created_at DESC NULLS LAST, id DESC
+    LIMIT 1
+    `,
+    [
+      userId,
+      MOVEMENT_LIMIT_REQUEST_STATUS_PENDING,
+      MOVEMENT_LIMIT_REQUEST_STATUS_RESPONDED
+    ]
+  );
+  return mapMovementLimitRequest(result.rows[0]);
+}
+
+async function listMovementLimitRequests(client = pool) {
+  const result = await client.query(
+    `
+    SELECT
+      r.*,
+      u.email AS user_email,
+      u.nome AS user_nome
+    FROM movement_limit_requests r
+    LEFT JOIN usuarios u ON u.id = r.user_id
+    ORDER BY r.created_at DESC NULLS LAST, r.id DESC
+    `
+  );
+
+  return result.rows.map((row) => ({
+    ...mapMovementLimitRequest(row),
+    user: row.user_email || row.user_nome
+      ? {
+          id: row.user_id,
+          nome: row.user_nome || row.user_email?.split("@")[0] || "",
+          email: row.user_email || ""
+        }
+      : null
+  }));
+}
+
+async function saveInvestmentReserve(reserve, client = pool) {
+  await client.query(
+    `
+    INSERT INTO investment_reserves (
+      id, user_id, product_key, product_name, product_headline, cdi_multiplier,
+      annual_rate, principal_invested_total, principal_remaining, profit_paid_total,
+      capacity_limit, min_amount, release_at, profit_eligible_at, lock_months,
+      min_hold_days_for_profit, movement_required_per_month, allow_partial_withdraw,
+      status, created_at, updated_at, last_withdrawn_at, closed_at
+    )
+    VALUES (
+      $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23
+    )
+    ON CONFLICT (id) DO UPDATE SET
+      user_id = EXCLUDED.user_id,
+      product_key = EXCLUDED.product_key,
+      product_name = EXCLUDED.product_name,
+      product_headline = EXCLUDED.product_headline,
+      cdi_multiplier = EXCLUDED.cdi_multiplier,
+      annual_rate = EXCLUDED.annual_rate,
+      principal_invested_total = EXCLUDED.principal_invested_total,
+      principal_remaining = EXCLUDED.principal_remaining,
+      profit_paid_total = EXCLUDED.profit_paid_total,
+      capacity_limit = EXCLUDED.capacity_limit,
+      min_amount = EXCLUDED.min_amount,
+      release_at = EXCLUDED.release_at,
+      profit_eligible_at = EXCLUDED.profit_eligible_at,
+      lock_months = EXCLUDED.lock_months,
+      min_hold_days_for_profit = EXCLUDED.min_hold_days_for_profit,
+      movement_required_per_month = EXCLUDED.movement_required_per_month,
+      allow_partial_withdraw = EXCLUDED.allow_partial_withdraw,
+      status = EXCLUDED.status,
+      updated_at = EXCLUDED.updated_at,
+      last_withdrawn_at = EXCLUDED.last_withdrawn_at,
+      closed_at = EXCLUDED.closed_at
+    `,
+    [
+      reserve.id,
+      reserve.userId,
+      normalizeInvestmentProductKey(reserve.productKey),
+      reserve.productName || "",
+      reserve.productHeadline || "",
+      Number(reserve.cdiMultiplier || 0),
+      Number(reserve.annualRate || 0),
+      toMoney(reserve.principalInvestedTotal),
+      toMoney(reserve.principalRemaining),
+      toMoney(reserve.profitPaidTotal),
+      toMoney(reserve.capacityLimit),
+      toMoney(reserve.minAmount),
+      reserve.releaseAt || null,
+      reserve.profitEligibleAt || null,
+      Number(reserve.lockMonths || 0),
+      Number(reserve.minHoldDaysForProfit || 0),
+      toMoney(reserve.movementRequiredPerMonth),
+      Boolean(reserve.allowPartialWithdraw),
+      getInvestmentReserveStatus(reserve.status),
+      reserve.createdAt || db(),
+      reserve.updatedAt || db(),
+      reserve.lastWithdrawnAt || null,
+      reserve.closedAt || null
+    ]
+  );
+}
+
+async function getInvestmentReserveById(id, client = pool) {
+  const result = await client.query(
+    "SELECT * FROM investment_reserves WHERE id = $1 LIMIT 1",
+    [id]
+  );
+  return mapInvestmentReserve(result.rows[0]);
+}
+
+async function getInvestmentReserveByIdForUpdate(id, client) {
+  const result = await client.query(
+    "SELECT * FROM investment_reserves WHERE id = $1 LIMIT 1 FOR UPDATE",
+    [id]
+  );
+  return mapInvestmentReserve(result.rows[0]);
+}
+
+async function listInvestmentReservesByUserId(userId, client = pool) {
+  const result = await client.query(
+    `
+    SELECT *
+    FROM investment_reserves
+    WHERE user_id = $1
+    ORDER BY created_at DESC NULLS LAST, id DESC
+    `,
+    [userId]
+  );
+
+  return result.rows.map(mapInvestmentReserve);
+}
+
+async function listInvestmentReserves(client = pool) {
+  const result = await client.query(
+    `
+    SELECT
+      r.*,
+      u.email AS user_email,
+      u.nome AS user_nome
+    FROM investment_reserves r
+    LEFT JOIN usuarios u ON u.id = r.user_id
+    ORDER BY r.created_at DESC NULLS LAST, r.id DESC
+    `
+  );
+
+  return result.rows.map((row) => ({
+    ...mapInvestmentReserve(row),
+    user: row.user_email || row.user_nome
+      ? {
+          id: row.user_id,
+          nome: row.user_nome || row.user_email?.split("@")[0] || "",
+          email: row.user_email || ""
+        }
+      : null
+  }));
 }
 
 async function getDepositoById(id, client = pool) {
@@ -3456,7 +4156,9 @@ function computeUserFinancialContext(transactions, currentBalance = 0) {
     if (tx.direction === "credit") {
       if (
         tx.sourceType === "welcome_bonus" ||
-        tx.operationType === "welcome_bonus"
+        tx.operationType === "welcome_bonus" ||
+        tx.sourceType === "referral_bonus" ||
+        tx.operationType === "referral_bonus"
       ) {
         saldoBonusAtual = toMoney(saldoBonusAtual + amount);
         continue;
@@ -3614,6 +4316,10 @@ function buildAdminUserResponse(user, context = null) {
     ...buildDefaultAdminUserContext(user),
     ...(context || {})
   };
+  const indicacao = buildIndicacaoParticipacao(
+    user,
+    financialContext.valorRecebidoViaPix
+  );
 
   return {
     id: user.id,
@@ -3627,6 +4333,17 @@ function buildAdminUserResponse(user, context = null) {
     motivoBanimento: user.motivoBanimento || "",
     bonusBoasVindas: toMoney(user.bonusBoasVindas),
     bonusBoasVindasConcedidoEm: user.bonusBoasVindasConcedidoEm || null,
+    indicadoPorUserId: user.indicadoPorUserId || "",
+    indicadoPorEmail: user.indicadoPorEmail || "",
+    indicacaoVinculadaEm: user.indicacaoVinculadaEm || null,
+    indicacaoQualificadaEm: user.indicacaoQualificadaEm || null,
+    indicacaoBonusCreditadoEm: user.indicacaoBonusCreditadoEm || null,
+    indicacaoBonusCreditadoValor: toMoney(user.indicacaoBonusCreditadoValor),
+    indicacaoStatus: indicacao.status,
+    indicacaoValorNecessario: indicacao.valorNecessario,
+    investimosLiberado:
+      toMoney(financialContext.valorRecebidoViaPix) >= INVESTIMENTOS_PIX_DESBLOQUEIO_MIN,
+    investimosValorNecessario: INVESTIMENTOS_PIX_DESBLOQUEIO_MIN,
     saldoBonusAtual: toMoney(financialContext.saldoBonusAtual),
     saldoRealAtual: toMoney(financialContext.saldoRealAtual),
     valorRecebidoViaPix: toMoney(financialContext.valorRecebidoViaPix),
@@ -3659,6 +4376,248 @@ async function getValorRecebidoViaPix(userId, client = pool) {
   );
 
   return toMoney(result.rows[0]?.total);
+}
+
+async function getInvestimentosEligibilityContext(userId, client = pool) {
+  const valorRecebidoViaPix = await getValorRecebidoViaPix(userId, client);
+  const faltaParaDesbloqueio = Math.max(
+    0,
+    toMoney(INVESTIMENTOS_PIX_DESBLOQUEIO_MIN - valorRecebidoViaPix)
+  );
+
+  return {
+    valorRecebidoViaPix,
+    valorNecessarioDesbloqueio: INVESTIMENTOS_PIX_DESBLOQUEIO_MIN,
+    faltaParaDesbloqueio,
+    investimosLiberado: valorRecebidoViaPix >= INVESTIMENTOS_PIX_DESBLOQUEIO_MIN
+  };
+}
+
+async function getUserMonthlyMovementTotal(userId, referenceDate = new Date(), client = pool) {
+  const result = await client.query(
+    `
+    SELECT COALESCE(SUM(amount), 0) AS total
+    FROM financial_transactions
+    WHERE user_id = $1
+      AND status = 'completed'
+      AND created_at >= $2
+      AND created_at < $3
+      AND source_type NOT IN ('welcome_bonus', 'referral_bonus', 'admin_adjustment', 'investment_reserve')
+      AND operation_type NOT IN ('manual_balance_adjustment', 'welcome_bonus', 'referral_bonus')
+    `,
+    [userId, getStartOfMonthIso(referenceDate), getStartOfNextMonthIso(referenceDate)]
+  );
+
+  return toMoney(result.rows[0]?.total);
+}
+
+function getInvestmentReserveCapacityBase(reserve, productConfig = null) {
+  const config = productConfig || getInvestmentProductConfig(reserve?.productKey);
+  if (Number.isFinite(Number(reserve?.capacityLimit)) && Number(reserve?.capacityLimit) > 0) {
+    return toMoney(reserve.capacityLimit);
+  }
+  if (config?.maxAmount !== null && config?.maxAmount !== undefined) {
+    return toMoney(config.maxAmount);
+  }
+  return toMoney(config?.minDisplayCapacity || config?.minAmount || reserve?.principalInvestedTotal || 0);
+}
+
+function buildInvestmentReserveResponse(
+  reserve,
+  {
+    now = new Date(),
+    currentMonthMovement = 0
+  } = {}
+) {
+  const config = getInvestmentProductConfig(reserve?.productKey);
+  if (!reserve || !config) return null;
+
+  const nowDate = now instanceof Date ? now : new Date(now || Date.now());
+  const principalRemaining = toMoney(reserve.principalRemaining);
+  const principalInvestedTotal = toMoney(reserve.principalInvestedTotal);
+  const createdAt = reserve.createdAt || null;
+  const releaseAt = reserve.releaseAt || null;
+  const profitEligibleAt = reserve.profitEligibleAt || null;
+  const holdDays = diffDaysFloor(createdAt, nowDate);
+  const isClosed = getInvestmentReserveStatus(reserve.status) === INVESTMENT_RESERVE_STATUS_CLOSED || principalRemaining <= 0;
+  const releaseReached = !releaseAt || new Date(releaseAt).getTime() <= nowDate.getTime();
+  const movementRequired = toMoney(reserve.movementRequiredPerMonth || config.movementRequiredPerMonth || 0);
+  const movementCurrent = toMoney(currentMonthMovement);
+  const missingMovement = Math.max(0, toMoney(movementRequired - movementCurrent));
+  const juniorMovementOk = movementRequired <= 0 || movementCurrent >= movementRequired;
+  const profitEligibleByTime =
+    !profitEligibleAt || new Date(profitEligibleAt).getTime() <= nowDate.getTime();
+  const canWithdrawPrincipal =
+    !isClosed &&
+    (config.withdrawLock ? releaseReached : principalRemaining > 0);
+  const profitActiveNow =
+    !isClosed &&
+    principalRemaining > 0 &&
+    profitEligibleByTime &&
+    (!config.withdrawLock ? juniorMovementOk : releaseReached);
+  const projectedDaysNow = config.withdrawLock
+    ? diffDaysFloor(createdAt, releaseAt || nowDate)
+    : holdDays;
+  const projectedProfitNow = profitActiveNow
+    ? calculateInvestmentProjectedProfit(principalRemaining, reserve.annualRate, projectedDaysNow)
+    : 0;
+  const projectedProfitOnRelease = calculateInvestmentProjectedProfit(
+    principalRemaining,
+    reserve.annualRate,
+    config.withdrawLock
+      ? diffDaysFloor(createdAt, releaseAt || nowDate)
+      : Math.max(projectedDaysNow, diffDaysFloor(createdAt, profitEligibleAt || nowDate))
+  );
+  const capacityBase = getInvestmentReserveCapacityBase(reserve, config);
+  const capacityPercent = capacityBase > 0
+    ? Math.min(100, Number(((principalRemaining / capacityBase) * 100).toFixed(2)))
+    : 0;
+  const remainingCapacity = Math.max(0, toMoney(capacityBase - principalRemaining));
+  const daysUntilRelease = releaseAt
+    ? Math.max(0, diffDaysFloor(nowDate, releaseAt))
+    : 0;
+  const daysUntilProfitEligible = profitEligibleAt
+    ? Math.max(0, diffDaysFloor(nowDate, profitEligibleAt))
+    : 0;
+  const productStatus = isClosed
+    ? "encerrada"
+    : config.withdrawLock
+      ? releaseReached
+        ? "liberada"
+        : "travada"
+      : profitActiveNow
+        ? "rendendo"
+        : "aguardando_meta";
+
+  return {
+    id: reserve.id,
+    productKey: config.key,
+    productName: reserve.productName || config.name,
+    productHeadline: reserve.productHeadline || config.headline,
+    status: productStatus,
+    principalInvestedTotal,
+    principalRemaining,
+    principalWithdrawableNow: canWithdrawPrincipal ? principalRemaining : 0,
+    profitPaidTotal: toMoney(reserve.profitPaidTotal),
+    annualRatePercent: Number((Number(reserve.annualRate || 0) * 100).toFixed(2)),
+    cdiMultiplier: Number(reserve.cdiMultiplier || config.cdiMultiplier || 0),
+    capacityBase,
+    remainingCapacity,
+    capacityPercent,
+    releaseAt,
+    profitEligibleAt,
+    createdAt,
+    lastWithdrawnAt: reserve.lastWithdrawnAt || null,
+    closedAt: reserve.closedAt || null,
+    holdDays,
+    daysUntilRelease,
+    daysUntilProfitEligible,
+    canWithdraw: Boolean(canWithdrawPrincipal),
+    allowPartialWithdraw: Boolean(reserve.allowPartialWithdraw),
+    withdrawLock: Boolean(config.withdrawLock),
+    movementRequiredPerMonth: movementRequired,
+    currentMonthMovement: movementCurrent,
+    missingMovementThisMonth: missingMovement,
+    juniorMovementOk,
+    profitEligibleByTime,
+    profitActiveNow,
+    estimatedProfitNow: projectedProfitNow,
+    estimatedProfitOnRelease: projectedProfitOnRelease
+  };
+}
+
+function buildInvestmentSummary(reserves, eligibilityContext, currentMonthMovement) {
+  const list = Array.isArray(reserves) ? reserves : [];
+  const totalPrincipal = toMoney(
+    list.reduce((sum, item) => sum + toMoney(item?.principalRemaining), 0)
+  );
+  const totalProfitPaid = toMoney(
+    list.reduce((sum, item) => sum + toMoney(item?.profitPaidTotal), 0)
+  );
+  const withdrawableNow = toMoney(
+    list.reduce((sum, item) => sum + toMoney(item?.canWithdraw ? item.principalWithdrawableNow : 0), 0)
+  );
+  const nextRelease = list
+    .filter((item) => item?.releaseAt && item?.status !== "encerrada")
+    .sort((a, b) => new Date(a.releaseAt).getTime() - new Date(b.releaseAt).getTime())[0];
+
+  return {
+    totalPrincipal,
+    totalProfitPaid,
+    activeReserveCount: list.filter((item) => item?.status !== "encerrada").length,
+    withdrawableNow,
+    nextReleaseAt: nextRelease?.releaseAt || null,
+    currentMonthMovement: toMoney(currentMonthMovement),
+    juniorMovementRequiredPerMonth: INVESTIMENTOS_JUNIOR_MOVIMENTACAO_MENSAL_MIN,
+    juniorMovementMissing: Math.max(
+      0,
+      toMoney(INVESTIMENTOS_JUNIOR_MOVIMENTACAO_MENSAL_MIN - toMoney(currentMonthMovement))
+    ),
+    investimosLiberado: Boolean(eligibilityContext?.investimosLiberado),
+    valorRecebidoViaPix: toMoney(eligibilityContext?.valorRecebidoViaPix),
+    valorNecessarioDesbloqueio: toMoney(eligibilityContext?.valorNecessarioDesbloqueio),
+    faltaParaDesbloqueio: toMoney(eligibilityContext?.faltaParaDesbloqueio)
+  };
+}
+
+async function buildInvestimentosDashboardResponse(user, client = pool) {
+  const eligibilityContext = await getInvestimentosEligibilityContext(user.id, client);
+  const currentMonthMovement = await getUserMonthlyMovementTotal(user.id, new Date(), client);
+  const [reserveRows, currentLimitRequest] = await Promise.all([
+    listInvestmentReservesByUserId(user.id, client),
+    getOpenMovementLimitRequestByUserId(user.id, client)
+  ]);
+
+  const reserves = reserveRows.map((reserve) =>
+    buildInvestmentReserveResponse(reserve, {
+      now: new Date(),
+      currentMonthMovement
+    })
+  );
+
+  return {
+    eligibility: eligibilityContext,
+    currentMonthMovement,
+    products: Object.values(INVESTMENT_PRODUCT_DEFINITIONS).map(
+      buildInvestmentProductPublicConfig
+    ),
+    summary: buildInvestmentSummary(reserves, eligibilityContext, currentMonthMovement),
+    reserves,
+    currentLimitRequest: currentLimitRequest
+      ? {
+          id: currentLimitRequest.id,
+          requestedAmount: toMoney(currentLimitRequest.requestedAmount),
+          status: currentLimitRequest.status,
+          adminMessage: currentLimitRequest.adminMessage || "",
+          pixKey: currentLimitRequest.pixKey || "",
+          createdAt: currentLimitRequest.createdAt || null,
+          respondedAt: currentLimitRequest.respondedAt || null
+        }
+      : null
+  };
+}
+
+function buildMovementLimitPixKeyNotification({
+  userId,
+  requestId,
+  requestedAmount,
+  pixKey
+}) {
+  return {
+    id: buildId("notif"),
+    userId,
+    type: USER_NOTIFICATION_TYPE_LIMIT_REQUEST_PIX_KEY,
+    title: "Limite especial em análise",
+    body: "Recebemos sua solicitação, envie essa chave pix para o pagador.",
+    metadata: {
+      requestId,
+      requestedAmount: toMoney(requestedAmount),
+      pixKey: String(pixKey || "").trim(),
+      copyLabel: "Copiar chave Pix"
+    },
+    readAt: null,
+    createdAt: db()
+  };
 }
 
 async function listTransferenciasRecebidasPorUsuario(userId, client = pool) {
@@ -3750,7 +4709,7 @@ async function getResumoFinanceiroUsuario(userId, client = pool) {
       ) AS transfer_out_count,
       COUNT(*) FILTER (
         WHERE status = 'completed'
-          AND source_type NOT IN ('welcome_bonus', 'transfer')
+          AND source_type NOT IN ('welcome_bonus', 'referral_bonus', 'transfer')
       ) AS other_completed_ops,
       COALESCE(SUM(
         CASE
@@ -3811,7 +4770,7 @@ async function getResumoFinanceiroUsuarios(userIds, client = pool) {
       ) AS transfer_out_count,
       COUNT(*) FILTER (
         WHERE status = 'completed'
-          AND source_type NOT IN ('welcome_bonus', 'transfer')
+          AND source_type NOT IN ('welcome_bonus', 'referral_bonus', 'transfer')
       ) AS other_completed_ops,
       COALESCE(SUM(
         CASE
@@ -3843,6 +4802,191 @@ async function getResumoFinanceiroUsuarios(userIds, client = pool) {
   }
 
   return resumoMap;
+}
+
+function buildIndicacaoListItem(user, qualifyingPixTotal = 0) {
+  return {
+    userId: user.id,
+    nome: user.nome || user.email?.split("@")[0] || "",
+    email: user.email || "",
+    criadoEm: user.criadoEm || null,
+    status: getIndicacaoStatus(user, qualifyingPixTotal),
+    qualifyingPixTotal: toMoney(qualifyingPixTotal),
+    valorNecessario: INDICACAO_PIX_QUALIFICACAO_MIN,
+    bonusValor: BONUS_INDICACAO_VALOR,
+    vinculadaEm: user.indicacaoVinculadaEm || null,
+    qualificadaEm: user.indicacaoQualificadaEm || null,
+    bonusCreditadoEm: user.indicacaoBonusCreditadoEm || null,
+    bonusCreditadoValor: toMoney(user.indicacaoBonusCreditadoValor)
+  };
+}
+
+function buildIndicacoesResumo(items = []) {
+  const total = Array.isArray(items) ? items.length : 0;
+  const concluidos = (Array.isArray(items) ? items : []).filter(
+    (item) => item?.status === "concluido"
+  ).length;
+  const pendentes = Math.max(0, total - concluidos);
+
+  return {
+    total,
+    pendentes,
+    concluidos,
+    bonusTotalLiberado: toMoney(concluidos * BONUS_INDICACAO_VALOR)
+  };
+}
+
+async function listIndicacoesPorIndicadorIds(indicadorIds, client = pool) {
+  const ids = Array.from(
+    new Set(
+      (Array.isArray(indicadorIds) ? indicadorIds : [])
+        .map((id) => String(id || "").trim())
+        .filter(Boolean)
+    )
+  );
+
+  const indicacoesMap = new Map(ids.map((id) => [id, []]));
+
+  if (!ids.length) {
+    return indicacoesMap;
+  }
+
+  const result = await client.query(
+    `
+    SELECT *
+    FROM usuarios
+    WHERE indicado_por_user_id = ANY($1::text[])
+    ORDER BY criado_em DESC NULLS LAST, id ASC
+    `,
+    [ids]
+  );
+
+  const indicados = result.rows.map(mapUser);
+  const resumoMap = await getResumoFinanceiroUsuarios(
+    indicados.map((user) => user.id),
+    client
+  );
+
+  for (const indicado of indicados) {
+    const qualifyingPixTotal = toMoney(
+      resumoMap.get(indicado.id)?.qualifyingPixTotal
+    );
+    if (!indicacoesMap.has(indicado.indicadoPorUserId)) {
+      indicacoesMap.set(indicado.indicadoPorUserId, []);
+    }
+    indicacoesMap
+      .get(indicado.indicadoPorUserId)
+      .push(buildIndicacaoListItem(indicado, qualifyingPixTotal));
+  }
+
+  return indicacoesMap;
+}
+
+async function buildIndicacoesProgramaResposta(user, client = pool) {
+  const [referrer, indicacoesMap, qualifyingPixTotal] = await Promise.all([
+    user?.indicadoPorUserId ? getUserById(user.indicadoPorUserId, client) : null,
+    listIndicacoesPorIndicadorIds([user.id], client),
+    getValorRecebidoViaPix(user.id, client)
+  ]);
+
+  const meusIndicados = indicacoesMap.get(user.id) || [];
+
+  return {
+    meuEmailIndicacao: user.email,
+    bonusValor: BONUS_INDICACAO_VALOR,
+    valorNecessarioDepositos: INDICACAO_PIX_QUALIFICACAO_MIN,
+    participacao: buildIndicacaoParticipacao(user, qualifyingPixTotal, referrer),
+    resumo: buildIndicacoesResumo(meusIndicados),
+    meusIndicados
+  };
+}
+
+async function aplicarBonusIndicacaoSeElegivel(userId, client = pool) {
+  const indicado =
+    client === pool
+      ? await getUserById(userId, client)
+      : await getUserByIdForUpdate(userId, client);
+
+  if (!indicado?.id || !indicado.indicadoPorUserId) {
+    return { creditado: false, motivo: "sem_indicacao" };
+  }
+
+  if (indicado.indicacaoBonusCreditadoEm) {
+    return { creditado: false, motivo: "bonus_ja_creditado" };
+  }
+
+  const qualifyingPixTotal = await getValorRecebidoViaPix(indicado.id, client);
+
+  if (qualifyingPixTotal < INDICACAO_PIX_QUALIFICACAO_MIN) {
+    return {
+      creditado: false,
+      motivo: "meta_nao_atingida",
+      qualifyingPixTotal
+    };
+  }
+
+  if (!indicado.indicacaoQualificadaEm) {
+    indicado.indicacaoQualificadaEm = db();
+  }
+
+  const indicador =
+    client === pool
+      ? await getUserById(indicado.indicadoPorUserId, client)
+      : await getUserByIdForUpdate(indicado.indicadoPorUserId, client);
+
+  if (!indicador?.id) {
+    await saveUser(indicado, client);
+    return {
+      creditado: false,
+      motivo: "indicador_nao_encontrado",
+      qualifyingPixTotal
+    };
+  }
+
+  const descricaoBonus = `Bonus por indicacao liberado por ${indicado.email}`;
+  const bonusTx = await createFinancialTransaction(client, {
+    userId: indicador.id,
+    referenceKey: `indicacao:${indicado.id}:bonus`,
+    sourceType: "referral_bonus",
+    sourceId: indicado.id,
+    operationType: "referral_bonus",
+    direction: "credit",
+    amount: BONUS_INDICACAO_VALOR,
+    status: "completed",
+    description: descricaoBonus,
+    metadata: {
+      tipoBonus: "indicacao",
+      indicadoUserId: indicado.id,
+      indicadoEmail: indicado.email,
+      qualifyingPixTotal
+    }
+  });
+
+  const indicadorAtualizado = await applyLedgerChange(client, {
+    userId: indicador.id,
+    financialTransactionId: bonusTx.id,
+    entryType: "credit",
+    amount: BONUS_INDICACAO_VALOR,
+    description: descricaoBonus,
+    metadata: {
+      tipoBonus: "indicacao",
+      indicadoUserId: indicado.id,
+      indicadoEmail: indicado.email
+    }
+  });
+
+  indicado.indicacaoBonusCreditadoEm = db();
+  indicado.indicacaoBonusCreditadoValor = BONUS_INDICACAO_VALOR;
+  indicado.indicacaoBonusTransacaoId = bonusTx.id;
+
+  await saveUser(indicado, client);
+
+  return {
+    creditado: true,
+    indicador: indicadorAtualizado,
+    indicado,
+    qualifyingPixTotal
+  };
 }
 
 function isResumoContaOrigemFraudeBonus(user, resumo = null) {
@@ -4650,14 +5794,26 @@ app.post("/admin/banner-config", authAdmin, async (req, res) => {
 
 app.post("/register", async (req, res) => {
   try {
-    const { email, senha } = req.body;
+    const { email, senha, veioPorIndicacao, emailIndicador } = req.body;
 
     if (!email || !senha) {
       return res.status(400).json({ error: "Email e senha sao obrigatorios" });
     }
 
-
     const emailNorm = normalizeEmail(email);
+    const usarIndicacao =
+      veioPorIndicacao === true || Boolean(String(emailIndicador || "").trim());
+    const emailIndicadorNorm = usarIndicacao
+      ? normalizeEmail(emailIndicador)
+      : "";
+
+    if (usarIndicacao && !emailIndicadorNorm) {
+      return res.status(400).json({ error: "Informe o email de quem te indicou" });
+    }
+
+    if (usarIndicacao && emailIndicadorNorm === emailNorm) {
+      return res.status(400).json({ error: "Voce nao pode indicar a propria conta" });
+    }
 
     const exists = await pool.query(
       "SELECT id FROM usuarios WHERE email = $1 LIMIT 1",
@@ -4668,6 +5824,13 @@ app.post("/register", async (req, res) => {
       return res.status(400).json({ error: "Usuario ja existe" });
     }
 
+    const indicador = usarIndicacao
+      ? await getUserByEmail(emailIndicadorNorm)
+      : null;
+
+    if (usarIndicacao && !indicador) {
+      return res.status(400).json({ error: "Email do indicador nao encontrado" });
+    }
 
     const hash = await bcrypt.hash(String(senha), 10);
     const novoUsuario = await runInTransaction(async (client) => {
@@ -4684,65 +5847,23 @@ app.post("/register", async (req, res) => {
         statusConta: STATUS_CONTA_ATIVA,
         contaBanidaEm: null,
         motivoBanimento: "",
-        bonusBoasVindas: BONUS_BOAS_VINDAS_VALOR,
-        bonusBoasVindasConcedidoEm: db()
+        bonusBoasVindas: 0,
+        bonusBoasVindasConcedidoEm: null,
+        indicadoPorUserId: indicador?.id || "",
+        indicadoPorEmail: indicador?.email || "",
+        indicacaoVinculadaEm: indicador ? db() : null,
+        indicacaoQualificadaEm: null,
+        indicacaoBonusCreditadoEm: null,
+        indicacaoBonusCreditadoValor: 0,
+        indicacaoBonusTransacaoId: ""
       };
 
       await saveUser(user, client);
-
-      const txBonus = await createFinancialTransaction(client, {
-        userId: user.id,
-        referenceKey: `welcome-bonus:${user.id}`,
-        sourceType: "welcome_bonus",
-        sourceId: user.id,
-        operationType: "welcome_bonus",
-        direction: "credit",
-        amount: BONUS_BOAS_VINDAS_VALOR,
-        status: "completed",
-        description: "Saldo de boas-vindas Sigmo",
-        metadata: {
-          tipoBonus: "boas_vindas"
-        }
-      });
-
-      const userAtualizado = await applyLedgerChange(client, {
-        userId: user.id,
-        financialTransactionId: txBonus.id,
-        entryType: "credit",
-        amount: BONUS_BOAS_VINDAS_VALOR,
-        description: "Saldo de boas-vindas Sigmo",
-        metadata: {
-          tipoBonus: "boas_vindas"
-        }
-      });
-
-      await saveDeposito(
-        {
-          id: buildId("dep"),
-          userId: user.id,
-          valor: BONUS_BOAS_VINDAS_VALOR,
-          chavePix: "",
-          tipoChave: "",
-          tipoTransacao: "entrada",
-          status: "aprovado",
-          comprovanteUrl: "",
-          descricao: "Saldo de boas-vindas Sigmo",
-          repassarTaxa: false,
-          taxaPix: 0,
-          valorLiquidoPix: 0,
-          valorDebitadoPix: 0,
-          criadoEm: db(),
-          aprovadoEm: db(),
-          recusadoEm: null,
-          comprovanteEnviadoEm: null
-        },
-        client
-      );
-
-      return userAtualizado;
+      return user;
     });
 
     const token = signUserToken(novoUsuario);
+    const indicacao = buildIndicacaoParticipacao(novoUsuario, 0, indicador);
 
     res.status(201).json(
       attachUserAuthToPayload(
@@ -4750,7 +5871,7 @@ app.post("/register", async (req, res) => {
           pixDesbloqueado: false,
           valorRecebidoViaPix: 0,
           valorMinimoDesbloqueioPix: PIX_SAQUE_DESBLOQUEIO_MIN,
-          welcomeBonusGranted: true
+          indicacao
         }),
         token
       )
@@ -5832,6 +6953,575 @@ app.get("/usuario/:id", authUser, async (req, res) => {
   }
 });
 
+app.get("/usuario/:id/indicacoes", authUser, async (req, res) => {
+  try {
+    const authenticatedUserId = getAuthenticatedUserId(req);
+    const requestedUserId = String(req.params.id || "").trim();
+
+    if (!authenticatedUserId || requestedUserId !== authenticatedUserId) {
+      return sendJsonError(
+        res,
+        403,
+        "USER_FORBIDDEN",
+        "Acesso negado para as indicacoes desta conta"
+      );
+    }
+
+    const user = await getUserById(authenticatedUserId);
+
+    if (!user) {
+      return res.status(404).json({ error: "Usuário não encontrado" });
+    }
+
+    res.json(await buildIndicacoesProgramaResposta(user));
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: "Erro ao buscar indicacoes" });
+  }
+});
+
+app.get("/usuario/:id/notificacoes", authUser, async (req, res) => {
+  try {
+    const authenticatedUserId = getAuthenticatedUserId(req);
+    const requestedUserId = String(req.params.id || "").trim();
+
+    if (!authenticatedUserId || requestedUserId !== authenticatedUserId) {
+      return sendJsonError(
+        res,
+        403,
+        "USER_FORBIDDEN",
+        "Acesso negado para as notificacoes desta conta"
+      );
+    }
+
+    const user = await getUserById(authenticatedUserId);
+
+    if (!user) {
+      return res.status(404).json({ error: "Usuário não encontrado" });
+    }
+
+    const notifications = await listUserNotificationsByUserId(user.id);
+    res.json({
+      notifications,
+      unreadCount: notifications.filter((item) => !item.readAt).length
+    });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: "Erro ao buscar notificacoes" });
+  }
+});
+
+app.post("/usuario/:id/notificacoes/marcar-lidas", authUser, async (req, res) => {
+  try {
+    const authenticatedUserId = getAuthenticatedUserId(req);
+    const requestedUserId = String(req.params.id || "").trim();
+
+    if (!authenticatedUserId || requestedUserId !== authenticatedUserId) {
+      return sendJsonError(
+        res,
+        403,
+        "USER_FORBIDDEN",
+        "Acesso negado para esta conta"
+      );
+    }
+
+    await runInTransaction(async (client) => {
+      await markUserNotificationsAsRead(authenticatedUserId, client);
+    });
+
+    res.json({ message: "Notificacoes marcadas como lidas" });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: "Erro ao atualizar notificacoes" });
+  }
+});
+
+app.get("/usuario/:id/investimos", authUser, async (req, res) => {
+  try {
+    const authenticatedUserId = getAuthenticatedUserId(req);
+    const requestedUserId = String(req.params.id || "").trim();
+
+    if (!authenticatedUserId || requestedUserId !== authenticatedUserId) {
+      return sendJsonError(
+        res,
+        403,
+        "INVESTIMENTOS_FORBIDDEN",
+        "Acesso negado para a area Investimos"
+      );
+    }
+
+    const user = await getUserById(authenticatedUserId);
+
+    if (!user) {
+      return res.status(404).json({ error: "Usuário não encontrado" });
+    }
+
+    if (isContaBanida(user)) {
+      return res.status(403).json(buildContaBanidaPayload(user));
+    }
+
+    res.json(await buildInvestimentosDashboardResponse(user));
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: "Erro ao carregar Investimos" });
+  }
+});
+
+app.post("/usuario/:id/investimos/reservas", authUser, async (req, res) => {
+  try {
+    const authenticatedUserId = getAuthenticatedUserId(req);
+    const requestedUserId = String(req.params.id || "").trim();
+    const productKey = normalizeInvestmentProductKey(req.body?.productKey);
+    const amount = toMoney(req.body?.amount);
+
+    if (!authenticatedUserId || requestedUserId !== authenticatedUserId) {
+      return sendJsonError(
+        res,
+        403,
+        "INVESTIMENTOS_FORBIDDEN",
+        "Acesso negado para esta conta"
+      );
+    }
+
+    if (!productKey) {
+      return res.status(400).json({ error: "Produto de investimento invalido" });
+    }
+
+    if (!Number.isFinite(amount) || amount <= 0) {
+      return res.status(400).json({ error: "Informe um valor valido para investir" });
+    }
+
+    const result = await runInTransaction(async (client) => {
+      const user = await getUserByIdForUpdate(authenticatedUserId, client);
+
+      if (!user) {
+        throw new Error("Usuário não encontrado");
+      }
+
+      if (isContaBanida(user)) {
+        const error = new Error(getMensagemContaBanida());
+        error.statusCode = 403;
+        error.payload = buildContaBanidaPayload(user);
+        throw error;
+      }
+
+      const eligibility = await getInvestimentosEligibilityContext(user.id, client);
+
+      if (!eligibility.investimosLiberado) {
+        const error = new Error(
+          `A area Investimos sera liberada apos ${eligibility.valorNecessarioDesbloqueio.toFixed(2)} em depositos Pix aprovados`
+        );
+        error.statusCode = 403;
+        error.payload = {
+          error:
+            `A area Investimos sera liberada apos R$${eligibility.valorNecessarioDesbloqueio.toFixed(2)} em depositos Pix aprovados`,
+          eligibility
+        };
+        throw error;
+      }
+
+      const config = getInvestmentProductConfig(productKey);
+
+      if (!config) {
+        throw new Error("Produto de investimento invalido");
+      }
+
+      if (amount < toMoney(config.minAmount)) {
+        throw new Error(
+          `O aporte minimo para ${config.name} e de R$${toMoney(config.minAmount).toFixed(2)}`
+        );
+      }
+
+      if (
+        config.maxAmount !== null &&
+        config.maxAmount !== undefined &&
+        amount > toMoney(config.maxAmount)
+      ) {
+        throw new Error(
+          `O valor maximo por estrutura ${config.name} e de R$${toMoney(config.maxAmount).toFixed(2)}`
+        );
+      }
+
+      if (toMoney(user.saldo) < amount) {
+        throw new Error("Saldo insuficiente");
+      }
+
+      const now = new Date();
+      const releaseAt = config.lockMonths > 0 ? addMonthsToDate(now, config.lockMonths) : null;
+      const profitEligibleAt =
+        config.minHoldDaysForProfit > 0 ? addDaysToDate(now, config.minHoldDaysForProfit) : null;
+      const reserve = {
+        id: buildId("invest"),
+        userId: user.id,
+        productKey: config.key,
+        productName: config.name,
+        productHeadline: config.headline,
+        cdiMultiplier: Number(config.cdiMultiplier || 0),
+        annualRate: getInvestmentReferenceAnnualRate(config),
+        principalInvestedTotal: amount,
+        principalRemaining: amount,
+        profitPaidTotal: 0,
+        capacityLimit:
+          config.maxAmount === null || config.maxAmount === undefined
+            ? toMoney(config.minDisplayCapacity || config.minAmount || amount)
+            : toMoney(config.maxAmount),
+        minAmount: toMoney(config.minAmount),
+        releaseAt: toIsoOrNull(releaseAt),
+        profitEligibleAt: toIsoOrNull(profitEligibleAt),
+        lockMonths: Number(config.lockMonths || 0),
+        minHoldDaysForProfit: Number(config.minHoldDaysForProfit || 0),
+        movementRequiredPerMonth: toMoney(config.movementRequiredPerMonth),
+        allowPartialWithdraw: Boolean(config.allowPartialWithdraw),
+        status: INVESTMENT_RESERVE_STATUS_ACTIVE,
+        createdAt: db(now),
+        updatedAt: db(now),
+        lastWithdrawnAt: null,
+        closedAt: null
+      };
+
+      const financialTx = await createFinancialTransaction(client, {
+        userId: user.id,
+        referenceKey: `investment:${reserve.id}:create`,
+        sourceType: "investment_reserve",
+        sourceId: reserve.id,
+        operationType: "investment_reserve_create",
+        direction: "debit",
+        amount,
+        status: "completed",
+        description: `Aporte em ${config.name}`,
+        metadata: {
+          reserveId: reserve.id,
+          productKey: config.key,
+          productName: config.name
+        }
+      });
+
+      const updatedUser = await applyLedgerChange(client, {
+        userId: user.id,
+        financialTransactionId: financialTx.id,
+        entryType: "debit",
+        amount,
+        description: `Aporte em ${config.name}`,
+        metadata: {
+          reserveId: reserve.id,
+          productKey: config.key,
+          productName: config.name
+        }
+      });
+
+      await saveInvestmentReserve(reserve, client);
+
+      await createAuditLog(client, {
+        adminId: "",
+        action: "user_create_investment_reserve",
+        targetType: "investment_reserve",
+        targetId: reserve.id,
+        details: {
+          userId: user.id,
+          productKey: config.key,
+          amount
+        },
+        ipAddress: getRequestIp(req)
+      });
+
+      return {
+        reserve,
+        user: updatedUser
+      };
+    });
+
+    const dashboard = await buildInvestimentosDashboardResponse(result.user);
+    res.status(201).json({
+      message: "Estrutura criada com sucesso",
+      reserve: dashboard.reserves.find((item) => item.id === result.reserve.id) || null,
+      saldoAtual: toMoney(result.user.saldo),
+      dashboard
+    });
+  } catch (error) {
+    console.error(error);
+    if (error?.statusCode && error?.payload) {
+      return res.status(error.statusCode).json(error.payload);
+    }
+    res.status(400).json({ error: error.message || "Erro ao criar estrutura" });
+  }
+});
+
+app.post("/usuario/:id/investimos/reservas/:reserveId/resgatar", authUser, async (req, res) => {
+  try {
+    const authenticatedUserId = getAuthenticatedUserId(req);
+    const requestedUserId = String(req.params.id || "").trim();
+    const requestedAmount = req.body?.amount === undefined ? null : toMoney(req.body?.amount);
+
+    if (!authenticatedUserId || requestedUserId !== authenticatedUserId) {
+      return sendJsonError(
+        res,
+        403,
+        "INVESTIMENTOS_FORBIDDEN",
+        "Acesso negado para esta conta"
+      );
+    }
+
+    const result = await runInTransaction(async (client) => {
+      const user = await getUserByIdForUpdate(authenticatedUserId, client);
+      const reserve = await getInvestmentReserveByIdForUpdate(req.params.reserveId, client);
+
+      if (!user) {
+        throw new Error("Usuário não encontrado");
+      }
+
+      if (isContaBanida(user)) {
+        const error = new Error(getMensagemContaBanida());
+        error.statusCode = 403;
+        error.payload = buildContaBanidaPayload(user);
+        throw error;
+      }
+
+      if (!reserve || reserve.userId !== user.id) {
+        throw new Error("Estrutura de investimento nao encontrada");
+      }
+
+      if (getInvestmentReserveStatus(reserve.status) === INVESTMENT_RESERVE_STATUS_CLOSED) {
+        throw new Error("Esta estrutura ja foi encerrada");
+      }
+
+      const config = getInvestmentProductConfig(reserve.productKey);
+      const now = new Date();
+      const releaseReached =
+        !reserve.releaseAt || new Date(reserve.releaseAt).getTime() <= now.getTime();
+
+      if (config?.withdrawLock && !releaseReached) {
+        const error = new Error("Resgate indisponivel antes da data de liberacao");
+        error.statusCode = 403;
+        error.payload = {
+          error: "Resgate indisponivel antes da data de liberacao",
+          releaseAt: reserve.releaseAt
+        };
+        throw error;
+      }
+
+      let principalAmount = requestedAmount;
+      if (!config?.allowPartialWithdraw) {
+        principalAmount = toMoney(reserve.principalRemaining);
+      }
+
+      if (!Number.isFinite(principalAmount) || principalAmount <= 0) {
+        throw new Error("Informe um valor valido para resgatar");
+      }
+
+      if (principalAmount > toMoney(reserve.principalRemaining)) {
+        throw new Error("O valor informado excede o saldo guardado");
+      }
+
+      if (!config?.allowPartialWithdraw && principalAmount !== toMoney(reserve.principalRemaining)) {
+        throw new Error("Esta estrutura permite apenas resgate total");
+      }
+
+      const currentMonthMovement = await getUserMonthlyMovementTotal(user.id, now, client);
+      const reserveView = buildInvestmentReserveResponse(reserve, {
+        now,
+        currentMonthMovement
+      });
+
+      let profitAmount = 0;
+      if (config?.withdrawLock) {
+        if (reserveView.profitActiveNow) {
+          profitAmount = calculateInvestmentProjectedProfit(
+            principalAmount,
+            reserve.annualRate,
+            diffDaysFloor(reserve.createdAt, reserve.releaseAt || now)
+          );
+        }
+      } else if (reserveView.profitActiveNow) {
+        profitAmount = calculateInvestmentProjectedProfit(
+          principalAmount,
+          reserve.annualRate,
+          diffDaysFloor(reserve.createdAt, now)
+        );
+      }
+
+      const creditAmount = toMoney(principalAmount + profitAmount);
+      const financialTx = await createFinancialTransaction(client, {
+        userId: user.id,
+        referenceKey: `investment:${reserve.id}:withdraw:${Date.now()}`,
+        sourceType: "investment_reserve",
+        sourceId: reserve.id,
+        operationType: "investment_reserve_withdrawal",
+        direction: "credit",
+        amount: creditAmount,
+        status: "completed",
+        description: `Resgate de ${reserve.productName || config?.name || "investimento"}`,
+        metadata: {
+          reserveId: reserve.id,
+          productKey: reserve.productKey,
+          principalAmount,
+          profitAmount
+        }
+      });
+
+      const updatedUser = await applyLedgerChange(client, {
+        userId: user.id,
+        financialTransactionId: financialTx.id,
+        entryType: "credit",
+        amount: creditAmount,
+        description: `Resgate de ${reserve.productName || config?.name || "investimento"}`,
+        metadata: {
+          reserveId: reserve.id,
+          productKey: reserve.productKey,
+          principalAmount,
+          profitAmount
+        }
+      });
+
+      reserve.principalRemaining = toMoney(reserve.principalRemaining - principalAmount);
+      reserve.profitPaidTotal = toMoney(reserve.profitPaidTotal + profitAmount);
+      reserve.lastWithdrawnAt = db(now);
+      reserve.updatedAt = db(now);
+
+      if (reserve.principalRemaining <= 0) {
+        reserve.principalRemaining = 0;
+        reserve.status = INVESTMENT_RESERVE_STATUS_CLOSED;
+        reserve.closedAt = db(now);
+      } else {
+        reserve.status = config?.allowPartialWithdraw
+          ? INVESTMENT_RESERVE_STATUS_PARTIAL
+          : INVESTMENT_RESERVE_STATUS_ACTIVE;
+      }
+
+      await saveInvestmentReserve(reserve, client);
+
+      await createAuditLog(client, {
+        adminId: "",
+        action: "user_withdraw_investment_reserve",
+        targetType: "investment_reserve",
+        targetId: reserve.id,
+        details: {
+          userId: user.id,
+          productKey: reserve.productKey,
+          principalAmount,
+          profitAmount,
+          creditAmount
+        },
+        ipAddress: getRequestIp(req)
+      });
+
+      return {
+        reserve,
+        user: updatedUser,
+        principalAmount,
+        profitAmount,
+        creditAmount
+      };
+    });
+
+    const dashboard = await buildInvestimentosDashboardResponse(result.user);
+    res.json({
+      message: "Resgate concluido com sucesso",
+      principalAmount: toMoney(result.principalAmount),
+      profitAmount: toMoney(result.profitAmount),
+      creditAmount: toMoney(result.creditAmount),
+      saldoAtual: toMoney(result.user.saldo),
+      reserve: dashboard.reserves.find((item) => item.id === result.reserve.id) || null,
+      dashboard
+    });
+  } catch (error) {
+    console.error(error);
+    if (error?.statusCode && error?.payload) {
+      return res.status(error.statusCode).json(error.payload);
+    }
+    res.status(400).json({ error: error.message || "Erro ao resgatar estrutura" });
+  }
+});
+
+app.post("/usuario/:id/limite-movimentacao", authUser, async (req, res) => {
+  try {
+    const authenticatedUserId = getAuthenticatedUserId(req);
+    const requestedUserId = String(req.params.id || "").trim();
+    const requestedAmount = toMoney(req.body?.requestedAmount);
+
+    if (!authenticatedUserId || requestedUserId !== authenticatedUserId) {
+      return sendJsonError(
+        res,
+        403,
+        "LIMIT_REQUEST_FORBIDDEN",
+        "Acesso negado para esta conta"
+      );
+    }
+
+    if (!Number.isFinite(requestedAmount) || requestedAmount <= LIMITE_DEPOSITO_MAX) {
+      return res.status(400).json({
+        error: `Informe um valor acima de R$${LIMITE_DEPOSITO_MAX.toFixed(2)}`
+      });
+    }
+
+    const request = await runInTransaction(async (client) => {
+      const user = await getUserByIdForUpdate(authenticatedUserId, client);
+
+      if (!user) {
+        throw new Error("Usuário não encontrado");
+      }
+
+      if (isContaBanida(user)) {
+        const error = new Error(getMensagemContaBanida());
+        error.statusCode = 403;
+        error.payload = buildContaBanidaPayload(user);
+        throw error;
+      }
+
+      const existingRequest = await getOpenMovementLimitRequestByUserId(user.id, client);
+      if (existingRequest && String(existingRequest.status || "").toLowerCase() === MOVEMENT_LIMIT_REQUEST_STATUS_PENDING) {
+        throw new Error("Ja existe uma solicitacao aberta para esta conta");
+      }
+
+      const nextRequest = {
+        id: buildId("limitreq"),
+        userId: user.id,
+        requestedAmount,
+        status: MOVEMENT_LIMIT_REQUEST_STATUS_PENDING,
+        adminMessage: "",
+        pixKey: "",
+        notificationId: "",
+        createdAt: db(),
+        updatedAt: db(),
+        respondedAt: null,
+        closedAt: null
+      };
+
+      await saveMovementLimitRequest(nextRequest, client);
+
+      await createAuditLog(client, {
+        adminId: "",
+        action: "user_create_movement_limit_request",
+        targetType: "movement_limit_request",
+        targetId: nextRequest.id,
+        details: {
+          userId: user.id,
+          requestedAmount
+        },
+        ipAddress: getRequestIp(req)
+      });
+
+      return nextRequest;
+    });
+
+    res.status(201).json({
+      message:
+        "Assim que liberarmos o limite de movimentação, vamos avisar pela aba de Notificações",
+      request: {
+        id: request.id,
+        requestedAmount: toMoney(request.requestedAmount),
+        status: request.status,
+        createdAt: request.createdAt
+      }
+    });
+  } catch (error) {
+    console.error(error);
+    if (error?.statusCode && error?.payload) {
+      return res.status(error.statusCode).json(error.payload);
+    }
+    res.status(400).json({ error: error.message || "Erro ao enviar solicitacao" });
+  }
+});
+
 app.post("/usuario/update-nome", authUser, async (req, res) => {
   try {
     const authenticatedUserId = getAuthenticatedUserId(req);
@@ -5905,6 +7595,9 @@ app.post("/usuario/delete", authUser, async (req, res) => {
       await client.query("DELETE FROM topup_orders WHERE user_id = $1", [authenticatedUserId]);
       await client.query("DELETE FROM financial_transactions WHERE user_id = $1", [authenticatedUserId]);
       await client.query("DELETE FROM ledger_entries WHERE user_id = $1", [authenticatedUserId]);
+      await client.query("DELETE FROM user_notifications WHERE user_id = $1", [authenticatedUserId]);
+      await client.query("DELETE FROM movement_limit_requests WHERE user_id = $1", [authenticatedUserId]);
+      await client.query("DELETE FROM investment_reserves WHERE user_id = $1", [authenticatedUserId]);
       await client.query("DELETE FROM audit_logs WHERE target_id = $1", [authenticatedUserId]);
       await client.query("DELETE FROM usuarios WHERE id = $1", [authenticatedUserId]);
     });
@@ -7418,6 +9111,114 @@ app.post("/admin/topups/:id/refuse", authAdmin, async (req, res) => {
   }
 });
 
+app.get("/admin/investimos/reservas", authAdmin, async (req, res) => {
+  try {
+    const reserves = await listInvestmentReserves();
+    const uniqueUserIds = Array.from(
+      new Set(reserves.map((item) => String(item.userId || "").trim()).filter(Boolean))
+    );
+    const movementEntries = await Promise.all(
+      uniqueUserIds.map(async (userId) => [userId, await getUserMonthlyMovementTotal(userId)])
+    );
+    const movementMap = new Map(movementEntries);
+
+    res.json(
+      reserves.map((reserve) => ({
+        ...buildInvestmentReserveResponse(reserve, {
+          now: new Date(),
+          currentMonthMovement: movementMap.get(reserve.userId) || 0
+        }),
+        user: reserve.user || null
+      }))
+    );
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: "Erro ao buscar estruturas do Investimos" });
+  }
+});
+
+app.get("/admin/limite-movimentacao", authAdmin, async (req, res) => {
+  try {
+    const requests = await listMovementLimitRequests();
+    res.json(requests);
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: "Erro ao buscar solicitacoes de limite" });
+  }
+});
+
+app.post("/admin/limite-movimentacao/:id/responder", authAdmin, async (req, res) => {
+  try {
+    const pixKey = String(req.body?.pixKey || "").trim();
+
+    if (!pixKey) {
+      return res.status(400).json({ error: "A chave Pix e obrigatoria" });
+    }
+
+    const result = await runInTransaction(async (client) => {
+      const request = await getMovementLimitRequestByIdForUpdate(req.params.id, client);
+
+      if (!request) {
+        throw new Error("Solicitacao nao encontrada");
+      }
+
+      if (getMovementRequestStatusLabel(request.status) === MOVEMENT_LIMIT_REQUEST_STATUS_CLOSED) {
+        throw new Error("Solicitacao encerrada");
+      }
+
+      const user = await getUserById(request.userId, client);
+
+      if (!user) {
+        throw new Error("Usuário não encontrado");
+      }
+
+      const notification = buildMovementLimitPixKeyNotification({
+        userId: user.id,
+        requestId: request.id,
+        requestedAmount: request.requestedAmount,
+        pixKey
+      });
+
+      request.status = MOVEMENT_LIMIT_REQUEST_STATUS_RESPONDED;
+      request.adminMessage = notification.body;
+      request.pixKey = pixKey;
+      request.notificationId = notification.id;
+      request.updatedAt = db();
+      request.respondedAt = db();
+
+      await saveUserNotification(notification, client);
+      await saveMovementLimitRequest(request, client);
+
+      await createAuditLog(client, {
+        adminId: req.admin.sub,
+        action: "respond_movement_limit_request",
+        targetType: "movement_limit_request",
+        targetId: request.id,
+        details: {
+          userId: request.userId,
+          requestedAmount: request.requestedAmount,
+          pixKey
+        },
+        ipAddress: getRequestIp(req)
+      });
+
+      return {
+        request,
+        notification
+      };
+    });
+
+    res.json({
+      message: "Resposta enviada para o usuario",
+      request: result.request,
+      notification: result.notification
+    });
+  } catch (error) {
+    console.error(error);
+    res.status(400).json({ error: error.message || "Erro ao responder solicitacao" });
+  }
+});
+
 app.get("/usuarios", authAdmin, async (req, res) => {
   try {
     const result = await listUsers();
@@ -7546,6 +9347,10 @@ app.post("/aprovar", authAdmin, async (req, res) => {
       pedido.aprovadoEm = db();
 
       await saveDeposito(pedido, client);
+
+      if (!isSaida) {
+        await aplicarBonusIndicacaoSeElegivel(usuario.id, client);
+      }
 
       await createAuditLog(client, {
         adminId: req.admin.sub,
@@ -7908,6 +9713,9 @@ app.post("/admin/deletar-usuario", authAdmin, async (req, res) => {
         throw new Error("Usuário não encontrado");
       }
 
+      await client.query("DELETE FROM user_notifications WHERE user_id = $1", [userId]);
+      await client.query("DELETE FROM movement_limit_requests WHERE user_id = $1", [userId]);
+      await client.query("DELETE FROM investment_reserves WHERE user_id = $1", [userId]);
       await client.query("DELETE FROM usuarios WHERE id = $1", [userId]);
 
       await createAuditLog(client, {
@@ -8182,6 +9990,7 @@ const valorFinal = calcularValorCreditadoDeposito(valorBruto);
       depositoMatch.descricao = `Auto aprovado TXID ${txid}`;
 
       await saveDeposito(depositoMatch, client);
+      await aplicarBonusIndicacaoSeElegivel(usuario.id, client);
 
       // 📜 AUDITORIA
       await createAuditLog(client, {
@@ -8418,6 +10227,7 @@ app.post("/deposito/confirmar-bot-path-legacy", authBot, async (req, res) => {
       depositoMatch.descricao = `Auto aprovado DentPeg ${identificadorBot}`;
 
       await saveDeposito(depositoMatch, client);
+      await aplicarBonusIndicacaoSeElegivel(usuario.id, client);
 
       await createAuditLog(client, {
         action: "auto_deposit",
@@ -8686,6 +10496,7 @@ app.post("/deposito/confirmar-bot", authBot, async (req, res) => {
       depositoMatch.descricao = `Auto aprovado DentPeg ${identificadorBot}`;
 
       await saveDeposito(depositoMatch, client);
+      await aplicarBonusIndicacaoSeElegivel(usuario.id, client);
 
       await createAuditLog(client, {
         action: "auto_deposit",
