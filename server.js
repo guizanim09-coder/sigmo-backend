@@ -108,6 +108,12 @@ const BANNER_ROTATION_MIN_MS = 2500;
 const BANNER_ROTATION_MAX_MS = 30000;
 const BANNER_DURATION_DEFAULT_MS = 7000;
 const BANNER_SETTINGS_ID = "main";
+const APP_RUNTIME_SETTINGS_ID = "main";
+const APP_MAINTENANCE_MESSAGE_DEFAULT =
+  "Estamos passando por atualizacoes, voltaremos em breve.";
+const APP_MAINTENANCE_ETA_DEFAULT_MINUTES = 9;
+const APP_MAINTENANCE_ETA_MIN_MINUTES = 1;
+const APP_MAINTENANCE_ETA_MAX_MINUTES = 180;
 const BANNER_IMAGE_MAX_BYTES = 10 * 1024 * 1024;
 const STATUS_CONTA_ATIVA = "ativa";
 const STATUS_CONTA_BANIDA = "banida";
@@ -1509,6 +1515,37 @@ await ensureColumn("depositos", "comprovante_texto", "TEXT DEFAULT ''");
   );
 
   await pool.query(`
+    CREATE TABLE IF NOT EXISTS app_runtime_settings (
+      id TEXT PRIMARY KEY,
+      maintenance_enabled BOOLEAN NOT NULL DEFAULT false,
+      maintenance_message TEXT NOT NULL DEFAULT '${APP_MAINTENANCE_MESSAGE_DEFAULT}',
+      maintenance_eta_minutes INTEGER NOT NULL DEFAULT ${APP_MAINTENANCE_ETA_DEFAULT_MINUTES},
+      updated_at TIMESTAMP
+    );
+  `);
+
+  await pool.query(
+    `
+    INSERT INTO app_runtime_settings (
+      id,
+      maintenance_enabled,
+      maintenance_message,
+      maintenance_eta_minutes,
+      updated_at
+    )
+    VALUES ($1, $2, $3, $4, $5)
+    ON CONFLICT (id) DO NOTHING
+    `,
+    [
+      APP_RUNTIME_SETTINGS_ID,
+      false,
+      APP_MAINTENANCE_MESSAGE_DEFAULT,
+      APP_MAINTENANCE_ETA_DEFAULT_MINUTES,
+      db()
+    ]
+  );
+
+  await pool.query(`
     CREATE TABLE IF NOT EXISTS financial_transactions (
       id TEXT PRIMARY KEY,
       user_id TEXT NOT NULL,
@@ -1962,6 +1999,25 @@ function clampBannerRotationMs(value) {
 
 function clampBannerDurationMs(value) {
   return clampBannerRotationMs(value);
+}
+
+function clampMaintenanceEtaMinutes(value) {
+  const parsed = Number(value);
+
+  if (!Number.isFinite(parsed)) {
+    return APP_MAINTENANCE_ETA_DEFAULT_MINUTES;
+  }
+
+  return Math.min(
+    APP_MAINTENANCE_ETA_MAX_MINUTES,
+    Math.max(APP_MAINTENANCE_ETA_MIN_MINUTES, Math.round(parsed))
+  );
+}
+
+function normalizeMaintenanceMessage(value) {
+  return (
+    String(value || "").trim().slice(0, 220) || APP_MAINTENANCE_MESSAGE_DEFAULT
+  );
 }
 
 function normalizeBannerAlt(value) {
@@ -3749,6 +3805,110 @@ async function setBannerSettings(rotationMs, client = pool) {
     rotationMs: nextRotationMs,
     updatedAt
   };
+}
+
+async function getAppRuntimeSettings(client = pool) {
+  const result = await client.query(
+    `
+    SELECT maintenance_enabled, maintenance_message, maintenance_eta_minutes, updated_at
+    FROM app_runtime_settings
+    WHERE id = $1
+    LIMIT 1
+    `,
+    [APP_RUNTIME_SETTINGS_ID]
+  );
+
+  if (!result.rows.length) {
+    const fallback = {
+      maintenanceEnabled: false,
+      maintenanceMessage: APP_MAINTENANCE_MESSAGE_DEFAULT,
+      maintenanceEtaMinutes: APP_MAINTENANCE_ETA_DEFAULT_MINUTES,
+      updatedAt: db()
+    };
+
+    await client.query(
+      `
+      INSERT INTO app_runtime_settings (
+        id,
+        maintenance_enabled,
+        maintenance_message,
+        maintenance_eta_minutes,
+        updated_at
+      )
+      VALUES ($1, $2, $3, $4, $5)
+      ON CONFLICT (id) DO NOTHING
+      `,
+      [
+        APP_RUNTIME_SETTINGS_ID,
+        fallback.maintenanceEnabled,
+        fallback.maintenanceMessage,
+        fallback.maintenanceEtaMinutes,
+        fallback.updatedAt
+      ]
+    );
+
+    return fallback;
+  }
+
+  return {
+    maintenanceEnabled: result.rows[0].maintenance_enabled === true,
+    maintenanceMessage: normalizeMaintenanceMessage(result.rows[0].maintenance_message),
+    maintenanceEtaMinutes: clampMaintenanceEtaMinutes(
+      result.rows[0].maintenance_eta_minutes
+    ),
+    updatedAt: result.rows[0].updated_at || null
+  };
+}
+
+async function setAppRuntimeSettings(input = {}, client = pool) {
+  const current = await getAppRuntimeSettings(client);
+  const updatedAt = db();
+  const nextSettings = {
+    maintenanceEnabled:
+      typeof input.maintenanceEnabled === "boolean"
+        ? input.maintenanceEnabled
+        : current.maintenanceEnabled,
+    maintenanceMessage: Object.prototype.hasOwnProperty.call(
+      input,
+      "maintenanceMessage"
+    )
+      ? normalizeMaintenanceMessage(input.maintenanceMessage)
+      : current.maintenanceMessage,
+    maintenanceEtaMinutes: Object.prototype.hasOwnProperty.call(
+      input,
+      "maintenanceEtaMinutes"
+    )
+      ? clampMaintenanceEtaMinutes(input.maintenanceEtaMinutes)
+      : current.maintenanceEtaMinutes,
+    updatedAt
+  };
+
+  await client.query(
+    `
+    INSERT INTO app_runtime_settings (
+      id,
+      maintenance_enabled,
+      maintenance_message,
+      maintenance_eta_minutes,
+      updated_at
+    )
+    VALUES ($1, $2, $3, $4, $5)
+    ON CONFLICT (id) DO UPDATE SET
+      maintenance_enabled = EXCLUDED.maintenance_enabled,
+      maintenance_message = EXCLUDED.maintenance_message,
+      maintenance_eta_minutes = EXCLUDED.maintenance_eta_minutes,
+      updated_at = EXCLUDED.updated_at
+    `,
+    [
+      APP_RUNTIME_SETTINGS_ID,
+      nextSettings.maintenanceEnabled,
+      nextSettings.maintenanceMessage,
+      nextSettings.maintenanceEtaMinutes,
+      nextSettings.updatedAt
+    ]
+  );
+
+  return nextSettings;
 }
 
 async function listBannerAssets(client = pool, { activeOnly = false } = {}) {
@@ -5646,6 +5806,24 @@ app.get("/public/topup-config", async (req, res) => {
   });
 });
 
+app.get("/public/app-status", async (req, res) => {
+  try {
+    const settings = await getAppRuntimeSettings();
+    res.set("Cache-Control", "no-store");
+    res.json({
+      maintenance: {
+        enabled: settings.maintenanceEnabled,
+        message: settings.maintenanceMessage,
+        etaMinutes: settings.maintenanceEtaMinutes,
+        updatedAt: settings.updatedAt
+      }
+    });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: "Erro ao carregar status do app" });
+  }
+});
+
 app.get("/public/banner-config", async (req, res) => {
   try {
     const [settings, banners] = await Promise.all([
@@ -5734,6 +5912,59 @@ app.get("/admin/banner-config", authAdmin, async (req, res) => {
   } catch (error) {
     console.error(error);
     res.status(500).json({ error: "Erro ao carregar configuracao de banners" });
+  }
+});
+
+app.get("/admin/app-status", authAdmin, async (req, res) => {
+  try {
+    const settings = await getAppRuntimeSettings();
+    res.set("Cache-Control", "no-store");
+    res.json(settings);
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: "Erro ao carregar status do app" });
+  }
+});
+
+app.post("/admin/app-status", authAdmin, async (req, res) => {
+  try {
+    const maintenanceEnabled = req.body?.maintenanceEnabled === true;
+    const maintenanceEtaMinutes = req.body?.maintenanceEtaMinutes;
+
+    const settings = await runInTransaction(async (client) => {
+      const updated = await setAppRuntimeSettings(
+        {
+          maintenanceEnabled,
+          maintenanceEtaMinutes,
+          maintenanceMessage: APP_MAINTENANCE_MESSAGE_DEFAULT
+        },
+        client
+      );
+
+      await createAuditLog(client, {
+        adminId: req.admin.sub,
+        action: "update_app_runtime_status",
+        targetType: "app_runtime_settings",
+        targetId: APP_RUNTIME_SETTINGS_ID,
+        details: {
+          maintenanceEnabled: updated.maintenanceEnabled,
+          maintenanceEtaMinutes: updated.maintenanceEtaMinutes
+        },
+        ipAddress: getRequestIp(req)
+      });
+
+      return updated;
+    });
+
+    res.json({
+      message: settings.maintenanceEnabled
+        ? "Aviso de atualizacao ativado"
+        : "Aviso de atualizacao desativado",
+      settings
+    });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: "Erro ao atualizar status do app" });
   }
 });
 
