@@ -25,6 +25,11 @@ const ADMIN_PASSWORD = String(process.env.ADMIN_PASSWORD || "").trim();
 const DENTPEG_PUBLIC_CHECKOUT_URL = String(
   process.env.DENTPEG_PUBLIC_CHECKOUT_URL || "https://api.dentpeg.com/checkout/sigmo"
 ).trim();
+const PUBLIC_WEB_BASE_URL = String(
+  process.env.PUBLIC_WEB_BASE_URL || "https://sigmopay.com"
+)
+  .trim()
+  .replace(/\/+$/, "");
 const DENTPEG_CHECKOUT_TIMEOUT_MS = Math.max(
   3000,
   Number(process.env.DENTPEG_CHECKOUT_TIMEOUT_MS || 15000)
@@ -565,6 +570,29 @@ function normalizeDigits(value, maxLength = 32) {
 
 function normalizeEmail(email) {
   return String(email || "").trim().toLowerCase();
+}
+
+function normalizeReferralCode(value) {
+  return String(value || "")
+    .trim()
+    .toUpperCase()
+    .replace(/[^A-Z0-9]/g, "")
+    .slice(0, 24);
+}
+
+function buildReferralCodeCandidate() {
+  return `SIG${crypto
+    .randomBytes(6)
+    .toString("base64url")
+    .replace(/[^A-Za-z0-9]/g, "")
+    .toUpperCase()
+    .slice(0, 9)}`;
+}
+
+function buildReferralLinkFromCode(referralCode) {
+  const normalized = normalizeReferralCode(referralCode);
+  if (!normalized) return "";
+  return `${PUBLIC_WEB_BASE_URL}/login.html?ref=${encodeURIComponent(normalized)}`;
 }
 
 function toMoney(value) {
@@ -1393,11 +1421,16 @@ async function initDB() {
   await ensureColumn("usuarios", "indicacao_bonus_creditado_em", "TIMESTAMP");
   await ensureColumn("usuarios", "indicacao_bonus_creditado_valor", "NUMERIC DEFAULT 0");
   await ensureColumn("usuarios", "indicacao_bonus_transacao_id", "TEXT DEFAULT ''");
+  await ensureColumn("usuarios", "referral_code", "TEXT DEFAULT ''");
   await ensureColumn("usuarios", "pin_transacao_hash", "TEXT DEFAULT ''");
   await ensureColumn("usuarios", "pin_transacao_atualizado_em", "TIMESTAMP");
   await ensureIndex(
     "idx_usuarios_indicado_por_user_id",
     "CREATE INDEX idx_usuarios_indicado_por_user_id ON usuarios(indicado_por_user_id)"
+  );
+  await ensureIndex(
+    "idx_usuarios_referral_code_unique",
+    "CREATE UNIQUE INDEX idx_usuarios_referral_code_unique ON usuarios(referral_code) WHERE referral_code <> ''"
   );
 
   await pool.query(`
@@ -2003,6 +2036,7 @@ function mapUser(row) {
     indicacaoBonusCreditadoEm: row.indicacao_bonus_creditado_em || null,
     indicacaoBonusCreditadoValor: toMoney(row.indicacao_bonus_creditado_valor),
     indicacaoBonusTransacaoId: row.indicacao_bonus_transacao_id || "",
+    referralCode: normalizeReferralCode(row.referral_code || ""),
     pinTransacaoHash: row.pin_transacao_hash || "",
     pinTransacaoAtualizadoEm: row.pin_transacao_atualizado_em || null
   };
@@ -2069,17 +2103,20 @@ function buildUserPublicResponse(user, extras = {}) {
     indicacaoQualificadaEm: user.indicacaoQualificadaEm || null,
     indicacaoBonusCreditadoEm: user.indicacaoBonusCreditadoEm || null,
     indicacaoBonusCreditadoValor: toMoney(user.indicacaoBonusCreditadoValor),
+    referralCode: normalizeReferralCode(user.referralCode),
+    referralLink: buildReferralLinkFromCode(user.referralCode),
     ...extras
   };
 }
 
 async function buildUserPublicResponseWithPix(user, client = pool, extras = {}) {
+  const ensuredUser = await ensureUserReferralCode(user, client);
   const valorRecebidoViaPix = await getValorRecebidoViaPix(user.id, client);
-  const referrer = user?.indicadoPorUserId
-    ? await getUserById(user.indicadoPorUserId, client)
+  const referrer = ensuredUser?.indicadoPorUserId
+    ? await getUserById(ensuredUser.indicadoPorUserId, client)
     : null;
   const indicacao = buildIndicacaoParticipacao(
-    user,
+    ensuredUser,
     valorRecebidoViaPix,
     referrer
   );
@@ -2087,12 +2124,12 @@ async function buildUserPublicResponseWithPix(user, client = pool, extras = {}) 
   const activeCard =
     Object.prototype.hasOwnProperty.call(extras, "activeCard")
       ? extras.activeCard
-      : await buildUserActiveCardResponse(user, deviceId, client);
+      : await buildUserActiveCardResponse(ensuredUser, deviceId, client);
   const extraPayload = { ...extras };
   delete extraPayload.deviceId;
   delete extraPayload.activeCard;
 
-  return buildUserPublicResponse(user, {
+  return buildUserPublicResponse(ensuredUser, {
     pixDesbloqueado: valorRecebidoViaPix >= PIX_SAQUE_DESBLOQUEIO_MIN,
     valorRecebidoViaPix,
     valorMinimoDesbloqueioPix: PIX_SAQUE_DESBLOQUEIO_MIN,
@@ -2646,6 +2683,48 @@ async function getUserByEmail(email, client = pool) {
     [normalizeEmail(email)]
   );
   return mapUser(result.rows[0]);
+}
+
+async function getUserByReferralCode(referralCode, client = pool) {
+  const normalized = normalizeReferralCode(referralCode);
+  if (!normalized) return null;
+
+  const result = await client.query(
+    "SELECT * FROM usuarios WHERE referral_code = $1 LIMIT 1",
+    [normalized]
+  );
+  return mapUser(result.rows[0]);
+}
+
+async function ensureUserReferralCode(user, client = pool) {
+  if (!user?.id) return user;
+
+  const currentCode = normalizeReferralCode(user.referralCode);
+  if (currentCode) {
+    if (user.referralCode !== currentCode) {
+      user.referralCode = currentCode;
+      await saveUser(user, client);
+    }
+    return user;
+  }
+
+  for (let attempt = 0; attempt < 12; attempt += 1) {
+    const candidate = buildReferralCodeCandidate();
+    const existing = await client.query(
+      "SELECT id FROM usuarios WHERE referral_code = $1 AND id <> $2 LIMIT 1",
+      [candidate, user.id]
+    );
+
+    if (existing.rows.length > 0) {
+      continue;
+    }
+
+    user.referralCode = candidate;
+    await saveUser(user, client);
+    return user;
+  }
+
+  throw new Error("Nao foi possivel gerar um codigo de indicacao unico");
 }
 
 async function listUsers() {
@@ -3255,10 +3334,10 @@ async function saveUser(user, client = pool) {
       indicado_por_user_id, indicado_por_email, indicacao_vinculada_em,
       indicacao_qualificada_em, indicacao_bonus_creditado_em,
       indicacao_bonus_creditado_valor, indicacao_bonus_transacao_id,
-      pin_transacao_hash, pin_transacao_atualizado_em
+      referral_code, pin_transacao_hash, pin_transacao_atualizado_em
     )
     VALUES (
-      $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23
+      $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24
     )
     ON CONFLICT (id) DO UPDATE SET
       nome = EXCLUDED.nome,
@@ -3281,6 +3360,7 @@ async function saveUser(user, client = pool) {
       indicacao_bonus_creditado_em = EXCLUDED.indicacao_bonus_creditado_em,
       indicacao_bonus_creditado_valor = EXCLUDED.indicacao_bonus_creditado_valor,
       indicacao_bonus_transacao_id = EXCLUDED.indicacao_bonus_transacao_id,
+      referral_code = EXCLUDED.referral_code,
       pin_transacao_hash = EXCLUDED.pin_transacao_hash,
       pin_transacao_atualizado_em = EXCLUDED.pin_transacao_atualizado_em
     `,
@@ -3306,6 +3386,7 @@ async function saveUser(user, client = pool) {
       user.indicacaoBonusCreditadoEm || null,
       toMoney(user.indicacaoBonusCreditadoValor),
       user.indicacaoBonusTransacaoId || "",
+      normalizeReferralCode(user.referralCode),
       user.pinTransacaoHash || "",
       user.pinTransacaoAtualizadoEm || null
     ]
@@ -4883,19 +4964,22 @@ async function listIndicacoesPorIndicadorIds(indicadorIds, client = pool) {
 }
 
 async function buildIndicacoesProgramaResposta(user, client = pool) {
+  const ensuredUser = await ensureUserReferralCode(user, client);
   const [referrer, indicacoesMap, qualifyingPixTotal] = await Promise.all([
-    user?.indicadoPorUserId ? getUserById(user.indicadoPorUserId, client) : null,
-    listIndicacoesPorIndicadorIds([user.id], client),
-    getValorRecebidoViaPix(user.id, client)
+    ensuredUser?.indicadoPorUserId ? getUserById(ensuredUser.indicadoPorUserId, client) : null,
+    listIndicacoesPorIndicadorIds([ensuredUser.id], client),
+    getValorRecebidoViaPix(ensuredUser.id, client)
   ]);
 
-  const meusIndicados = indicacoesMap.get(user.id) || [];
+  const meusIndicados = indicacoesMap.get(ensuredUser.id) || [];
 
   return {
-    meuEmailIndicacao: user.email,
+    meuEmailIndicacao: ensuredUser.email,
+    meuCodigoIndicacao: normalizeReferralCode(ensuredUser.referralCode),
+    meuLinkIndicacao: buildReferralLinkFromCode(ensuredUser.referralCode),
     bonusValor: BONUS_INDICACAO_VALOR,
     valorNecessarioDepositos: INDICACAO_PIX_QUALIFICACAO_MIN,
-    participacao: buildIndicacaoParticipacao(user, qualifyingPixTotal, referrer),
+    participacao: buildIndicacaoParticipacao(ensuredUser, qualifyingPixTotal, referrer),
     resumo: buildIndicacoesResumo(meusIndicados),
     meusIndicados
   };
@@ -5794,24 +5878,35 @@ app.post("/admin/banner-config", authAdmin, async (req, res) => {
 
 app.post("/register", async (req, res) => {
   try {
-    const { email, senha, veioPorIndicacao, emailIndicador } = req.body;
+    const {
+      email,
+      senha,
+      veioPorIndicacao,
+      emailIndicador,
+      codigoIndicador
+    } = req.body;
 
     if (!email || !senha) {
       return res.status(400).json({ error: "Email e senha sao obrigatorios" });
     }
 
     const emailNorm = normalizeEmail(email);
+    const codigoIndicadorNorm = normalizeReferralCode(codigoIndicador);
     const usarIndicacao =
-      veioPorIndicacao === true || Boolean(String(emailIndicador || "").trim());
+      veioPorIndicacao === true ||
+      Boolean(String(emailIndicador || "").trim()) ||
+      Boolean(codigoIndicadorNorm);
     const emailIndicadorNorm = usarIndicacao
       ? normalizeEmail(emailIndicador)
       : "";
 
-    if (usarIndicacao && !emailIndicadorNorm) {
-      return res.status(400).json({ error: "Informe o email de quem te indicou" });
+    if (usarIndicacao && !codigoIndicadorNorm && !emailIndicadorNorm) {
+      return res.status(400).json({
+        error: "Informe o email do indicador ou abra a conta pelo link de indicacao"
+      });
     }
 
-    if (usarIndicacao && emailIndicadorNorm === emailNorm) {
+    if (usarIndicacao && !codigoIndicadorNorm && emailIndicadorNorm === emailNorm) {
       return res.status(400).json({ error: "Voce nao pode indicar a propria conta" });
     }
 
@@ -5824,12 +5919,22 @@ app.post("/register", async (req, res) => {
       return res.status(400).json({ error: "Usuario ja existe" });
     }
 
-    const indicador = usarIndicacao
-      ? await getUserByEmail(emailIndicadorNorm)
-      : null;
+    const indicador = codigoIndicadorNorm
+      ? await getUserByReferralCode(codigoIndicadorNorm)
+      : usarIndicacao
+        ? await getUserByEmail(emailIndicadorNorm)
+        : null;
 
     if (usarIndicacao && !indicador) {
-      return res.status(400).json({ error: "Email do indicador nao encontrado" });
+      return res.status(400).json({
+        error: codigoIndicadorNorm
+          ? "Link de indicacao invalido"
+          : "Email do indicador nao encontrado"
+      });
+    }
+
+    if (indicador && normalizeEmail(indicador.email) === emailNorm) {
+      return res.status(400).json({ error: "Voce nao pode indicar a propria conta" });
     }
 
     const hash = await bcrypt.hash(String(senha), 10);
@@ -5855,10 +5960,11 @@ app.post("/register", async (req, res) => {
         indicacaoQualificadaEm: null,
         indicacaoBonusCreditadoEm: null,
         indicacaoBonusCreditadoValor: 0,
-        indicacaoBonusTransacaoId: ""
+        indicacaoBonusTransacaoId: "",
+        referralCode: ""
       };
 
-      await saveUser(user, client);
+      await ensureUserReferralCode(user, client);
       return user;
     });
 
