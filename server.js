@@ -132,6 +132,55 @@ const SHOP_ORDER_STATUS_PENDING = "pendente";
 const SHOP_ORDER_STATUS_APPROVED = "aprovado";
 const SHOP_ORDER_STATUS_REFUSED = "recusado";
 const SHOP_PRODUCT_SOURCE_DEFAULT = "kaiross";
+const DATABASE_POOL_MAX = Math.max(5, Number(process.env.DATABASE_POOL_MAX || 20));
+const DATABASE_POOL_IDLE_TIMEOUT_MS = Math.max(
+  1000,
+  Number(process.env.DATABASE_POOL_IDLE_TIMEOUT_MS || 30000)
+);
+const DATABASE_POOL_CONNECTION_TIMEOUT_MS = Math.max(
+  1000,
+  Number(process.env.DATABASE_POOL_CONNECTION_TIMEOUT_MS || 10000)
+);
+const GLOBAL_API_RATE_LIMIT_WINDOW_MS = Math.max(
+  1000,
+  Number(process.env.GLOBAL_API_RATE_LIMIT_WINDOW_MS || 60000)
+);
+const GLOBAL_API_RATE_LIMIT_MAX = Math.max(
+  60,
+  Number(process.env.GLOBAL_API_RATE_LIMIT_MAX || 120)
+);
+const PUBLIC_SHOP_CATALOG_RATE_LIMIT_WINDOW_MS = Math.max(
+  1000,
+  Number(process.env.PUBLIC_SHOP_CATALOG_RATE_LIMIT_WINDOW_MS || 60000)
+);
+const PUBLIC_SHOP_CATALOG_RATE_LIMIT_MAX = Math.max(
+  120,
+  Number(process.env.PUBLIC_SHOP_CATALOG_RATE_LIMIT_MAX || 6000)
+);
+const SHOP_ORDER_RATE_LIMIT_WINDOW_MS = Math.max(
+  1000,
+  Number(process.env.SHOP_ORDER_RATE_LIMIT_WINDOW_MS || 60000)
+);
+const SHOP_ORDER_RATE_LIMIT_MAX = Math.max(
+  5,
+  Number(process.env.SHOP_ORDER_RATE_LIMIT_MAX || 20)
+);
+const SHOP_PUBLIC_CATALOG_CACHE_TTL_MS = Math.max(
+  5000,
+  Number(process.env.SHOP_PUBLIC_CATALOG_CACHE_TTL_MS || 30000)
+);
+const SHOP_PUBLIC_CATALOG_STALE_WHILE_REVALIDATE_MS = Math.max(
+  5000,
+  Number(process.env.SHOP_PUBLIC_CATALOG_STALE_WHILE_REVALIDATE_MS || 120000)
+);
+const SHOP_PUBLIC_CATALOG_MAX_AGE_SECONDS = Math.max(
+  1,
+  Number(process.env.SHOP_PUBLIC_CATALOG_MAX_AGE_SECONDS || 30)
+);
+const SHOP_PUBLIC_CATALOG_STALE_WHILE_REVALIDATE_SECONDS = Math.max(
+  SHOP_PUBLIC_CATALOG_MAX_AGE_SECONDS,
+  Number(process.env.SHOP_PUBLIC_CATALOG_STALE_WHILE_REVALIDATE_SECONDS || 120)
+);
 const KAIROSS_BASE_URL = String(
   process.env.KAIROSS_BASE_URL || "https://app.kaiross.com.br"
 )
@@ -245,8 +294,20 @@ if (!BOT_SECRET) {
 
 const pool = new Pool({
   connectionString: DATABASE_URL,
-  ssl: { rejectUnauthorized: false }
+  ssl: { rejectUnauthorized: false },
+  max: DATABASE_POOL_MAX,
+  idleTimeoutMillis: DATABASE_POOL_IDLE_TIMEOUT_MS,
+  connectionTimeoutMillis: DATABASE_POOL_CONNECTION_TIMEOUT_MS,
+  keepAlive: true
 });
+
+const shopPublicCatalogCache = {
+  snapshot: null,
+  refreshPromise: null,
+  expiresAtMs: 0,
+  staleUntilMs: 0,
+  version: 0
+};
 
 const BACKUPS_DIR = BACKUP_DIR
   ? path.resolve(BACKUP_DIR)
@@ -868,39 +929,54 @@ async function loginKaiross(options = {}) {
 }
 
 async function fetchKairossProducts(options = {}) {
-  const session = await loginKaiross(options);
-  const { response, data } = await fetchJsonWithTimeout(
-    `${session.baseUrl}${KAIROSS_PRODUCTS_PATH}`,
-    {
-      method: "GET",
-      headers: {
-        Cookie: session.cookieHeader
-      }
-    },
-    KAIROSS_TIMEOUT_MS
-  );
+  async function requestProducts(session) {
+    const { response, data } = await fetchJsonWithTimeout(
+      `${session.baseUrl}${KAIROSS_PRODUCTS_PATH}`,
+      {
+        method: "GET",
+        headers: {
+          Cookie: session.cookieHeader
+        }
+      },
+      KAIROSS_TIMEOUT_MS
+    );
 
-  if (!response.ok) {
-    throw new Error(data?.error || data?.message || "Falha ao carregar produtos da Kaiross");
+    return { session, response, data };
   }
 
-  const products = Array.isArray(data)
-    ? data
-    : Array.isArray(data?.produtos)
-      ? data.produtos
-      : Array.isArray(data?.items)
-        ? data.items
-        : Array.isArray(data?.data)
-          ? data.data
-          : null;
+  function normalizeKairossProductsPayload(data) {
+    const products = Array.isArray(data)
+      ? data
+      : Array.isArray(data?.produtos)
+        ? data.produtos
+        : Array.isArray(data?.items)
+          ? data.items
+          : Array.isArray(data?.data)
+            ? data.data
+            : null;
 
-  if (!Array.isArray(products)) {
-    throw new Error("A Kaiross nao retornou uma lista valida de produtos");
+    if (!Array.isArray(products)) {
+      throw new Error("A Kaiross nao retornou uma lista valida de produtos");
+    }
+
+    return products;
+  }
+
+  let result = await requestProducts(await loginKaiross(options));
+
+  if (!result.response.ok && [401, 403].includes(Number(result.response.status || 0))) {
+    result = await requestProducts(await loginKaiross(options));
+  }
+
+  if (!result.response.ok) {
+    throw new Error(
+      result.data?.error || result.data?.message || "Falha ao carregar produtos da Kaiross"
+    );
   }
 
   return {
-    ...session,
-    products
+    ...result.session,
+    products: normalizeKairossProductsPayload(result.data)
   };
 }
 
@@ -2425,14 +2501,37 @@ app.use(
 );
 app.use(express.json());
 
+function shouldSkipGlobalRateLimit(req) {
+  const path = String(req?.path || "").trim();
+  return path === "/public/shop/catalog";
+}
+
 app.use(
   rateLimit({
-    windowMs: 60 * 1000,
-    max: 120,
+    windowMs: GLOBAL_API_RATE_LIMIT_WINDOW_MS,
+    max: GLOBAL_API_RATE_LIMIT_MAX,
     standardHeaders: true,
-    legacyHeaders: false
+    legacyHeaders: false,
+    skip: shouldSkipGlobalRateLimit
   })
 );
+
+const publicShopCatalogLimiter = rateLimit({
+  windowMs: PUBLIC_SHOP_CATALOG_RATE_LIMIT_WINDOW_MS,
+  max: PUBLIC_SHOP_CATALOG_RATE_LIMIT_MAX,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: "Muitas consultas na vitrine. Aguarde alguns segundos." }
+});
+
+const shopOrderLimiter = rateLimit({
+  windowMs: SHOP_ORDER_RATE_LIMIT_WINDOW_MS,
+  max: SHOP_ORDER_RATE_LIMIT_MAX,
+  standardHeaders: true,
+  legacyHeaders: false,
+  keyGenerator: (req) => String(req?.userAuth?.sub || "shop-order"),
+  message: { error: "Muitas tentativas de concluir compra. Aguarde 1 minuto." }
+});
 
 const loginLimiter = rateLimit({
   windowMs: 60 * 1000,
@@ -3148,6 +3247,203 @@ function mapShopProduct(row) {
     updatedAt: row.updated_at || null,
     category
   };
+}
+
+function buildPublicShopCategoryResponse(category, extras = {}) {
+  if (!category) return null;
+
+  return {
+    id: category.id,
+    slug: category.slug || "",
+    name: category.name || "",
+    description: category.description || "",
+    imageUrl: category.imageUrl || "",
+    productCount: Math.max(0, Number(extras.productCount || 0))
+  };
+}
+
+function buildPublicShopProductResponse(product) {
+  if (!product) return null;
+
+  return {
+    id: product.id,
+    categoryId: product.categoryId,
+    slug: product.slug || "",
+    name: product.name || "",
+    shortDescription: product.shortDescription || "",
+    description: product.description || "",
+    imageUrl: product.imageUrl || "",
+    price: toMoney(product.price),
+    currency: product.currency || "BRL",
+    category: product.category
+      ? {
+          id: product.category.id,
+          slug: product.category.slug || "",
+          name: product.category.name || ""
+        }
+      : null
+  };
+}
+
+async function loadShopPublicCatalogSnapshotFromDb(client = pool) {
+  const [categories, products] = await Promise.all([
+    listShopCategories({ activeOnly: true }, client),
+    listShopProducts({ activeOnly: true }, client)
+  ]);
+
+  return {
+    generatedAt: db(),
+    categories,
+    publicCategories: categories.map((category) => buildPublicShopCategoryResponse(category)),
+    indexedProducts: products.map((product) => ({
+      categoryId: product.categoryId,
+      categorySlug: String(product.category?.slug || "").trim().toLowerCase(),
+      searchText: [
+        product.name,
+        product.shortDescription,
+        product.description,
+        product.category?.name
+      ]
+        .join(" ")
+        .toLowerCase(),
+      publicProduct: buildPublicShopProductResponse(product)
+    }))
+  };
+}
+
+async function refreshShopPublicCatalogSnapshotCache(force = false) {
+  const now = Date.now();
+
+  if (!force && shopPublicCatalogCache.refreshPromise) {
+    return shopPublicCatalogCache.refreshPromise;
+  }
+
+  if (!force && shopPublicCatalogCache.snapshot && shopPublicCatalogCache.expiresAtMs > now) {
+    return shopPublicCatalogCache.snapshot;
+  }
+
+  shopPublicCatalogCache.refreshPromise = (async () => {
+    const snapshot = await loadShopPublicCatalogSnapshotFromDb();
+    const refreshedAtMs = Date.now();
+
+    shopPublicCatalogCache.snapshot = snapshot;
+    shopPublicCatalogCache.expiresAtMs = refreshedAtMs + SHOP_PUBLIC_CATALOG_CACHE_TTL_MS;
+    shopPublicCatalogCache.staleUntilMs =
+      refreshedAtMs + SHOP_PUBLIC_CATALOG_STALE_WHILE_REVALIDATE_MS;
+    shopPublicCatalogCache.version += 1;
+
+    return snapshot;
+  })().finally(() => {
+    shopPublicCatalogCache.refreshPromise = null;
+  });
+
+  return shopPublicCatalogCache.refreshPromise;
+}
+
+async function getShopPublicCatalogSnapshotCached() {
+  const now = Date.now();
+
+  if (!shopPublicCatalogCache.snapshot) {
+    return {
+      cacheStatus: "miss",
+      snapshot: await refreshShopPublicCatalogSnapshotCache(true)
+    };
+  }
+
+  if (shopPublicCatalogCache.expiresAtMs > now) {
+    return {
+      cacheStatus: "hit",
+      snapshot: shopPublicCatalogCache.snapshot
+    };
+  }
+
+  if (shopPublicCatalogCache.staleUntilMs > now) {
+    refreshShopPublicCatalogSnapshotCache().catch((error) => {
+      console.error("[shop-cache] erro ao atualizar snapshot publico", error);
+    });
+
+    return {
+      cacheStatus: "stale",
+      snapshot: shopPublicCatalogCache.snapshot
+    };
+  }
+
+  return {
+    cacheStatus: "miss",
+    snapshot: await refreshShopPublicCatalogSnapshotCache(true)
+  };
+}
+
+function invalidateShopPublicCatalogSnapshotCache(options = {}) {
+  shopPublicCatalogCache.snapshot = null;
+  shopPublicCatalogCache.expiresAtMs = 0;
+  shopPublicCatalogCache.staleUntilMs = 0;
+  shopPublicCatalogCache.version += 1;
+
+  if (options.prewarm === false) {
+    return;
+  }
+
+  setImmediate(() => {
+    refreshShopPublicCatalogSnapshotCache(true).catch((error) => {
+      console.error("[shop-cache] erro ao preaquecer snapshot publico", error);
+    });
+  });
+}
+
+function buildPublicShopCatalogPayload(snapshot, options = {}) {
+  const categorySlug = String(options.categorySlug || "").trim().toLowerCase();
+  const search = normalizeShopText(options.search || "", 180).toLowerCase();
+  const includeGrouped = options.includeGrouped === true;
+  let filteredEntries = snapshot.indexedProducts;
+
+  if (categorySlug) {
+    filteredEntries = filteredEntries.filter((entry) => entry.categorySlug === categorySlug);
+  }
+
+  if (search) {
+    filteredEntries = filteredEntries.filter((entry) => entry.searchText.includes(search));
+  }
+
+  const countsByCategoryId = new Map();
+  const publicProducts = [];
+  const productsByCategoryId = includeGrouped ? new Map() : null;
+
+  for (const entry of filteredEntries) {
+    countsByCategoryId.set(
+      entry.categoryId,
+      (countsByCategoryId.get(entry.categoryId) || 0) + 1
+    );
+    publicProducts.push(entry.publicProduct);
+
+    if (productsByCategoryId) {
+      const list = productsByCategoryId.get(entry.categoryId) || [];
+      list.push(entry.publicProduct);
+      productsByCategoryId.set(entry.categoryId, list);
+    }
+  }
+
+  const publicCategories = snapshot.publicCategories.map((category) =>
+    buildPublicShopCategoryResponse(category, {
+      productCount: countsByCategoryId.get(category.id) || 0
+    })
+  );
+
+  const payload = {
+    generatedAt: snapshot.generatedAt,
+    markupPercentDefault: normalizeShopMarkupPercent(SHOP_DEFAULT_MARKUP_PERCENTUAL),
+    categories: publicCategories,
+    products: publicProducts
+  };
+
+  if (productsByCategoryId) {
+    payload.grouped = publicCategories.map((category) => ({
+      ...category,
+      products: productsByCategoryId.get(category.id) || []
+    }));
+  }
+
+  return payload;
 }
 
 function mapShopOrderItem(row) {
@@ -7246,41 +7542,26 @@ app.get("/public/topup-config", async (req, res) => {
   });
 });
 
-app.get("/public/shop/catalog", async (req, res) => {
+app.get("/public/shop/catalog", publicShopCatalogLimiter, async (req, res) => {
   try {
-    const categorySlug = String(req.query.category || "").trim();
-    const search = String(req.query.search || "").trim();
-    const [categories, products] = await Promise.all([
-      listShopCategories({ activeOnly: true }),
-      listShopProducts(
-        {
-          activeOnly: true,
-          categorySlug,
-          search
-        }
-      )
-    ]);
-
-    const productsByCategoryId = new Map();
-    for (const product of products) {
-      const list = productsByCategoryId.get(product.categoryId) || [];
-      list.push(product);
-      productsByCategoryId.set(product.categoryId, list);
-    }
-
-    res.set("Cache-Control", "no-store");
-    res.json({
-      markupPercentDefault: normalizeShopMarkupPercent(SHOP_DEFAULT_MARKUP_PERCENTUAL),
-      categories: categories.map((category) => ({
-        ...category,
-        productCount: (productsByCategoryId.get(category.id) || []).length
-      })),
-      products,
-      grouped: categories.map((category) => ({
-        ...category,
-        products: productsByCategoryId.get(category.id) || []
-      }))
+    const categorySlug = normalizeShopText(req.query.category || "", 120).toLowerCase();
+    const search = normalizeShopText(req.query.search || "", 180);
+    const includeGrouped =
+      String(req.query.grouped || "").trim() === "1" ||
+      String(req.query.includeGrouped || "").trim() === "1";
+    const { snapshot, cacheStatus } = await getShopPublicCatalogSnapshotCached();
+    const payload = buildPublicShopCatalogPayload(snapshot, {
+      categorySlug,
+      search,
+      includeGrouped
     });
+
+    res.set(
+      "Cache-Control",
+      `public, max-age=${SHOP_PUBLIC_CATALOG_MAX_AGE_SECONDS}, stale-while-revalidate=${SHOP_PUBLIC_CATALOG_STALE_WHILE_REVALIDATE_SECONDS}`
+    );
+    res.set("X-Shop-Catalog-Cache", cacheStatus);
+    res.json(payload);
   } catch (error) {
     console.error(error);
     res.status(500).json({ error: "Erro ao carregar catalogo da shop" });
@@ -7490,6 +7771,7 @@ app.post("/admin/shop/catalog/import", authAdmin, async (req, res) => {
 
       return imported;
     });
+    invalidateShopPublicCatalogSnapshotCache();
 
     res.json({
       message: "Catalogo da shop importado com sucesso",
@@ -7546,6 +7828,7 @@ app.post("/admin/shop/catalog/import-kaiross", authAdmin, async (req, res) => {
 
       return details;
     });
+    invalidateShopPublicCatalogSnapshotCache();
 
     res.json({
       message: "Catalogo da Kaiross importado com sucesso",
@@ -7639,6 +7922,7 @@ app.post("/admin/shop/products/:id", authAdmin, async (req, res) => {
 
       return await getShopProductById(updated.id, client);
     });
+    invalidateShopPublicCatalogSnapshotCache();
 
     res.json({
       message: "Produto da shop atualizado com sucesso",
@@ -9927,7 +10211,7 @@ app.get("/shop/orders/user/:id", authUser, async (req, res) => {
   }
 });
 
-app.post("/shop/orders", authUser, async (req, res) => {
+app.post("/shop/orders", authUser, shopOrderLimiter, async (req, res) => {
   try {
     const authenticatedUserId = getAuthenticatedUserId(req);
     const {
@@ -13054,6 +13338,9 @@ app.post("/deposito/confirmar-bot", authBot, async (req, res) => {
 initDB()
   .then(() => {
     startBackupScheduler();
+    refreshShopPublicCatalogSnapshotCache(true).catch((error) => {
+      console.error("[shop-cache] erro ao aquecer snapshot publico", error);
+    });
     app.listen(PORT, () => {
       console.log(`Servidor rodando na porta ${PORT}`);
     });
