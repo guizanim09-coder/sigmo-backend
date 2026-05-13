@@ -125,6 +125,27 @@ const MOVEMENT_LIMIT_REQUEST_STATUS_CLOSED = "closed";
 const INVESTMENT_RESERVE_STATUS_ACTIVE = "active";
 const INVESTMENT_RESERVE_STATUS_PARTIAL = "partial";
 const INVESTMENT_RESERVE_STATUS_CLOSED = "closed";
+const SHOP_DEFAULT_MARKUP_PERCENTUAL = Number(
+  process.env.SHOP_DEFAULT_MARKUP_PERCENTUAL || 110
+);
+const SHOP_ORDER_STATUS_PENDING = "pendente";
+const SHOP_ORDER_STATUS_APPROVED = "aprovado";
+const SHOP_ORDER_STATUS_REFUSED = "recusado";
+const SHOP_PRODUCT_SOURCE_DEFAULT = "kaiross";
+const KAIROSS_BASE_URL = String(
+  process.env.KAIROSS_BASE_URL || "https://app.kaiross.com.br"
+)
+  .trim()
+  .replace(/\/+$/, "");
+const KAIROSS_EMAIL = String(process.env.KAIROSS_EMAIL || "").trim().toLowerCase();
+const KAIROSS_PASSWORD = String(process.env.KAIROSS_PASSWORD || "").trim();
+const KAIROSS_TIMEOUT_MS = Math.max(
+  3000,
+  Number(process.env.KAIROSS_TIMEOUT_MS || 20000)
+);
+const KAIROSS_LOGIN_PATH = "/api/auth/login";
+const KAIROSS_PRODUCTS_PATH = "/api/produtos";
+const KAIROSS_VITRINE_PATH = "/vitrine-de-produtos";
 const INVESTMENT_PRODUCT_DEFINITIONS = {
   junior: {
     key: "junior",
@@ -388,6 +409,10 @@ async function createDatabaseBackup(trigger = "automatic") {
         usuarios,
         depositos,
         recargasCelular,
+        shopCategories,
+        shopProducts,
+        shopOrders,
+        shopOrderItems,
         admins,
         financialTransactions,
         ledgerEntries,
@@ -397,6 +422,18 @@ async function createDatabaseBackup(trigger = "automatic") {
         client.query("SELECT * FROM depositos ORDER BY criado_em ASC NULLS LAST, id ASC"),
         client.query(
           "SELECT * FROM topup_orders ORDER BY criado_em ASC NULLS LAST, id ASC"
+        ),
+        client.query(
+          "SELECT * FROM shop_categories ORDER BY sort_order ASC, created_at ASC NULLS LAST, id ASC"
+        ),
+        client.query(
+          "SELECT * FROM shop_products ORDER BY category_id ASC, name ASC, created_at ASC NULLS LAST, id ASC"
+        ),
+        client.query(
+          "SELECT * FROM shop_orders ORDER BY created_at ASC NULLS LAST, id ASC"
+        ),
+        client.query(
+          "SELECT * FROM shop_order_items ORDER BY created_at ASC NULLS LAST, id ASC"
         ),
         client.query("SELECT * FROM admins ORDER BY criado_em ASC NULLS LAST, id ASC"),
         client.query(
@@ -415,11 +452,15 @@ async function createDatabaseBackup(trigger = "automatic") {
         meta: {
           generatedAt: now.toISOString(),
           trigger,
-          version: 3,
+          version: 4,
           tables: {
             usuarios: usuarios.rowCount,
             depositos: depositos.rowCount,
             topup_orders: recargasCelular.rowCount,
+            shop_categories: shopCategories.rowCount,
+            shop_products: shopProducts.rowCount,
+            shop_orders: shopOrders.rowCount,
+            shop_order_items: shopOrderItems.rowCount,
             admins: admins.rowCount,
             financial_transactions: financialTransactions.rowCount,
             ledger_entries: ledgerEntries.rowCount,
@@ -430,6 +471,10 @@ async function createDatabaseBackup(trigger = "automatic") {
           usuarios: usuarios.rows,
           depositos: depositos.rows,
           topup_orders: recargasCelular.rows,
+          shop_categories: shopCategories.rows,
+          shop_products: shopProducts.rows,
+          shop_orders: shopOrders.rows,
+          shop_order_items: shopOrderItems.rows,
           admins: admins.rows,
           financial_transactions: financialTransactions.rows,
           ledger_entries: ledgerEntries.rows,
@@ -446,7 +491,7 @@ async function createDatabaseBackup(trigger = "automatic") {
       backupState.lastDurationMs = durationMs;
 
       console.log(
-        `[backup] concluído (${trigger}) arquivo=${fileName} usuarios=${usuarios.rowCount} depositos=${depositos.rowCount} admins=${admins.rowCount} tx=${financialTransactions.rowCount} ledger=${ledgerEntries.rowCount} audit=${auditLogs.rowCount} removidos=${cleanup.removed}`
+        `[backup] concluído (${trigger}) arquivo=${fileName} usuarios=${usuarios.rowCount} depositos=${depositos.rowCount} shop_produtos=${shopProducts.rowCount} shop_pedidos=${shopOrders.rowCount} admins=${admins.rowCount} tx=${financialTransactions.rowCount} ledger=${ledgerEntries.rowCount} audit=${auditLogs.rowCount} removidos=${cleanup.removed}`
       );
 
       return {
@@ -605,6 +650,395 @@ function toMoney(value) {
   const num = Number(value || 0);
   if (!Number.isFinite(num)) return 0;
   return Number(num.toFixed(2));
+}
+
+function normalizeShopText(value, maxLength = 500) {
+  return String(value || "")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, Math.max(0, Number(maxLength || 0) || 0));
+}
+
+function slugifyShopValue(value, fallback = "item") {
+  const normalized = String(value || "")
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 72);
+
+  return normalized || fallback;
+}
+
+function normalizeShopUrl(value) {
+  const raw = String(value || "").trim();
+  if (!raw) return "";
+
+  try {
+    const parsed = new URL(raw);
+    if (!["http:", "https:"].includes(parsed.protocol)) {
+      return "";
+    }
+    return parsed.toString();
+  } catch {
+    return "";
+  }
+}
+
+function normalizeShopSource(value) {
+  return (
+    normalizeShopText(value, 48)
+      .toLowerCase()
+      .replace(/[^a-z0-9_-]/g, "") || SHOP_PRODUCT_SOURCE_DEFAULT
+  );
+}
+
+function normalizeShopCategorySourceKey(value, source = SHOP_PRODUCT_SOURCE_DEFAULT) {
+  const cleaned = normalizeShopText(value, 160)
+    .toLowerCase()
+    .replace(/[^a-z0-9:_-]/g, "");
+  return cleaned || `${normalizeShopSource(source)}:categoria`;
+}
+
+function normalizeShopProductSourceKey(value, source = SHOP_PRODUCT_SOURCE_DEFAULT) {
+  const cleaned = normalizeShopText(value, 220)
+    .toLowerCase()
+    .replace(/[^a-z0-9:/._-]/g, "");
+  return cleaned || `${normalizeShopSource(source)}:produto`;
+}
+
+function normalizeShopMarkupPercent(value) {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric) || numeric < 0) {
+    return toMoney(SHOP_DEFAULT_MARKUP_PERCENTUAL);
+  }
+  return toMoney(Math.min(10000, numeric));
+}
+
+function calculateShopSalePrice(supplierPrice, markupPercent = SHOP_DEFAULT_MARKUP_PERCENTUAL) {
+  const cost = Math.max(0, toMoney(supplierPrice));
+  const markup = normalizeShopMarkupPercent(markupPercent);
+  return toMoney(cost * (1 + markup / 100));
+}
+
+function normalizeHttpBaseUrl(value, fallback = "") {
+  const raw = String(value || "").trim().replace(/\/+$/, "");
+
+  if (!raw) {
+    return String(fallback || "").trim().replace(/\/+$/, "");
+  }
+
+  try {
+    const parsed = new URL(raw);
+    if (!["http:", "https:"].includes(parsed.protocol)) {
+      return String(fallback || "").trim().replace(/\/+$/, "");
+    }
+    return parsed.toString().replace(/\/+$/, "");
+  } catch {
+    return String(fallback || "").trim().replace(/\/+$/, "");
+  }
+}
+
+function splitSetCookieHeader(value) {
+  const raw = String(value || "").trim();
+  if (!raw) return [];
+
+  return raw
+    .split(/,(?=\s*[^=;,\s]+=[^;,]+)/g)
+    .map((item) => String(item || "").trim())
+    .filter(Boolean);
+}
+
+function extractCookieHeaderFromResponse(response) {
+  const headers = response?.headers;
+  if (!headers) return "";
+
+  const setCookies =
+    typeof headers.getSetCookie === "function"
+      ? headers.getSetCookie()
+      : splitSetCookieHeader(headers.get("set-cookie"));
+
+  return setCookies
+    .map((entry) => String(entry || "").split(";")[0].trim())
+    .filter(Boolean)
+    .join("; ");
+}
+
+async function fetchJsonWithTimeout(url, options = {}, timeoutMs = 15000) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), Math.max(1000, Number(timeoutMs || 0) || 0));
+
+  try {
+    const response = await fetch(url, {
+      ...options,
+      headers: {
+        Accept: "application/json",
+        ...(options.headers || {})
+      },
+      signal: controller.signal
+    });
+    const data = await response.json().catch(() => ({}));
+
+    return { response, data };
+  } catch (error) {
+    if (error?.name === "AbortError") {
+      throw new Error("Tempo esgotado ao consultar provedor externo");
+    }
+    throw error;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+function buildKairossProductShortDescription(product) {
+  const descricao = normalizeShopText(product?.descricao, 320);
+  if (descricao) return descricao;
+
+  const pieces = [
+    normalizeShopText(product?.marca, 60),
+    normalizeShopText(product?.cor, 40),
+    normalizeShopText(product?.tamanho, 40),
+    normalizeShopText(product?.sku, 60) ? `SKU ${normalizeShopText(product?.sku, 60)}` : ""
+  ].filter(Boolean);
+
+  return normalizeShopText(
+    pieces.join(" | ") || "Produto importado automaticamente da Kaiross.",
+    320
+  );
+}
+
+function buildKairossProductDescription(product) {
+  const descricao = normalizeShopText(product?.descricao, 2400);
+  if (descricao) return descricao;
+
+  const pieces = [
+    normalizeShopText(product?.marca, 80),
+    normalizeShopText(product?.cor, 80),
+    normalizeShopText(product?.tamanho, 80),
+    normalizeShopText(product?.ncm, 40) ? `NCM ${normalizeShopText(product?.ncm, 40)}` : "",
+    normalizeShopText(product?.sku, 80) ? `SKU ${normalizeShopText(product?.sku, 80)}` : ""
+  ].filter(Boolean);
+
+  return normalizeShopText(
+    pieces.join(" | ") || "Produto importado automaticamente da Kaiross.",
+    2400
+  );
+}
+
+async function loginKaiross(options = {}) {
+  const baseUrl = normalizeHttpBaseUrl(
+    options.baseUrl || KAIROSS_BASE_URL,
+    "https://app.kaiross.com.br"
+  );
+  const email = normalizeEmail(options.email || KAIROSS_EMAIL);
+  const senha = String(options.senha || KAIROSS_PASSWORD || "").trim();
+
+  if (!email || !senha) {
+    throw new Error("Credenciais da Kaiross obrigatorias");
+  }
+
+  const { response, data } = await fetchJsonWithTimeout(
+    `${baseUrl}${KAIROSS_LOGIN_PATH}`,
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({ email, senha })
+    },
+    KAIROSS_TIMEOUT_MS
+  );
+
+  if (!response.ok) {
+    throw new Error(data?.error || data?.message || "Falha ao autenticar na Kaiross");
+  }
+
+  const cookieHeader = extractCookieHeaderFromResponse(response);
+
+  if (!cookieHeader) {
+    throw new Error("A Kaiross nao retornou cookies de autenticacao");
+  }
+
+  return {
+    baseUrl,
+    cookieHeader,
+    user: data?.user || null
+  };
+}
+
+async function fetchKairossProducts(options = {}) {
+  const session = await loginKaiross(options);
+  const { response, data } = await fetchJsonWithTimeout(
+    `${session.baseUrl}${KAIROSS_PRODUCTS_PATH}`,
+    {
+      method: "GET",
+      headers: {
+        Cookie: session.cookieHeader
+      }
+    },
+    KAIROSS_TIMEOUT_MS
+  );
+
+  if (!response.ok) {
+    throw new Error(data?.error || data?.message || "Falha ao carregar produtos da Kaiross");
+  }
+
+  const products = Array.isArray(data)
+    ? data
+    : Array.isArray(data?.produtos)
+      ? data.produtos
+      : Array.isArray(data?.items)
+        ? data.items
+        : Array.isArray(data?.data)
+          ? data.data
+          : null;
+
+  if (!Array.isArray(products)) {
+    throw new Error("A Kaiross nao retornou uma lista valida de produtos");
+  }
+
+  return {
+    ...session,
+    products
+  };
+}
+
+function buildKairossShopImportPayload(products, options = {}) {
+  const source = normalizeShopSource(options.source || SHOP_PRODUCT_SOURCE_DEFAULT);
+  const markupPercent = normalizeShopMarkupPercent(
+    options.markupPercent === undefined ? SHOP_DEFAULT_MARKUP_PERCENTUAL : options.markupPercent
+  );
+  const baseUrl = normalizeHttpBaseUrl(
+    options.baseUrl || KAIROSS_BASE_URL,
+    "https://app.kaiross.com.br"
+  );
+  const vitrineUrl = `${baseUrl}${KAIROSS_VITRINE_PATH}`;
+  const categories = new Map();
+
+  for (const rawProduct of Array.isArray(products) ? products : []) {
+    const categoryName = normalizeShopText(rawProduct?.categoria, 120) || "Sem categoria";
+
+    if (!categories.has(categoryName)) {
+      categories.set(categoryName, {
+        name: categoryName,
+        sourceKey: `${source}:category:${slugifyShopValue(categoryName, "categoria")}`,
+        sortOrder: categories.size,
+        products: []
+      });
+    }
+
+    const supplierPrice = Math.max(
+      0,
+      toMoney(
+        rawProduct?.precoSugerido ??
+          rawProduct?.preco ??
+          rawProduct?.valor ??
+          rawProduct?.price
+      )
+    );
+    const rawStockNumber = Number(rawProduct?.estoque);
+    const hasStockNumber = Number.isFinite(rawStockNumber);
+    const active =
+      rawProduct?.ativo === true &&
+      rawProduct?.pausadoPorEstoque !== true &&
+      (!hasStockNumber || rawStockNumber > 0);
+    const secondaryImages = Array.isArray(rawProduct?.imagensSecundariasUrls)
+      ? rawProduct.imagensSecundariasUrls
+      : [];
+    const fallbackImage = secondaryImages.find((item) => normalizeShopUrl(item));
+    const imageUrl = normalizeShopUrl(rawProduct?.imagemPrincipalUrl || fallbackImage || "");
+    const externalId = normalizeShopText(
+      rawProduct?.externalId || rawProduct?.id || rawProduct?.sku,
+      120
+    );
+    const externalKey =
+      externalId ||
+      slugifyShopValue(
+        rawProduct?.nome || rawProduct?.sku || rawProduct?.ean || "produto-kaiross",
+        "produto-kaiross"
+      );
+
+    categories.get(categoryName).products.push({
+      sourceKey: `${source}:product:${externalKey}`,
+      externalId,
+      externalUrl: vitrineUrl,
+      name: rawProduct?.nome,
+      shortDescription: buildKairossProductShortDescription(rawProduct),
+      description: buildKairossProductDescription(rawProduct),
+      imageUrl,
+      supplierPrice,
+      markupPercent,
+      active,
+      rawPayload: {
+        ...rawProduct,
+        importedFrom: "kaiross",
+        importedAt: db(),
+        vitrineUrl
+      }
+    });
+  }
+
+  return {
+    source,
+    markupPercent,
+    categories: Array.from(categories.values())
+  };
+}
+
+function normalizeShopOrderStatus(value) {
+  const normalized = String(value || "").trim().toLowerCase();
+  if (
+    [
+      SHOP_ORDER_STATUS_PENDING,
+      SHOP_ORDER_STATUS_APPROVED,
+      SHOP_ORDER_STATUS_REFUSED
+    ].includes(normalized)
+  ) {
+    return normalized;
+  }
+  return SHOP_ORDER_STATUS_PENDING;
+}
+
+function normalizeShopQuantity(value) {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) return 0;
+  return Math.max(0, Math.floor(numeric));
+}
+
+function normalizeShopPostalCode(value) {
+  return normalizeDigits(value, 8);
+}
+
+function normalizeShopPhone(value) {
+  return normalizeDigits(value, 15);
+}
+
+function normalizeShopState(value) {
+  return normalizeShopText(value, 2).toUpperCase();
+}
+
+function buildShopFormattedAddress(address = {}) {
+  const parts = [
+    normalizeShopText(address.shippingStreet || address.street, 120),
+    normalizeShopText(address.shippingNumber || address.number, 20),
+    normalizeShopText(address.shippingComplement || address.complement, 120),
+    normalizeShopText(address.shippingNeighborhood || address.neighborhood, 120),
+    normalizeShopText(address.shippingCity || address.city, 120),
+    normalizeShopState(address.shippingState || address.state),
+    normalizeShopPostalCode(address.shippingZip || address.zip)
+  ].filter(Boolean);
+
+  return parts.join(", ");
+}
+
+function montarDescricaoShopPedido(order = {}) {
+  const total = toMoney(order.totalAmount);
+  const quantity = Array.isArray(order.items)
+    ? order.items.reduce((sum, item) => sum + normalizeShopQuantity(item?.quantity), 0)
+    : 0;
+  const quantityLabel = quantity > 0 ? `${quantity} item(ns)` : "pedido";
+  return `Shop Sigmo | ${quantityLabel} | Total debitado: R$${total.toFixed(2)}`;
 }
 
 function isContaBanida(user) {
@@ -1662,6 +2096,124 @@ await ensureColumn("depositos", "comprovante_texto", "TEXT DEFAULT ''");
   );
 
   await pool.query(`
+    CREATE TABLE IF NOT EXISTS shop_categories (
+      id TEXT PRIMARY KEY,
+      source_key TEXT UNIQUE NOT NULL,
+      source TEXT NOT NULL DEFAULT '${SHOP_PRODUCT_SOURCE_DEFAULT}',
+      slug TEXT UNIQUE NOT NULL,
+      name TEXT NOT NULL DEFAULT '',
+      description TEXT DEFAULT '',
+      image_url TEXT DEFAULT '',
+      is_active BOOLEAN NOT NULL DEFAULT true,
+      sort_order INTEGER NOT NULL DEFAULT 0,
+      created_at TIMESTAMP,
+      updated_at TIMESTAMP
+    );
+  `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS shop_products (
+      id TEXT PRIMARY KEY,
+      category_id TEXT NOT NULL,
+      source_key TEXT UNIQUE NOT NULL,
+      source TEXT NOT NULL DEFAULT '${SHOP_PRODUCT_SOURCE_DEFAULT}',
+      external_id TEXT DEFAULT '',
+      external_url TEXT DEFAULT '',
+      slug TEXT UNIQUE NOT NULL,
+      name TEXT NOT NULL DEFAULT '',
+      short_description TEXT DEFAULT '',
+      description TEXT DEFAULT '',
+      image_url TEXT DEFAULT '',
+      supplier_price NUMERIC NOT NULL DEFAULT 0,
+      markup_percent NUMERIC NOT NULL DEFAULT ${SHOP_DEFAULT_MARKUP_PERCENTUAL},
+      price NUMERIC NOT NULL DEFAULT 0,
+      currency TEXT NOT NULL DEFAULT 'BRL',
+      is_active BOOLEAN NOT NULL DEFAULT true,
+      raw_payload JSONB DEFAULT '{}'::jsonb,
+      created_at TIMESTAMP,
+      updated_at TIMESTAMP
+    );
+  `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS shop_orders (
+      id TEXT PRIMARY KEY,
+      user_id TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT '${SHOP_ORDER_STATUS_PENDING}',
+      subtotal_amount NUMERIC NOT NULL DEFAULT 0,
+      total_amount NUMERIC NOT NULL DEFAULT 0,
+      bonus_debitado NUMERIC NOT NULL DEFAULT 0,
+      real_debitado NUMERIC NOT NULL DEFAULT 0,
+      shipping_name TEXT DEFAULT '',
+      shipping_phone TEXT DEFAULT '',
+      shipping_zip TEXT DEFAULT '',
+      shipping_street TEXT DEFAULT '',
+      shipping_number TEXT DEFAULT '',
+      shipping_complement TEXT DEFAULT '',
+      shipping_neighborhood TEXT DEFAULT '',
+      shipping_city TEXT DEFAULT '',
+      shipping_state TEXT DEFAULT '',
+      shipping_reference TEXT DEFAULT '',
+      customer_note TEXT DEFAULT '',
+      refusal_reason TEXT DEFAULT '',
+      financial_transaction_id_debito TEXT DEFAULT '',
+      financial_transaction_id_estorno TEXT DEFAULT '',
+      admin_id TEXT DEFAULT '',
+      created_at TIMESTAMP,
+      updated_at TIMESTAMP,
+      approved_at TIMESTAMP,
+      refused_at TIMESTAMP,
+      refunded_at TIMESTAMP
+    );
+  `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS shop_order_items (
+      id TEXT PRIMARY KEY,
+      order_id TEXT NOT NULL,
+      product_id TEXT NOT NULL,
+      category_id TEXT NOT NULL,
+      source_key TEXT DEFAULT '',
+      external_url TEXT DEFAULT '',
+      product_name TEXT NOT NULL DEFAULT '',
+      product_slug TEXT DEFAULT '',
+      image_url TEXT DEFAULT '',
+      supplier_price NUMERIC NOT NULL DEFAULT 0,
+      unit_price NUMERIC NOT NULL DEFAULT 0,
+      quantity INTEGER NOT NULL DEFAULT 1,
+      total_price NUMERIC NOT NULL DEFAULT 0,
+      metadata JSONB DEFAULT '{}'::jsonb,
+      created_at TIMESTAMP,
+      updated_at TIMESTAMP
+    );
+  `);
+
+  await ensureIndex(
+    "idx_shop_categories_sort_order",
+    "CREATE INDEX idx_shop_categories_sort_order ON shop_categories(sort_order)"
+  );
+  await ensureIndex(
+    "idx_shop_products_category_id",
+    "CREATE INDEX idx_shop_products_category_id ON shop_products(category_id)"
+  );
+  await ensureIndex(
+    "idx_shop_products_is_active",
+    "CREATE INDEX idx_shop_products_is_active ON shop_products(is_active)"
+  );
+  await ensureIndex(
+    "idx_shop_orders_user_id",
+    "CREATE INDEX idx_shop_orders_user_id ON shop_orders(user_id)"
+  );
+  await ensureIndex(
+    "idx_shop_orders_status",
+    "CREATE INDEX idx_shop_orders_status ON shop_orders(status)"
+  );
+  await ensureIndex(
+    "idx_shop_order_items_order_id",
+    "CREATE INDEX idx_shop_order_items_order_id ON shop_order_items(order_id)"
+  );
+
+  await pool.query(`
     CREATE TABLE IF NOT EXISTS topup_orders (
       id TEXT PRIMARY KEY,
       user_id TEXT NOT NULL,
@@ -2535,6 +3087,144 @@ function mapInvestmentReserve(row) {
     updatedAt: row.updated_at || null,
     lastWithdrawnAt: row.last_withdrawn_at || null,
     closedAt: row.closed_at || null
+  };
+}
+
+function mapShopCategory(row) {
+  if (!row) return null;
+
+  return {
+    id: row.id,
+    sourceKey: row.source_key || "",
+    source: row.source || SHOP_PRODUCT_SOURCE_DEFAULT,
+    slug: row.slug || "",
+    name: row.name || "",
+    description: row.description || "",
+    imageUrl: row.image_url || "",
+    active: row.is_active !== false,
+    sortOrder: Number(row.sort_order || 0),
+    createdAt: row.created_at || null,
+    updatedAt: row.updated_at || null
+  };
+}
+
+function mapShopProduct(row) {
+  if (!row) return null;
+
+  const category =
+    row.category_slug || row.category_name
+      ? {
+          id: row.category_id,
+          sourceKey: row.category_source_key || "",
+          source: row.category_source || SHOP_PRODUCT_SOURCE_DEFAULT,
+          slug: row.category_slug || "",
+          name: row.category_name || "",
+          description: row.category_description || "",
+          imageUrl: row.category_image_url || "",
+          active: row.category_is_active !== false,
+          sortOrder: Number(row.category_sort_order || 0)
+        }
+      : null;
+
+  return {
+    id: row.id,
+    categoryId: row.category_id,
+    sourceKey: row.source_key || "",
+    source: row.source || SHOP_PRODUCT_SOURCE_DEFAULT,
+    externalId: row.external_id || "",
+    externalUrl: row.external_url || "",
+    slug: row.slug || "",
+    name: row.name || "",
+    shortDescription: row.short_description || "",
+    description: row.description || "",
+    imageUrl: row.image_url || "",
+    supplierPrice: toMoney(row.supplier_price),
+    markupPercent: toMoney(row.markup_percent),
+    price: toMoney(row.price),
+    currency: row.currency || "BRL",
+    active: row.is_active !== false,
+    rawPayload: row.raw_payload || {},
+    createdAt: row.created_at || null,
+    updatedAt: row.updated_at || null,
+    category
+  };
+}
+
+function mapShopOrderItem(row) {
+  if (!row) return null;
+
+  return {
+    id: row.id,
+    orderId: row.order_id,
+    productId: row.product_id,
+    categoryId: row.category_id,
+    sourceKey: row.source_key || "",
+    externalUrl: row.external_url || "",
+    productName: row.product_name || "",
+    productSlug: row.product_slug || "",
+    imageUrl: row.image_url || "",
+    supplierPrice: toMoney(row.supplier_price),
+    unitPrice: toMoney(row.unit_price),
+    quantity: Number(row.quantity || 0),
+    totalPrice: toMoney(row.total_price),
+    metadata: row.metadata || {},
+    createdAt: row.created_at || null,
+    updatedAt: row.updated_at || null
+  };
+}
+
+function mapShopOrder(row) {
+  if (!row) return null;
+
+  const shipping = {
+    name: row.shipping_name || "",
+    phone: row.shipping_phone || "",
+    zip: row.shipping_zip || "",
+    street: row.shipping_street || "",
+    number: row.shipping_number || "",
+    complement: row.shipping_complement || "",
+    neighborhood: row.shipping_neighborhood || "",
+    city: row.shipping_city || "",
+    state: row.shipping_state || "",
+    reference: row.shipping_reference || ""
+  };
+
+  return {
+    id: row.id,
+    userId: row.user_id,
+    status: normalizeShopOrderStatus(row.status),
+    subtotalAmount: toMoney(row.subtotal_amount),
+    totalAmount: toMoney(row.total_amount),
+    bonusDebitado: toMoney(row.bonus_debitado),
+    realDebitado: toMoney(row.real_debitado),
+    customerNote: row.customer_note || "",
+    refusalReason: row.refusal_reason || "",
+    financialTransactionIdDebito: row.financial_transaction_id_debito || "",
+    financialTransactionIdEstorno: row.financial_transaction_id_estorno || "",
+    adminId: row.admin_id || "",
+    shipping,
+    shippingAddress: buildShopFormattedAddress({
+      shippingStreet: shipping.street,
+      shippingNumber: shipping.number,
+      shippingComplement: shipping.complement,
+      shippingNeighborhood: shipping.neighborhood,
+      shippingCity: shipping.city,
+      shippingState: shipping.state,
+      shippingZip: shipping.zip
+    }),
+    createdAt: row.created_at || null,
+    updatedAt: row.updated_at || null,
+    approvedAt: row.approved_at || null,
+    refusedAt: row.refused_at || null,
+    refundedAt: row.refunded_at || null,
+    user:
+      row.user_email || row.user_nome
+        ? {
+            id: row.user_id,
+            nome: row.user_nome || row.user_email?.split("@")[0] || "",
+            email: row.user_email || ""
+          }
+        : null
   };
 }
 
@@ -4249,6 +4939,746 @@ async function listRecargaCelularPedidos(status = "", client = pool) {
   return result.rows.map(mapRecargaCelularPedido);
 }
 
+async function saveShopCategory(category, client = pool) {
+  const payload = {
+    id: String(category.id || buildId("shopcat")).trim(),
+    sourceKey: normalizeShopCategorySourceKey(category.sourceKey, category.source),
+    source: normalizeShopSource(category.source),
+    slug: slugifyShopValue(category.slug || category.name, "categoria"),
+    name: normalizeShopText(category.name, 120),
+    description: normalizeShopText(category.description, 1000),
+    imageUrl: normalizeShopUrl(category.imageUrl),
+    active: category.active !== false,
+    sortOrder: Number(category.sortOrder || 0),
+    createdAt: category.createdAt || db(),
+    updatedAt: category.updatedAt || db()
+  };
+
+  const result = await client.query(
+    `
+    INSERT INTO shop_categories (
+      id, source_key, source, slug, name, description, image_url,
+      is_active, sort_order, created_at, updated_at
+    )
+    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+    ON CONFLICT (source_key) DO UPDATE SET
+      source = EXCLUDED.source,
+      slug = EXCLUDED.slug,
+      name = EXCLUDED.name,
+      description = EXCLUDED.description,
+      image_url = EXCLUDED.image_url,
+      is_active = EXCLUDED.is_active,
+      sort_order = EXCLUDED.sort_order,
+      updated_at = EXCLUDED.updated_at
+    RETURNING *
+    `,
+    [
+      payload.id,
+      payload.sourceKey,
+      payload.source,
+      payload.slug,
+      payload.name,
+      payload.description,
+      payload.imageUrl,
+      payload.active,
+      payload.sortOrder,
+      payload.createdAt,
+      payload.updatedAt
+    ]
+  );
+
+  return mapShopCategory(result.rows[0]);
+}
+
+async function saveShopProduct(product, client = pool) {
+  const payload = {
+    id: String(product.id || buildId("shopprd")).trim(),
+    categoryId: String(product.categoryId || "").trim(),
+    sourceKey: normalizeShopProductSourceKey(product.sourceKey, product.source),
+    source: normalizeShopSource(product.source),
+    externalId: normalizeShopText(product.externalId, 120),
+    externalUrl: normalizeShopUrl(product.externalUrl),
+    slug: slugifyShopValue(product.slug || product.name, "produto"),
+    name: normalizeShopText(product.name, 180),
+    shortDescription: normalizeShopText(product.shortDescription, 320),
+    description: normalizeShopText(product.description, 2400),
+    imageUrl: normalizeShopUrl(product.imageUrl),
+    supplierPrice: Math.max(0, toMoney(product.supplierPrice)),
+    markupPercent: normalizeShopMarkupPercent(product.markupPercent),
+    price: Math.max(
+      0,
+      toMoney(
+        product.price !== undefined && product.price !== null
+          ? product.price
+          : calculateShopSalePrice(product.supplierPrice, product.markupPercent)
+      )
+    ),
+    currency: normalizeShopText(product.currency || "BRL", 12).toUpperCase() || "BRL",
+    active: product.active !== false,
+    rawPayload: product.rawPayload || {},
+    createdAt: product.createdAt || db(),
+    updatedAt: product.updatedAt || db()
+  };
+
+  const result = await client.query(
+    `
+    INSERT INTO shop_products (
+      id, category_id, source_key, source, external_id, external_url, slug, name,
+      short_description, description, image_url, supplier_price, markup_percent,
+      price, currency, is_active, raw_payload, created_at, updated_at
+    )
+    VALUES (
+      $1,$2,$3,$4,$5,$6,$7,$8,
+      $9,$10,$11,$12,$13,
+      $14,$15,$16,$17,$18,$19
+    )
+    ON CONFLICT (source_key) DO UPDATE SET
+      category_id = EXCLUDED.category_id,
+      source = EXCLUDED.source,
+      external_id = EXCLUDED.external_id,
+      external_url = EXCLUDED.external_url,
+      slug = EXCLUDED.slug,
+      name = EXCLUDED.name,
+      short_description = EXCLUDED.short_description,
+      description = EXCLUDED.description,
+      image_url = EXCLUDED.image_url,
+      supplier_price = EXCLUDED.supplier_price,
+      markup_percent = EXCLUDED.markup_percent,
+      price = EXCLUDED.price,
+      currency = EXCLUDED.currency,
+      is_active = EXCLUDED.is_active,
+      raw_payload = EXCLUDED.raw_payload,
+      updated_at = EXCLUDED.updated_at
+    RETURNING *
+    `,
+    [
+      payload.id,
+      payload.categoryId,
+      payload.sourceKey,
+      payload.source,
+      payload.externalId,
+      payload.externalUrl,
+      payload.slug,
+      payload.name,
+      payload.shortDescription,
+      payload.description,
+      payload.imageUrl,
+      payload.supplierPrice,
+      payload.markupPercent,
+      payload.price,
+      payload.currency,
+      payload.active,
+      JSON.stringify(payload.rawPayload || {}),
+      payload.createdAt,
+      payload.updatedAt
+    ]
+  );
+
+  return mapShopProduct(result.rows[0]);
+}
+
+async function saveShopOrder(order, client = pool) {
+  const shipping = order.shipping || {};
+  const payload = {
+    id: String(order.id || buildId("shopord")).trim(),
+    userId: String(order.userId || "").trim(),
+    status: normalizeShopOrderStatus(order.status),
+    subtotalAmount: toMoney(order.subtotalAmount),
+    totalAmount: toMoney(order.totalAmount),
+    bonusDebitado: toMoney(order.bonusDebitado),
+    realDebitado: toMoney(order.realDebitado),
+    shippingName: normalizeShopText(shipping.name, 120),
+    shippingPhone: normalizeShopPhone(shipping.phone),
+    shippingZip: normalizeShopPostalCode(shipping.zip),
+    shippingStreet: normalizeShopText(shipping.street, 120),
+    shippingNumber: normalizeShopText(shipping.number, 20),
+    shippingComplement: normalizeShopText(shipping.complement, 120),
+    shippingNeighborhood: normalizeShopText(shipping.neighborhood, 120),
+    shippingCity: normalizeShopText(shipping.city, 120),
+    shippingState: normalizeShopState(shipping.state),
+    shippingReference: normalizeShopText(shipping.reference, 220),
+    customerNote: normalizeShopText(order.customerNote, 1000),
+    refusalReason: normalizeShopText(order.refusalReason, 320),
+    financialTransactionIdDebito: String(order.financialTransactionIdDebito || "").trim(),
+    financialTransactionIdEstorno: String(order.financialTransactionIdEstorno || "").trim(),
+    adminId: String(order.adminId || "").trim(),
+    createdAt: order.createdAt || db(),
+    updatedAt: order.updatedAt || db(),
+    approvedAt: order.approvedAt || null,
+    refusedAt: order.refusedAt || null,
+    refundedAt: order.refundedAt || null
+  };
+
+  const result = await client.query(
+    `
+    INSERT INTO shop_orders (
+      id, user_id, status, subtotal_amount, total_amount, bonus_debitado,
+      real_debitado, shipping_name, shipping_phone, shipping_zip, shipping_street,
+      shipping_number, shipping_complement, shipping_neighborhood, shipping_city,
+      shipping_state, shipping_reference, customer_note, refusal_reason,
+      financial_transaction_id_debito, financial_transaction_id_estorno, admin_id,
+      created_at, updated_at, approved_at, refused_at, refunded_at
+    )
+    VALUES (
+      $1,$2,$3,$4,$5,$6,
+      $7,$8,$9,$10,$11,
+      $12,$13,$14,$15,
+      $16,$17,$18,$19,
+      $20,$21,$22,
+      $23,$24,$25,$26,$27
+    )
+    ON CONFLICT (id) DO UPDATE SET
+      user_id = EXCLUDED.user_id,
+      status = EXCLUDED.status,
+      subtotal_amount = EXCLUDED.subtotal_amount,
+      total_amount = EXCLUDED.total_amount,
+      bonus_debitado = EXCLUDED.bonus_debitado,
+      real_debitado = EXCLUDED.real_debitado,
+      shipping_name = EXCLUDED.shipping_name,
+      shipping_phone = EXCLUDED.shipping_phone,
+      shipping_zip = EXCLUDED.shipping_zip,
+      shipping_street = EXCLUDED.shipping_street,
+      shipping_number = EXCLUDED.shipping_number,
+      shipping_complement = EXCLUDED.shipping_complement,
+      shipping_neighborhood = EXCLUDED.shipping_neighborhood,
+      shipping_city = EXCLUDED.shipping_city,
+      shipping_state = EXCLUDED.shipping_state,
+      shipping_reference = EXCLUDED.shipping_reference,
+      customer_note = EXCLUDED.customer_note,
+      refusal_reason = EXCLUDED.refusal_reason,
+      financial_transaction_id_debito = EXCLUDED.financial_transaction_id_debito,
+      financial_transaction_id_estorno = EXCLUDED.financial_transaction_id_estorno,
+      admin_id = EXCLUDED.admin_id,
+      created_at = COALESCE(shop_orders.created_at, EXCLUDED.created_at),
+      updated_at = EXCLUDED.updated_at,
+      approved_at = EXCLUDED.approved_at,
+      refused_at = EXCLUDED.refused_at,
+      refunded_at = EXCLUDED.refunded_at
+    `,
+    [
+      payload.id,
+      payload.userId,
+      payload.status,
+      payload.subtotalAmount,
+      payload.totalAmount,
+      payload.bonusDebitado,
+      payload.realDebitado,
+      payload.shippingName,
+      payload.shippingPhone,
+      payload.shippingZip,
+      payload.shippingStreet,
+      payload.shippingNumber,
+      payload.shippingComplement,
+      payload.shippingNeighborhood,
+      payload.shippingCity,
+      payload.shippingState,
+      payload.shippingReference,
+      payload.customerNote,
+      payload.refusalReason,
+      payload.financialTransactionIdDebito,
+      payload.financialTransactionIdEstorno,
+      payload.adminId,
+      payload.createdAt,
+      payload.updatedAt,
+      payload.approvedAt,
+      payload.refusedAt,
+      payload.refundedAt
+    ]
+  );
+
+  return getShopOrderById(payload.id, client);
+}
+
+async function replaceShopOrderItems(orderId, items = [], client = pool) {
+  const normalizedOrderId = String(orderId || "").trim();
+
+  await client.query("DELETE FROM shop_order_items WHERE order_id = $1", [normalizedOrderId]);
+
+  for (const rawItem of Array.isArray(items) ? items : []) {
+    const item = {
+      id: String(rawItem.id || buildId("shopitem")).trim(),
+      orderId: normalizedOrderId,
+      productId: String(rawItem.productId || "").trim(),
+      categoryId: String(rawItem.categoryId || "").trim(),
+      sourceKey: normalizeShopProductSourceKey(rawItem.sourceKey, rawItem.source),
+      externalUrl: normalizeShopUrl(rawItem.externalUrl),
+      productName: normalizeShopText(rawItem.productName, 180),
+      productSlug: slugifyShopValue(rawItem.productSlug || rawItem.productName, "produto"),
+      imageUrl: normalizeShopUrl(rawItem.imageUrl),
+      supplierPrice: Math.max(0, toMoney(rawItem.supplierPrice)),
+      unitPrice: Math.max(0, toMoney(rawItem.unitPrice)),
+      quantity: Math.max(1, normalizeShopQuantity(rawItem.quantity)),
+      totalPrice: Math.max(0, toMoney(rawItem.totalPrice)),
+      metadata: rawItem.metadata || {},
+      createdAt: rawItem.createdAt || db(),
+      updatedAt: rawItem.updatedAt || db()
+    };
+
+    await client.query(
+      `
+      INSERT INTO shop_order_items (
+        id, order_id, product_id, category_id, source_key, external_url, product_name,
+        product_slug, image_url, supplier_price, unit_price, quantity, total_price,
+        metadata, created_at, updated_at
+      )
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
+      `,
+      [
+        item.id,
+        item.orderId,
+        item.productId,
+        item.categoryId,
+        item.sourceKey,
+        item.externalUrl,
+        item.productName,
+        item.productSlug,
+        item.imageUrl,
+        item.supplierPrice,
+        item.unitPrice,
+        item.quantity,
+        item.totalPrice,
+        JSON.stringify(item.metadata || {}),
+        item.createdAt,
+        item.updatedAt
+      ]
+    );
+  }
+}
+
+async function listShopCategories(options = {}, client = pool) {
+  const activeOnly = options?.activeOnly === true;
+  const result = await client.query(
+    `
+    SELECT *
+    FROM shop_categories
+    ${activeOnly ? "WHERE is_active = true" : ""}
+    ORDER BY sort_order ASC, name ASC, created_at ASC NULLS LAST, id ASC
+    `
+  );
+
+  return result.rows.map(mapShopCategory);
+}
+
+async function listShopProducts(options = {}, client = pool) {
+  const params = [];
+  const clauses = [];
+
+  if (options?.activeOnly) {
+    clauses.push("p.is_active = true");
+    clauses.push("c.is_active = true");
+  }
+
+  if (options?.categoryId) {
+    params.push(String(options.categoryId || "").trim());
+    clauses.push(`p.category_id = $${params.length}`);
+  } else if (options?.categorySlug) {
+    params.push(String(options.categorySlug || "").trim());
+    clauses.push(`c.slug = $${params.length}`);
+  }
+
+  if (options?.search) {
+    params.push(`%${String(options.search || "").trim().toLowerCase()}%`);
+    clauses.push(`(
+      LOWER(p.name) LIKE $${params.length}
+      OR LOWER(p.short_description) LIKE $${params.length}
+      OR LOWER(p.description) LIKE $${params.length}
+      OR LOWER(c.name) LIKE $${params.length}
+    )`);
+  }
+
+  const whereSql = clauses.length ? `WHERE ${clauses.join(" AND ")}` : "";
+  const result = await client.query(
+    `
+    SELECT
+      p.*,
+      c.source_key AS category_source_key,
+      c.source AS category_source,
+      c.slug AS category_slug,
+      c.name AS category_name,
+      c.description AS category_description,
+      c.image_url AS category_image_url,
+      c.is_active AS category_is_active,
+      c.sort_order AS category_sort_order
+    FROM shop_products p
+    INNER JOIN shop_categories c ON c.id = p.category_id
+    ${whereSql}
+    ORDER BY c.sort_order ASC, c.name ASC, p.name ASC, p.created_at ASC NULLS LAST, p.id ASC
+    `,
+    params
+  );
+
+  return result.rows.map(mapShopProduct);
+}
+
+async function getShopProductById(id, client = pool) {
+  const result = await client.query(
+    `
+    SELECT
+      p.*,
+      c.source_key AS category_source_key,
+      c.source AS category_source,
+      c.slug AS category_slug,
+      c.name AS category_name,
+      c.description AS category_description,
+      c.image_url AS category_image_url,
+      c.is_active AS category_is_active,
+      c.sort_order AS category_sort_order
+    FROM shop_products p
+    INNER JOIN shop_categories c ON c.id = p.category_id
+    WHERE p.id = $1
+    LIMIT 1
+    `,
+    [String(id || "").trim()]
+  );
+
+  return mapShopProduct(result.rows[0]);
+}
+
+async function listShopProductsByIds(ids = [], client = pool) {
+  const normalizedIds = Array.from(
+    new Set(
+      (Array.isArray(ids) ? ids : [])
+        .map((id) => String(id || "").trim())
+        .filter(Boolean)
+    )
+  );
+
+  if (!normalizedIds.length) {
+    return [];
+  }
+
+  const result = await client.query(
+    `
+    SELECT
+      p.*,
+      c.source_key AS category_source_key,
+      c.source AS category_source,
+      c.slug AS category_slug,
+      c.name AS category_name,
+      c.description AS category_description,
+      c.image_url AS category_image_url,
+      c.is_active AS category_is_active,
+      c.sort_order AS category_sort_order
+    FROM shop_products p
+    INNER JOIN shop_categories c ON c.id = p.category_id
+    WHERE p.id = ANY($1::text[])
+    `,
+    [normalizedIds]
+  );
+
+  return result.rows.map(mapShopProduct);
+}
+
+async function getShopProductByIdForUpdate(id, client) {
+  const result = await client.query(
+    `
+    SELECT *
+    FROM shop_products
+    WHERE id = $1
+    LIMIT 1
+    FOR UPDATE
+    `,
+    [String(id || "").trim()]
+  );
+
+  return mapShopProduct(result.rows[0]);
+}
+
+async function getShopOrderById(id, client = pool) {
+  const result = await client.query(
+    `
+    SELECT
+      o.*,
+      u.nome AS user_nome,
+      u.email AS user_email
+    FROM shop_orders o
+    LEFT JOIN usuarios u ON u.id = o.user_id
+    WHERE o.id = $1
+    LIMIT 1
+    `,
+    [String(id || "").trim()]
+  );
+
+  const order = mapShopOrder(result.rows[0]);
+  if (!order) return null;
+  const [withItems] = await attachShopItemsToOrders([order], client);
+  return withItems || null;
+}
+
+async function getShopOrderByIdForUpdate(id, client) {
+  const result = await client.query(
+    `
+    SELECT *
+    FROM shop_orders
+    WHERE id = $1
+    LIMIT 1
+    FOR UPDATE
+    `,
+    [String(id || "").trim()]
+  );
+
+  return mapShopOrder(result.rows[0]);
+}
+
+async function listShopOrdersByUser(userId, client = pool) {
+  const result = await client.query(
+    `
+    SELECT
+      o.*,
+      u.nome AS user_nome,
+      u.email AS user_email
+    FROM shop_orders o
+    LEFT JOIN usuarios u ON u.id = o.user_id
+    WHERE o.user_id = $1
+    ORDER BY o.created_at DESC NULLS LAST, o.id DESC
+    `,
+    [String(userId || "").trim()]
+  );
+
+  return attachShopItemsToOrders(result.rows.map(mapShopOrder), client);
+}
+
+async function listShopOrders(status = "", client = pool) {
+  const requestedStatus = String(status || "").trim().toLowerCase();
+  const shouldFilter = [
+    SHOP_ORDER_STATUS_PENDING,
+    SHOP_ORDER_STATUS_APPROVED,
+    SHOP_ORDER_STATUS_REFUSED
+  ].includes(requestedStatus);
+  const rawStatus = shouldFilter
+    ? requestedStatus
+    : SHOP_ORDER_STATUS_PENDING;
+  const params = shouldFilter ? [rawStatus] : [];
+  const result = await client.query(
+    `
+    SELECT
+      o.*,
+      u.nome AS user_nome,
+      u.email AS user_email
+    FROM shop_orders o
+    LEFT JOIN usuarios u ON u.id = o.user_id
+    ${shouldFilter ? "WHERE o.status = $1" : ""}
+    ORDER BY o.created_at DESC NULLS LAST, o.id DESC
+    `,
+    params
+  );
+
+  return attachShopItemsToOrders(result.rows.map(mapShopOrder), client);
+}
+
+async function attachShopItemsToOrders(orders = [], client = pool) {
+  const orderList = Array.isArray(orders) ? orders.filter(Boolean) : [];
+  const ids = orderList.map((order) => String(order.id || "").trim()).filter(Boolean);
+
+  if (!ids.length) {
+    return orderList.map((order) => ({ ...order, items: [] }));
+  }
+
+  const result = await client.query(
+    `
+    SELECT *
+    FROM shop_order_items
+    WHERE order_id = ANY($1::text[])
+    ORDER BY created_at ASC NULLS LAST, id ASC
+    `,
+    [ids]
+  );
+
+  const itemsByOrderId = new Map();
+  for (const row of result.rows) {
+    const item = mapShopOrderItem(row);
+    const list = itemsByOrderId.get(item.orderId) || [];
+    list.push(item);
+    itemsByOrderId.set(item.orderId, list);
+  }
+
+  return orderList.map((order) => ({
+    ...order,
+    items: itemsByOrderId.get(order.id) || []
+  }));
+}
+
+async function importShopCatalog(input = {}, client = pool) {
+  const source = normalizeShopSource(input.source || SHOP_PRODUCT_SOURCE_DEFAULT);
+  const defaultMarkupPercent = normalizeShopMarkupPercent(
+    input.markupPercent === undefined ? SHOP_DEFAULT_MARKUP_PERCENTUAL : input.markupPercent
+  );
+  const deactivateMissing = input.deactivateMissing === true;
+  const groupedCategories = [];
+  const importedCategoryIds = new Set();
+  const importedProductKeys = new Set();
+  let importedProducts = 0;
+  let skippedProducts = 0;
+
+  if (Array.isArray(input.categories)) {
+    for (let index = 0; index < input.categories.length; index += 1) {
+      const category = input.categories[index] || {};
+      groupedCategories.push({
+        ...category,
+        sortOrder: Number(category.sortOrder ?? index),
+        products: Array.isArray(category.products) ? category.products : []
+      });
+    }
+  }
+
+  if (Array.isArray(input.products) && input.products.length) {
+    const productsByCategory = new Map();
+    for (const product of input.products) {
+      const categoryName =
+        normalizeShopText(product?.categoryName || product?.category || "Sem categoria", 120) ||
+        "Sem categoria";
+      if (!productsByCategory.has(categoryName)) {
+        productsByCategory.set(categoryName, []);
+      }
+      productsByCategory.get(categoryName).push(product);
+    }
+
+    let sortOrderBase = groupedCategories.length;
+    for (const [categoryName, products] of productsByCategory.entries()) {
+      groupedCategories.push({
+        name: categoryName,
+        sortOrder: sortOrderBase++,
+        products
+      });
+    }
+  }
+
+  for (const rawCategory of groupedCategories) {
+    const categoryName = normalizeShopText(
+      rawCategory.name || rawCategory.title || rawCategory.categoryName,
+      120
+    );
+
+    if (!categoryName) {
+      continue;
+    }
+
+    const categorySourceKey = normalizeShopCategorySourceKey(
+      rawCategory.sourceKey || `${source}:category:${slugifyShopValue(categoryName, "categoria")}`,
+      source
+    );
+    const categorySlug = slugifyShopValue(rawCategory.slug || categoryName, "categoria");
+    const savedCategory = await saveShopCategory(
+      {
+        source,
+        sourceKey: categorySourceKey,
+        slug: categorySlug,
+        name: categoryName,
+        description: rawCategory.description || "",
+        imageUrl: rawCategory.imageUrl || rawCategory.image || "",
+        active: rawCategory.active !== false,
+        sortOrder: rawCategory.sortOrder
+      },
+      client
+    );
+
+    importedCategoryIds.add(savedCategory.id);
+
+    for (const rawProduct of Array.isArray(rawCategory.products) ? rawCategory.products : []) {
+      const productName = normalizeShopText(
+        rawProduct?.name || rawProduct?.title || rawProduct?.produto,
+        180
+      );
+      const supplierPrice = Math.max(
+        0,
+        toMoney(
+          rawProduct?.supplierPrice ??
+            rawProduct?.cost ??
+            rawProduct?.priceCost ??
+            rawProduct?.valorCusto ??
+            rawProduct?.precoCusto ??
+            rawProduct?.price
+        )
+      );
+
+      if (!productName || supplierPrice <= 0) {
+        skippedProducts += 1;
+        continue;
+      }
+
+      const externalId = normalizeShopText(
+        rawProduct?.externalId || rawProduct?.id || rawProduct?.sku,
+        120
+      );
+      const externalUrl = normalizeShopUrl(
+        rawProduct?.externalUrl || rawProduct?.url || rawProduct?.href || rawProduct?.link
+      );
+      const sourceKey = normalizeShopProductSourceKey(
+        rawProduct?.sourceKey ||
+          `${source}:product:${externalId || slugifyShopValue(productName, "produto")}:${slugifyShopValue(categoryName, "categoria")}`,
+        source
+      );
+      const hashSuffix = crypto
+        .createHash("md5")
+        .update(sourceKey)
+        .digest("hex")
+        .slice(0, 8);
+      const productSlug = `${slugifyShopValue(rawProduct?.slug || productName, "produto")}-${hashSuffix}`;
+      const markupPercent = normalizeShopMarkupPercent(
+        rawProduct?.markupPercent === undefined ? defaultMarkupPercent : rawProduct?.markupPercent
+      );
+      const finalPrice =
+        rawProduct?.price !== undefined && rawProduct?.price !== null
+          ? Math.max(0, toMoney(rawProduct.price))
+          : calculateShopSalePrice(supplierPrice, markupPercent);
+
+      await saveShopProduct(
+        {
+          categoryId: savedCategory.id,
+          source,
+          sourceKey,
+          externalId,
+          externalUrl,
+          slug: productSlug,
+          name: productName,
+          shortDescription:
+            rawProduct?.shortDescription ||
+            rawProduct?.headline ||
+            rawProduct?.subtitle ||
+            "",
+          description: rawProduct?.description || rawProduct?.descricao || "",
+          imageUrl: rawProduct?.imageUrl || rawProduct?.image || rawProduct?.thumbnail || "",
+          supplierPrice,
+          markupPercent,
+          price: finalPrice,
+          currency: rawProduct?.currency || "BRL",
+          active: rawProduct?.active !== false,
+          rawPayload: rawProduct
+        },
+        client
+      );
+
+      importedProductKeys.add(sourceKey);
+      importedProducts += 1;
+    }
+  }
+
+  let deactivatedProducts = 0;
+  if (deactivateMissing && importedProductKeys.size > 0) {
+    const result = await client.query(
+      `
+      UPDATE shop_products
+      SET is_active = false,
+          updated_at = $3
+      WHERE source = $1
+        AND NOT (source_key = ANY($2::text[]))
+        AND is_active = true
+      `,
+      [source, Array.from(importedProductKeys), db()]
+    );
+    deactivatedProducts = Number(result.rowCount || 0);
+  }
+
+  return {
+    source,
+    markupPercent: defaultMarkupPercent,
+    categoriesImported: importedCategoryIds.size,
+    productsImported: importedProducts,
+    productsSkipped: skippedProducts,
+    deactivatedProducts
+  };
+}
+
 async function getAdminByEmail(email) {
   const result = await pool.query(
     "SELECT * FROM admins WHERE email = $1 LIMIT 1",
@@ -4406,6 +5836,16 @@ function computeUserFinancialContext(transactions, currentBalance = 0) {
       }
 
       if (tx.sourceType === "topup_order" && tx.operationType === "topup_refund") {
+        const split = getBalanceSplitFromMetadata(tx.metadata, amount);
+
+        if (split) {
+          saldoBonusAtual = toMoney(saldoBonusAtual + split.bonusAmount);
+          saldoRealAtual = toMoney(saldoRealAtual + split.realAmount);
+          continue;
+        }
+      }
+
+      if (tx.sourceType === "shop_order" && tx.operationType === "shop_refund") {
         const split = getBalanceSplitFromMetadata(tx.metadata, amount);
 
         if (split) {
@@ -5806,6 +7246,47 @@ app.get("/public/topup-config", async (req, res) => {
   });
 });
 
+app.get("/public/shop/catalog", async (req, res) => {
+  try {
+    const categorySlug = String(req.query.category || "").trim();
+    const search = String(req.query.search || "").trim();
+    const [categories, products] = await Promise.all([
+      listShopCategories({ activeOnly: true }),
+      listShopProducts(
+        {
+          activeOnly: true,
+          categorySlug,
+          search
+        }
+      )
+    ]);
+
+    const productsByCategoryId = new Map();
+    for (const product of products) {
+      const list = productsByCategoryId.get(product.categoryId) || [];
+      list.push(product);
+      productsByCategoryId.set(product.categoryId, list);
+    }
+
+    res.set("Cache-Control", "no-store");
+    res.json({
+      markupPercentDefault: normalizeShopMarkupPercent(SHOP_DEFAULT_MARKUP_PERCENTUAL),
+      categories: categories.map((category) => ({
+        ...category,
+        productCount: (productsByCategoryId.get(category.id) || []).length
+      })),
+      products,
+      grouped: categories.map((category) => ({
+        ...category,
+        products: productsByCategoryId.get(category.id) || []
+      }))
+    });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: "Erro ao carregar catalogo da shop" });
+  }
+});
+
 app.get("/public/app-status", async (req, res) => {
   try {
     const settings = await getAppRuntimeSettings();
@@ -5965,6 +7446,207 @@ app.post("/admin/app-status", authAdmin, async (req, res) => {
   } catch (error) {
     console.error(error);
     res.status(500).json({ error: "Erro ao atualizar status do app" });
+  }
+});
+
+app.get("/admin/shop/catalog", authAdmin, async (req, res) => {
+  try {
+    const [categories, products] = await Promise.all([
+      listShopCategories(),
+      listShopProducts()
+    ]);
+
+    res.set("Cache-Control", "no-store");
+    res.json({
+      stats: {
+        categories: categories.length,
+        activeCategories: categories.filter((item) => item.active).length,
+        products: products.length,
+        activeProducts: products.filter((item) => item.active).length
+      },
+      categories,
+      products
+    });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: "Erro ao carregar catalogo da shop" });
+  }
+});
+
+app.post("/admin/shop/catalog/import", authAdmin, async (req, res) => {
+  try {
+    const payload = req.body || {};
+    const summary = await runInTransaction(async (client) => {
+      const imported = await importShopCatalog(payload, client);
+
+      await createAuditLog(client, {
+        adminId: req.admin.sub,
+        action: "import_shop_catalog",
+        targetType: "shop_catalog",
+        targetId: imported.source,
+        details: imported,
+        ipAddress: getRequestIp(req)
+      });
+
+      return imported;
+    });
+
+    res.json({
+      message: "Catalogo da shop importado com sucesso",
+      summary
+    });
+  } catch (error) {
+    console.error(error);
+    res.status(400).json({ error: error.message || "Erro ao importar catalogo da shop" });
+  }
+});
+
+app.post("/admin/shop/catalog/import-kaiross", authAdmin, async (req, res) => {
+  try {
+    const markupPercent =
+      req.body?.markupPercent === undefined
+        ? SHOP_DEFAULT_MARKUP_PERCENTUAL
+        : req.body.markupPercent;
+    const deactivateMissing = req.body?.deactivateMissing === true;
+    const provider = await fetchKairossProducts({
+      email: req.body?.email,
+      senha: req.body?.senha,
+      baseUrl: req.body?.baseUrl
+    });
+    const payload = buildKairossShopImportPayload(provider.products, {
+      source: SHOP_PRODUCT_SOURCE_DEFAULT,
+      markupPercent,
+      baseUrl: provider.baseUrl
+    });
+    payload.deactivateMissing = deactivateMissing;
+    const kairossCategoriesFetched = new Set(
+      provider.products
+        .map((item) => normalizeShopText(item?.categoria, 120) || "Sem categoria")
+        .filter(Boolean)
+    ).size;
+
+    const summary = await runInTransaction(async (client) => {
+      const imported = await importShopCatalog(payload, client);
+      const details = {
+        ...imported,
+        kairossProductsFetched: provider.products.length,
+        kairossCategoriesFetched,
+        kairossUserId: provider.user?.id || null,
+        baseUrl: provider.baseUrl
+      };
+
+      await createAuditLog(client, {
+        adminId: req.admin.sub,
+        action: "import_shop_catalog_kaiross",
+        targetType: "shop_catalog",
+        targetId: imported.source,
+        details,
+        ipAddress: getRequestIp(req)
+      });
+
+      return details;
+    });
+
+    res.json({
+      message: "Catalogo da Kaiross importado com sucesso",
+      summary
+    });
+  } catch (error) {
+    console.error(error);
+    res.status(400).json({ error: error.message || "Erro ao importar catalogo da Kaiross" });
+  }
+});
+
+app.post("/admin/shop/products/:id", authAdmin, async (req, res) => {
+  try {
+    const productId = String(req.params.id || "").trim();
+
+    if (!productId) {
+      return res.status(400).json({ error: "Produto obrigatorio" });
+    }
+
+    const result = await runInTransaction(async (client) => {
+      const current = await getShopProductById(productId, client);
+
+      if (!current) {
+        throw new Error("Produto da shop nao encontrado");
+      }
+
+      const nextCategoryId = String(req.body?.categoryId || current.categoryId || "").trim();
+
+      if (!nextCategoryId) {
+        throw new Error("Categoria do produto obrigatoria");
+      }
+
+      const categoryExists = await client.query(
+        "SELECT id FROM shop_categories WHERE id = $1 LIMIT 1",
+        [nextCategoryId]
+      );
+
+      if (!categoryExists.rows.length) {
+        throw new Error("Categoria da shop nao encontrada");
+      }
+
+      const updated = await saveShopProduct(
+        {
+          id: current.id,
+          categoryId: nextCategoryId,
+          sourceKey: current.sourceKey,
+          source: current.source,
+          externalId:
+            req.body?.externalId !== undefined ? req.body.externalId : current.externalId,
+          externalUrl:
+            req.body?.externalUrl !== undefined ? req.body.externalUrl : current.externalUrl,
+          slug: req.body?.slug !== undefined ? req.body.slug : current.slug,
+          name: req.body?.name !== undefined ? req.body.name : current.name,
+          shortDescription:
+            req.body?.shortDescription !== undefined
+              ? req.body.shortDescription
+              : current.shortDescription,
+          description:
+            req.body?.description !== undefined ? req.body.description : current.description,
+          imageUrl: req.body?.imageUrl !== undefined ? req.body.imageUrl : current.imageUrl,
+          supplierPrice:
+            req.body?.supplierPrice !== undefined
+              ? req.body.supplierPrice
+              : current.supplierPrice,
+          markupPercent:
+            req.body?.markupPercent !== undefined
+              ? req.body.markupPercent
+              : current.markupPercent,
+          price: req.body?.price !== undefined ? req.body.price : current.price,
+          currency: req.body?.currency !== undefined ? req.body.currency : current.currency,
+          active: req.body?.active !== undefined ? req.body.active === true : current.active,
+          rawPayload: current.rawPayload || {}
+        },
+        client
+      );
+
+      await createAuditLog(client, {
+        adminId: req.admin.sub,
+        action: "update_shop_product",
+        targetType: "shop_product",
+        targetId: updated.id,
+        details: {
+          categoryId: updated.categoryId,
+          supplierPrice: updated.supplierPrice,
+          markupPercent: updated.markupPercent,
+          price: updated.price,
+          active: updated.active
+        },
+        ipAddress: getRequestIp(req)
+      });
+
+      return await getShopProductById(updated.id, client);
+    });
+
+    res.json({
+      message: "Produto da shop atualizado com sucesso",
+      product: result
+    });
+  } catch (error) {
+    console.error(error);
+    res.status(400).json({ error: error.message || "Erro ao atualizar produto da shop" });
   }
 });
 
@@ -7930,6 +9612,8 @@ app.post("/usuario/delete", authUser, async (req, res) => {
     await runInTransaction(async (client) => {
       await client.query("DELETE FROM depositos WHERE user_id = $1", [authenticatedUserId]);
       await client.query("DELETE FROM topup_orders WHERE user_id = $1", [authenticatedUserId]);
+      await client.query("DELETE FROM shop_order_items WHERE order_id IN (SELECT id FROM shop_orders WHERE user_id = $1)", [authenticatedUserId]);
+      await client.query("DELETE FROM shop_orders WHERE user_id = $1", [authenticatedUserId]);
       await client.query("DELETE FROM financial_transactions WHERE user_id = $1", [authenticatedUserId]);
       await client.query("DELETE FROM ledger_entries WHERE user_id = $1", [authenticatedUserId]);
       await client.query("DELETE FROM user_notifications WHERE user_id = $1", [authenticatedUserId]);
@@ -8223,6 +9907,274 @@ app.get("/topups/user/:id", authUser, async (req, res) => {
   } catch (error) {
     console.error(error);
     res.status(500).json({ error: "Erro ao buscar recargas do usuario" });
+  }
+});
+
+app.get("/shop/orders/user/:id", authUser, async (req, res) => {
+  try {
+    const authenticatedUserId = getAuthenticatedUserId(req);
+    const requestedUserId = String(req.params.id || "").trim();
+
+    if (!authenticatedUserId || requestedUserId !== authenticatedUserId) {
+      return sendJsonError(res, 403, "SHOP_FORBIDDEN", "Acesso negado para estes pedidos");
+    }
+
+    const orders = await listShopOrdersByUser(authenticatedUserId);
+    res.json(orders);
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: "Erro ao buscar pedidos da shop" });
+  }
+});
+
+app.post("/shop/orders", authUser, async (req, res) => {
+  try {
+    const authenticatedUserId = getAuthenticatedUserId(req);
+    const {
+      userId,
+      items,
+      shipping,
+      customerNote,
+      clientRequestId
+    } = req.body;
+
+    if (isAuthenticatedUserMismatch(authenticatedUserId, userId)) {
+      return sendJsonError(res, 403, "SHOP_FORBIDDEN", "Acesso negado para este pedido");
+    }
+
+    const normalizedItems = new Map();
+    for (const rawItem of Array.isArray(items) ? items : []) {
+      const productId = String(rawItem?.productId || rawItem?.id || "").trim();
+      const quantity = normalizeShopQuantity(rawItem?.quantity);
+      if (!productId || quantity <= 0) continue;
+      normalizedItems.set(productId, (normalizedItems.get(productId) || 0) + quantity);
+    }
+
+    const normalizedShipping = {
+      name: normalizeShopText(shipping?.name, 120),
+      phone: normalizeShopPhone(shipping?.phone),
+      zip: normalizeShopPostalCode(shipping?.zip),
+      street: normalizeShopText(shipping?.street, 120),
+      number: normalizeShopText(shipping?.number, 20),
+      complement: normalizeShopText(shipping?.complement, 120),
+      neighborhood: normalizeShopText(shipping?.neighborhood, 120),
+      city: normalizeShopText(shipping?.city, 120),
+      state: normalizeShopState(shipping?.state),
+      reference: normalizeShopText(shipping?.reference, 220)
+    };
+    const normalizedClientRequestId =
+      normalizeRecargaCelularClientRequestId(clientRequestId);
+
+    if (!authenticatedUserId || !normalizedItems.size) {
+      return res.status(400).json({ error: "Selecione pelo menos um produto" });
+    }
+
+    if (
+      !normalizedShipping.name ||
+      !normalizedShipping.phone ||
+      !normalizedShipping.zip ||
+      !normalizedShipping.street ||
+      !normalizedShipping.number ||
+      !normalizedShipping.neighborhood ||
+      !normalizedShipping.city ||
+      !normalizedShipping.state
+    ) {
+      return res.status(400).json({ error: "Preencha o endereco completo para entrega" });
+    }
+
+    const result = await runInTransaction(async (client) => {
+      const user = await getUserByIdForUpdate(authenticatedUserId, client);
+
+      if (!user) {
+        throw new Error("Usuario nao encontrado");
+      }
+
+      if (isContaBanida(user)) {
+        const error = new Error(getMensagemContaBanida());
+        error.statusCode = 403;
+        error.payload = buildContaBanidaPayload(user);
+        throw error;
+      }
+
+      const products = await listShopProductsByIds(Array.from(normalizedItems.keys()), client);
+      const productsById = new Map(products.map((product) => [product.id, product]));
+
+      if (productsById.size !== normalizedItems.size) {
+        throw new Error("Um ou mais produtos da shop nao foram encontrados");
+      }
+
+      const orderItems = [];
+      let subtotalAmount = 0;
+
+      for (const [productId, quantity] of normalizedItems.entries()) {
+        const product = productsById.get(productId);
+
+        if (!product || !product.active || product.category?.active === false) {
+          throw new Error("Existe produto indisponivel no carrinho");
+        }
+
+        const unitPrice = toMoney(product.price);
+        const totalPrice = toMoney(unitPrice * quantity);
+        subtotalAmount = toMoney(subtotalAmount + totalPrice);
+
+        orderItems.push({
+          productId: product.id,
+          categoryId: product.categoryId,
+          source: product.source,
+          sourceKey: product.sourceKey,
+          externalUrl: product.externalUrl,
+          productName: product.name,
+          productSlug: product.slug,
+          imageUrl: product.imageUrl,
+          supplierPrice: product.supplierPrice,
+          unitPrice,
+          quantity,
+          totalPrice,
+          metadata: {
+            categoryName: product.category?.name || "",
+            categorySlug: product.category?.slug || ""
+          }
+        });
+      }
+
+      if (subtotalAmount <= 0) {
+        throw new Error("Nao foi possivel calcular o valor do pedido");
+      }
+
+      if (toMoney(user.saldo) < subtotalAmount) {
+        throw new Error("Saldo insuficiente");
+      }
+
+      const contexto = await getUserFinancialContext(user, client);
+      const bonusDebitado = Math.min(
+        toMoney(contexto.saldoBonusAtual),
+        subtotalAmount
+      );
+      const realDebitado = toMoney(subtotalAmount - bonusDebitado);
+      const orderId = buildId("shopord");
+      const referenceKey = normalizedClientRequestId
+        ? `shop:${authenticatedUserId}:${normalizedClientRequestId}:debit`
+        : `shop:${orderId}:debit`;
+      const now = db();
+      const order = {
+        id: orderId,
+        userId: user.id,
+        status: SHOP_ORDER_STATUS_PENDING,
+        subtotalAmount,
+        totalAmount: subtotalAmount,
+        bonusDebitado,
+        realDebitado,
+        shipping: normalizedShipping,
+        customerNote: customerNote || "",
+        refusalReason: "",
+        financialTransactionIdDebito: "",
+        financialTransactionIdEstorno: "",
+        adminId: "",
+        createdAt: now,
+        updatedAt: now,
+        approvedAt: null,
+        refusedAt: null,
+        refundedAt: null
+      };
+      const itemCount = orderItems.reduce((sum, item) => sum + item.quantity, 0);
+      const description = montarDescricaoShopPedido({
+        totalAmount: order.totalAmount,
+        items: orderItems
+      });
+      const metadataBase = {
+        itemCount,
+        shippingCity: normalizedShipping.city,
+        shippingState: normalizedShipping.state,
+        shippingZip: normalizedShipping.zip,
+        customerNote: normalizeShopText(customerNote, 240),
+        items: orderItems.map((item) => ({
+          productId: item.productId,
+          productName: item.productName,
+          quantity: item.quantity,
+          unitPrice: item.unitPrice,
+          totalPrice: item.totalPrice
+        })),
+        bonusAmount: bonusDebitado,
+        realAmount: realDebitado
+      };
+
+      const financialTx = await createFinancialTransaction(client, {
+        userId: user.id,
+        referenceKey,
+        sourceType: "shop_order",
+        sourceId: orderId,
+        operationType: "shop_purchase",
+        direction: "debit",
+        amount: order.totalAmount,
+        status: "completed",
+        description,
+        metadata: metadataBase
+      });
+
+      if (
+        normalizedClientRequestId &&
+        String(financialTx.sourceId || "").trim() !== orderId
+      ) {
+        const existingOrder = await getShopOrderById(financialTx.sourceId, client);
+
+        if (existingOrder) {
+          return {
+            order: existingOrder,
+            saldoAtual: toMoney(user.saldo),
+            duplicate: true
+          };
+        }
+
+        throw new Error("Pedido da shop duplicado sem registro associado");
+      }
+
+      const usuarioAtualizado = await applyLedgerChange(client, {
+        userId: user.id,
+        financialTransactionId: financialTx.id,
+        entryType: "debit",
+        amount: order.totalAmount,
+        description,
+        metadata: {
+          orderId,
+          ...metadataBase
+        }
+      });
+
+      order.financialTransactionIdDebito = financialTx.id;
+      await saveShopOrder(order, client);
+      await replaceShopOrderItems(order.id, orderItems, client);
+      await saveUserNotification(
+        {
+          id: buildId("notif"),
+          userId: user.id,
+          type: "shop_order",
+          title: "Pedido recebido",
+          body: "Seu pedido da Shop Sigmo foi recebido e esta aguardando execucao manual.",
+          metadata: {
+            orderId: order.id,
+            totalAmount: order.totalAmount,
+            itemCount
+          },
+          createdAt: now
+        },
+        client
+      );
+
+      return {
+        order: await getShopOrderById(order.id, client),
+        saldoAtual: toMoney(usuarioAtualizado.saldo)
+      };
+    });
+
+    res.status(result.duplicate ? 200 : 201).json(result);
+  } catch (error) {
+    console.error(error);
+
+    if (error?.statusCode && error?.payload) {
+      return res.status(error.statusCode).json(error.payload);
+    }
+
+    res.status(400).json({ error: error.message || "Erro ao criar pedido da shop" });
   }
 });
 
@@ -9264,6 +11216,225 @@ app.post("/nfc/pay", authUser, async (req, res) => {
   }
 });
 
+app.get("/admin/shop/orders", authAdmin, async (req, res) => {
+  try {
+    const orders = await listShopOrders(String(req.query.status || ""));
+    res.json(orders);
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: "Erro ao buscar pedidos da shop" });
+  }
+});
+
+app.post("/admin/shop/orders/:id/approve", authAdmin, async (req, res) => {
+  try {
+    const orderId = String(req.params.id || "").trim();
+
+    if (!orderId) {
+      return res.status(400).json({ error: "Pedido da shop obrigatorio" });
+    }
+
+    const result = await runInTransaction(async (client) => {
+      const current = await getShopOrderById(orderId, client);
+      const order = await getShopOrderByIdForUpdate(orderId, client);
+
+      if (!order || !current) {
+        throw new Error("Pedido da shop nao encontrado");
+      }
+
+      if (order.status === SHOP_ORDER_STATUS_APPROVED) {
+        throw new Error("Pedido da shop ja aprovado");
+      }
+
+      if (order.status === SHOP_ORDER_STATUS_REFUSED) {
+        throw new Error("Pedido da shop ja recusado");
+      }
+
+      const now = db();
+      order.status = SHOP_ORDER_STATUS_APPROVED;
+      order.adminId = req.admin.sub;
+      order.approvedAt = now;
+      order.updatedAt = now;
+
+      await saveShopOrder(order, client);
+      await saveUserNotification(
+        {
+          id: buildId("notif"),
+          userId: order.userId,
+          type: "shop_order_approved",
+          title: "Pedido aprovado",
+          body: "Seu pedido da Shop Sigmo foi aprovado e segue para execucao manual.",
+          metadata: {
+            orderId: order.id,
+            totalAmount: order.totalAmount
+          },
+          createdAt: now
+        },
+        client
+      );
+
+      await createAuditLog(client, {
+        adminId: req.admin.sub,
+        action: "approve_shop_order",
+        targetType: "shop_order",
+        targetId: order.id,
+        details: {
+          userId: order.userId,
+          totalAmount: order.totalAmount,
+          itemCount: Array.isArray(current.items) ? current.items.length : 0
+        },
+        ipAddress: getRequestIp(req)
+      });
+
+      return {
+        order: await getShopOrderById(order.id, client)
+      };
+    });
+
+    res.json({
+      message: "Pedido da shop aprovado com sucesso",
+      order: result.order
+    });
+  } catch (error) {
+    console.error(error);
+    res.status(400).json({ error: error.message || "Erro ao aprovar pedido da shop" });
+  }
+});
+
+app.post("/admin/shop/orders/:id/refuse", authAdmin, async (req, res) => {
+  try {
+    const orderId = String(req.params.id || "").trim();
+    const refusalReason = normalizeShopText(req.body?.refusalReason, 320);
+
+    if (!orderId) {
+      return res.status(400).json({ error: "Pedido da shop obrigatorio" });
+    }
+
+    if (!refusalReason) {
+      return res.status(400).json({ error: "Motivo da recusa obrigatorio" });
+    }
+
+    const result = await runInTransaction(async (client) => {
+      const current = await getShopOrderById(orderId, client);
+      const order = await getShopOrderByIdForUpdate(orderId, client);
+
+      if (!order || !current) {
+        throw new Error("Pedido da shop nao encontrado");
+      }
+
+      if (order.status === SHOP_ORDER_STATUS_APPROVED) {
+        throw new Error("Pedido da shop ja aprovado");
+      }
+
+      if (order.status === SHOP_ORDER_STATUS_REFUSED) {
+        throw new Error("Pedido da shop ja recusado");
+      }
+
+      const now = db();
+      const itemCount = Array.isArray(current.items)
+        ? current.items.reduce((sum, item) => sum + Number(item.quantity || 0), 0)
+        : 0;
+      const metadataBase = {
+        refusalReason,
+        itemCount,
+        items: Array.isArray(current.items)
+          ? current.items.map((item) => ({
+              productId: item.productId,
+              productName: item.productName,
+              quantity: item.quantity,
+              unitPrice: item.unitPrice,
+              totalPrice: item.totalPrice
+            }))
+          : [],
+        bonusAmount: order.bonusDebitado,
+        realAmount: order.realDebitado
+      };
+      const description = `Estorno ${montarDescricaoShopPedido({
+        totalAmount: order.totalAmount,
+        items: current.items
+      })}`;
+
+      const financialTx = await createFinancialTransaction(client, {
+        userId: order.userId,
+        referenceKey: `shop:${order.id}:refund`,
+        sourceType: "shop_order",
+        sourceId: order.id,
+        operationType: "shop_refund",
+        direction: "credit",
+        amount: order.totalAmount,
+        status: "completed",
+        description,
+        metadata: metadataBase
+      });
+
+      const usuarioAtualizado = await applyLedgerChange(client, {
+        userId: order.userId,
+        financialTransactionId: financialTx.id,
+        entryType: "credit",
+        amount: order.totalAmount,
+        description,
+        metadata: {
+          orderId: order.id,
+          ...metadataBase
+        }
+      });
+
+      order.status = SHOP_ORDER_STATUS_REFUSED;
+      order.refusalReason = refusalReason;
+      order.adminId = req.admin.sub;
+      order.financialTransactionIdEstorno = financialTx.id;
+      order.refusedAt = now;
+      order.refundedAt = now;
+      order.updatedAt = now;
+
+      await saveShopOrder(order, client);
+      await saveUserNotification(
+        {
+          id: buildId("notif"),
+          userId: order.userId,
+          type: "shop_order_refused",
+          title: "Pedido recusado",
+          body: "Seu pedido da Shop Sigmo foi recusado e o valor voltou para sua carteira.",
+          metadata: {
+            orderId: order.id,
+            totalAmount: order.totalAmount,
+            refusalReason
+          },
+          createdAt: now
+        },
+        client
+      );
+
+      await createAuditLog(client, {
+        adminId: req.admin.sub,
+        action: "refuse_shop_order",
+        targetType: "shop_order",
+        targetId: order.id,
+        details: {
+          userId: order.userId,
+          totalAmount: order.totalAmount,
+          refusalReason
+        },
+        ipAddress: getRequestIp(req)
+      });
+
+      return {
+        order: await getShopOrderById(order.id, client),
+        saldoAtual: toMoney(usuarioAtualizado.saldo)
+      };
+    });
+
+    res.json({
+      message: "Pedido da shop recusado e estornado com sucesso",
+      order: result.order,
+      saldoAtual: result.saldoAtual
+    });
+  } catch (error) {
+    console.error(error);
+    res.status(400).json({ error: error.message || "Erro ao recusar pedido da shop" });
+  }
+});
+
 app.get("/admin/topups", authAdmin, async (req, res) => {
   try {
     const lista = await listRecargaCelularPedidos(String(req.query.status || ""));
@@ -10050,6 +12221,8 @@ app.post("/admin/deletar-usuario", authAdmin, async (req, res) => {
         throw new Error("Usuário não encontrado");
       }
 
+      await client.query("DELETE FROM shop_order_items WHERE order_id IN (SELECT id FROM shop_orders WHERE user_id = $1)", [userId]);
+      await client.query("DELETE FROM shop_orders WHERE user_id = $1", [userId]);
       await client.query("DELETE FROM user_notifications WHERE user_id = $1", [userId]);
       await client.query("DELETE FROM movement_limit_requests WHERE user_id = $1", [userId]);
       await client.query("DELETE FROM investment_reserves WHERE user_id = $1", [userId]);
