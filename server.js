@@ -132,6 +132,12 @@ const INVESTMENT_RESERVE_STATUS_CLOSED = "closed";
 const SHOP_DEFAULT_MARKUP_PERCENTUAL = Number(
   process.env.SHOP_DEFAULT_MARKUP_PERCENTUAL || 110
 );
+const SHOP_FREE_SHIPPING_MIN_AMOUNT = toMoney(
+  process.env.SHOP_FREE_SHIPPING_MIN_AMOUNT || 189
+);
+const SHOP_DEFAULT_SHIPPING_FEE_AMOUNT = toMoney(
+  process.env.SHOP_DEFAULT_SHIPPING_FEE_AMOUNT || 24.9
+);
 const SHOP_SLUG_MAX_LENGTH = 72;
 const SHOP_ORDER_STATUS_PENDING = "pendente";
 const SHOP_ORDER_STATUS_APPROVED = "aprovado";
@@ -1218,6 +1224,18 @@ function montarDescricaoShopPedido(order = {}) {
     : 0;
   const quantityLabel = quantity > 0 ? `${quantity} item(ns)` : "pedido";
   return `Shop Sigmo | ${quantityLabel} | Total debitado: R$${total.toFixed(2)}`;
+}
+
+function hasShopFreeShipping(subtotalAmount = 0) {
+  return toMoney(subtotalAmount) >= SHOP_FREE_SHIPPING_MIN_AMOUNT;
+}
+
+function getShopShippingFeeAmount(subtotalAmount = 0) {
+  return toMoney(subtotalAmount) <= 0
+    ? 0
+    : hasShopFreeShipping(subtotalAmount)
+      ? 0
+      : SHOP_DEFAULT_SHIPPING_FEE_AMOUNT;
 }
 
 function normalizeStatusConta(value) {
@@ -2394,6 +2412,7 @@ await ensureColumn("depositos", "comprovante_texto", "TEXT DEFAULT ''");
       user_id TEXT NOT NULL,
       status TEXT NOT NULL DEFAULT '${SHOP_ORDER_STATUS_PENDING}',
       subtotal_amount NUMERIC NOT NULL DEFAULT 0,
+      shipping_fee_amount NUMERIC NOT NULL DEFAULT 0,
       total_amount NUMERIC NOT NULL DEFAULT 0,
       bonus_debitado NUMERIC NOT NULL DEFAULT 0,
       real_debitado NUMERIC NOT NULL DEFAULT 0,
@@ -2419,6 +2438,8 @@ await ensureColumn("depositos", "comprovante_texto", "TEXT DEFAULT ''");
       refunded_at TIMESTAMP
     );
   `);
+
+  await ensureColumn("shop_orders", "shipping_fee_amount", "NUMERIC NOT NULL DEFAULT 0");
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS shop_order_items (
@@ -3830,6 +3851,8 @@ function buildPublicShopCatalogPayload(snapshot, options = {}) {
   const payload = {
     generatedAt: snapshot.generatedAt,
     markupPercentDefault: normalizeShopMarkupPercent(SHOP_DEFAULT_MARKUP_PERCENTUAL),
+    freeShippingMinAmount: toMoney(SHOP_FREE_SHIPPING_MIN_AMOUNT),
+    shippingFeeAmount: toMoney(SHOP_DEFAULT_SHIPPING_FEE_AMOUNT),
     categories: publicCategories,
     products: publicProducts
   };
@@ -3870,6 +3893,13 @@ function mapShopOrderItem(row) {
 function mapShopOrder(row) {
   if (!row) return null;
 
+  const subtotalAmount = toMoney(row.subtotal_amount);
+  const totalAmount = toMoney(row.total_amount);
+  const shippingFeeAmount =
+    row.shipping_fee_amount === undefined || row.shipping_fee_amount === null
+      ? Math.max(0, toMoney(totalAmount - subtotalAmount))
+      : toMoney(row.shipping_fee_amount);
+
   const shipping = {
     name: row.shipping_name || "",
     phone: row.shipping_phone || "",
@@ -3887,8 +3917,9 @@ function mapShopOrder(row) {
     id: row.id,
     userId: row.user_id,
     status: normalizeShopOrderStatus(row.status),
-    subtotalAmount: toMoney(row.subtotal_amount),
-    totalAmount: toMoney(row.total_amount),
+    subtotalAmount,
+    shippingFeeAmount,
+    totalAmount,
     bonusDebitado: toMoney(row.bonus_debitado),
     realDebitado: toMoney(row.real_debitado),
     customerNote: row.customer_note || "",
@@ -5791,6 +5822,7 @@ async function saveShopOrder(order, client = pool) {
     userId: String(order.userId || "").trim(),
     status: normalizeShopOrderStatus(order.status),
     subtotalAmount: toMoney(order.subtotalAmount),
+    shippingFeeAmount: toMoney(order.shippingFeeAmount),
     totalAmount: toMoney(order.totalAmount),
     bonusDebitado: toMoney(order.bonusDebitado),
     realDebitado: toMoney(order.realDebitado),
@@ -5819,7 +5851,7 @@ async function saveShopOrder(order, client = pool) {
   const result = await client.query(
     `
     INSERT INTO shop_orders (
-      id, user_id, status, subtotal_amount, total_amount, bonus_debitado,
+      id, user_id, status, subtotal_amount, shipping_fee_amount, total_amount, bonus_debitado,
       real_debitado, shipping_name, shipping_phone, shipping_zip, shipping_street,
       shipping_number, shipping_complement, shipping_neighborhood, shipping_city,
       shipping_state, shipping_reference, customer_note, refusal_reason,
@@ -5827,17 +5859,18 @@ async function saveShopOrder(order, client = pool) {
       created_at, updated_at, approved_at, refused_at, refunded_at
     )
     VALUES (
-      $1,$2,$3,$4,$5,$6,
-      $7,$8,$9,$10,$11,
-      $12,$13,$14,$15,
-      $16,$17,$18,$19,
-      $20,$21,$22,
-      $23,$24,$25,$26,$27
+      $1,$2,$3,$4,$5,$6,$7,
+      $8,$9,$10,$11,$12,
+      $13,$14,$15,$16,
+      $17,$18,$19,$20,
+      $21,$22,$23,
+      $24,$25,$26,$27,$28
     )
     ON CONFLICT (id) DO UPDATE SET
       user_id = EXCLUDED.user_id,
       status = EXCLUDED.status,
       subtotal_amount = EXCLUDED.subtotal_amount,
+      shipping_fee_amount = EXCLUDED.shipping_fee_amount,
       total_amount = EXCLUDED.total_amount,
       bonus_debitado = EXCLUDED.bonus_debitado,
       real_debitado = EXCLUDED.real_debitado,
@@ -5867,6 +5900,7 @@ async function saveShopOrder(order, client = pool) {
       payload.userId,
       payload.status,
       payload.subtotalAmount,
+      payload.shippingFeeAmount,
       payload.totalAmount,
       payload.bonusDebitado,
       payload.realDebitado,
@@ -10804,16 +10838,19 @@ app.post("/shop/orders", authUser, shopOrderLimiter, async (req, res) => {
         throw new Error("Nao foi possivel calcular o valor do pedido");
       }
 
-      if (toMoney(user.saldo) < subtotalAmount) {
+      const shippingFeeAmount = getShopShippingFeeAmount(subtotalAmount);
+      const totalAmount = toMoney(subtotalAmount + shippingFeeAmount);
+
+      if (toMoney(user.saldo) < totalAmount) {
         throw new Error("Saldo insuficiente");
       }
 
       const contexto = await getUserFinancialContext(user, client);
       const bonusDebitado = Math.min(
         toMoney(contexto.saldoBonusAtual),
-        subtotalAmount
+        totalAmount
       );
-      const realDebitado = toMoney(subtotalAmount - bonusDebitado);
+      const realDebitado = toMoney(totalAmount - bonusDebitado);
       const orderId = buildId("shopord");
       const referenceKey = normalizedClientRequestId
         ? `shop:${authenticatedUserId}:${normalizedClientRequestId}:debit`
@@ -10824,7 +10861,8 @@ app.post("/shop/orders", authUser, shopOrderLimiter, async (req, res) => {
         userId: user.id,
         status: SHOP_ORDER_STATUS_PENDING,
         subtotalAmount,
-        totalAmount: subtotalAmount,
+        shippingFeeAmount,
+        totalAmount,
         bonusDebitado,
         realDebitado,
         shipping: normalizedShipping,
@@ -10857,6 +10895,10 @@ app.post("/shop/orders", authUser, shopOrderLimiter, async (req, res) => {
           unitPrice: item.unitPrice,
           totalPrice: item.totalPrice
         })),
+        subtotalAmount,
+        shippingFeeAmount,
+        freeShippingUnlocked: shippingFeeAmount <= 0,
+        freeShippingMinAmount: SHOP_FREE_SHIPPING_MIN_AMOUNT,
         bonusAmount: bonusDebitado,
         realAmount: realDebitado
       };
@@ -10915,6 +10957,8 @@ app.post("/shop/orders", authUser, shopOrderLimiter, async (req, res) => {
           body: "Seu pedido da Shop Sigmo foi recebido e esta aguardando execucao manual.",
           metadata: {
             orderId: order.id,
+            subtotalAmount: order.subtotalAmount,
+            shippingFeeAmount: order.shippingFeeAmount,
             totalAmount: order.totalAmount,
             itemCount
           },
