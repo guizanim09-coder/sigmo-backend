@@ -116,8 +116,12 @@ const APP_MAINTENANCE_ETA_MIN_MINUTES = 1;
 const APP_MAINTENANCE_ETA_MAX_MINUTES = 180;
 const BANNER_IMAGE_MAX_BYTES = 10 * 1024 * 1024;
 const STATUS_CONTA_ATIVA = "ativa";
+const STATUS_CONTA_BLOQUEADA = "bloqueada";
 const STATUS_CONTA_BANIDA = "banida";
 const MOTIVO_BANIMENTO_FRAUDE_BONUS = "tentativa_fraude_bonus";
+const MOTIVO_BANIMENTO_LABELS = Object.freeze({
+  [MOTIVO_BANIMENTO_FRAUDE_BONUS]: "Tentativa de fraude com bonus"
+});
 const USER_NOTIFICATION_TYPE_LIMIT_REQUEST_PIX_KEY = "limit_request_pix_key";
 const MOVEMENT_LIMIT_REQUEST_STATUS_PENDING = "pending";
 const MOVEMENT_LIMIT_REQUEST_STATUS_RESPONDED = "responded";
@@ -734,6 +738,67 @@ function normalizeShopText(value, maxLength = 500) {
     .slice(0, Math.max(0, Number(maxLength || 0) || 0));
 }
 
+function scoreShopCatalogTextQuality(value) {
+  const text = String(value || "");
+  if (!text) return 0;
+
+  const mojibakeMatches = text.match(/(?:Ã.|Â.|â.|Ê.|Ô.|Õ.|Ð.|�)/g) || [];
+  const replacementMatches = text.match(/�/g) || [];
+  const accentedMatches = text.match(/[À-ÿ]/g) || [];
+  const alphaNumMatches = text.match(/[A-Za-z0-9]/g) || [];
+
+  return (
+    accentedMatches.length +
+    alphaNumMatches.length * 0.05 -
+    mojibakeMatches.length * 6 -
+    replacementMatches.length * 8
+  );
+}
+
+function repairShopCatalogText(value) {
+  let current = String(value || "");
+  if (!current) return "";
+
+  let best = current;
+  let bestScore = scoreShopCatalogTextQuality(best);
+  const seen = new Set([current]);
+
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    let candidate = "";
+
+    try {
+      candidate = Buffer.from(current, "latin1").toString("utf8");
+    } catch {
+      break;
+    }
+
+    if (!candidate || seen.has(candidate)) {
+      break;
+    }
+
+    seen.add(candidate);
+    const candidateScore = scoreShopCatalogTextQuality(candidate);
+
+    if (candidateScore <= bestScore) {
+      break;
+    }
+
+    best = candidate;
+    bestScore = candidateScore;
+    current = candidate;
+  }
+
+  return best;
+}
+
+function normalizeShopCatalogText(value, maxLength = 500) {
+  return normalizeShopText(repairShopCatalogText(value), maxLength);
+}
+
+function normalizeShopCatalogCategoryName(value, maxLength = 120) {
+  return normalizeShopCatalogText(value, maxLength) || "Sem categoria";
+}
+
 function slugifyShopValue(value, fallback = "item", maxLength = SHOP_SLUG_MAX_LENGTH) {
   const safeMaxLength = Math.max(1, Number(maxLength || SHOP_SLUG_MAX_LENGTH) || SHOP_SLUG_MAX_LENGTH);
   const normalized = String(value || "")
@@ -882,35 +947,41 @@ async function fetchJsonWithTimeout(url, options = {}, timeoutMs = 15000) {
 }
 
 function buildKairossProductShortDescription(product) {
-  const descricao = normalizeShopText(product?.descricao, 320);
+  const descricao = normalizeShopCatalogText(product?.descricao, 320);
   if (descricao) return descricao;
 
   const pieces = [
-    normalizeShopText(product?.marca, 60),
-    normalizeShopText(product?.cor, 40),
-    normalizeShopText(product?.tamanho, 40),
-    normalizeShopText(product?.sku, 60) ? `SKU ${normalizeShopText(product?.sku, 60)}` : ""
+    normalizeShopCatalogText(product?.marca, 60),
+    normalizeShopCatalogText(product?.cor, 40),
+    normalizeShopCatalogText(product?.tamanho, 40),
+    normalizeShopCatalogText(product?.sku, 60)
+      ? `SKU ${normalizeShopCatalogText(product?.sku, 60)}`
+      : ""
   ].filter(Boolean);
 
-  return normalizeShopText(
+  return normalizeShopCatalogText(
     pieces.join(" | ") || "Produto importado automaticamente da Kaiross.",
     320
   );
 }
 
 function buildKairossProductDescription(product) {
-  const descricao = normalizeShopText(product?.descricao, 2400);
+  const descricao = normalizeShopCatalogText(product?.descricao, 2400);
   if (descricao) return descricao;
 
   const pieces = [
-    normalizeShopText(product?.marca, 80),
-    normalizeShopText(product?.cor, 80),
-    normalizeShopText(product?.tamanho, 80),
-    normalizeShopText(product?.ncm, 40) ? `NCM ${normalizeShopText(product?.ncm, 40)}` : "",
-    normalizeShopText(product?.sku, 80) ? `SKU ${normalizeShopText(product?.sku, 80)}` : ""
+    normalizeShopCatalogText(product?.marca, 80),
+    normalizeShopCatalogText(product?.cor, 80),
+    normalizeShopCatalogText(product?.tamanho, 80),
+    normalizeShopCatalogText(product?.ncm, 40)
+      ? `NCM ${normalizeShopCatalogText(product?.ncm, 40)}`
+      : "",
+    normalizeShopCatalogText(product?.sku, 80)
+      ? `SKU ${normalizeShopCatalogText(product?.sku, 80)}`
+      : ""
   ].filter(Boolean);
 
-  return normalizeShopText(
+  return normalizeShopCatalogText(
     pieces.join(" | ") || "Produto importado automaticamente da Kaiross.",
     2400
   );
@@ -1022,7 +1093,7 @@ function buildKairossShopImportPayload(products, options = {}) {
   const categories = new Map();
 
   for (const rawProduct of Array.isArray(products) ? products : []) {
-    const categoryName = normalizeShopText(rawProduct?.categoria, 120) || "Sem categoria";
+    const categoryName = normalizeShopCatalogCategoryName(rawProduct?.categoria, 120);
 
     if (!categories.has(categoryName)) {
       categories.set(categoryName, {
@@ -1053,14 +1124,17 @@ function buildKairossShopImportPayload(products, options = {}) {
       : [];
     const fallbackImage = secondaryImages.find((item) => normalizeShopUrl(item));
     const imageUrl = normalizeShopUrl(rawProduct?.imagemPrincipalUrl || fallbackImage || "");
-    const externalId = normalizeShopText(
+    const externalId = normalizeShopCatalogText(
       rawProduct?.externalId || rawProduct?.id || rawProduct?.sku,
       120
     );
     const externalKey =
       externalId ||
       slugifyShopValue(
-        rawProduct?.nome || rawProduct?.sku || rawProduct?.ean || "produto-kaiross",
+        normalizeShopCatalogText(
+          rawProduct?.nome || rawProduct?.sku || rawProduct?.ean || "produto-kaiross",
+          180
+        ),
         "produto-kaiross"
       );
 
@@ -1068,7 +1142,7 @@ function buildKairossShopImportPayload(products, options = {}) {
       sourceKey: `${source}:product:${externalKey}`,
       externalId,
       externalUrl: vitrineUrl,
-      name: rawProduct?.nome,
+      name: normalizeShopCatalogText(rawProduct?.nome, 180),
       shortDescription: buildKairossProductShortDescription(rawProduct),
       description: buildKairossProductDescription(rawProduct),
       imageUrl,
@@ -1146,14 +1220,74 @@ function montarDescricaoShopPedido(order = {}) {
   return `Shop Sigmo | ${quantityLabel} | Total debitado: R$${total.toFixed(2)}`;
 }
 
-function isContaBanida(user) {
-  return String(user?.statusConta || "")
+function normalizeStatusConta(value) {
+  const normalized = String(value || "")
     .trim()
-    .toLowerCase() === STATUS_CONTA_BANIDA;
+    .toLowerCase();
+
+  if (
+    normalized === STATUS_CONTA_ATIVA ||
+    normalized === STATUS_CONTA_BLOQUEADA ||
+    normalized === STATUS_CONTA_BANIDA
+  ) {
+    return normalized;
+  }
+
+  return STATUS_CONTA_ATIVA;
 }
 
-function getMensagemContaBanida() {
-  return "Conta banida permanentemente por tentativa de fraude. Esta acao e irreversivel e o saldo ficou congelado.";
+function normalizeAccountRestrictionReason(value, maxLen = 220) {
+  return String(value || "")
+    .trim()
+    .replace(/\s+/g, " ")
+    .slice(0, maxLen);
+}
+
+function isContaBloqueada(user) {
+  return normalizeStatusConta(user?.statusConta) === STATUS_CONTA_BLOQUEADA;
+}
+
+function isContaPermanentementeBanida(user) {
+  return normalizeStatusConta(user?.statusConta) === STATUS_CONTA_BANIDA;
+}
+
+function isContaBanida(user) {
+  return isContaPermanentementeBanida(user) || isContaBloqueada(user);
+}
+
+function getMotivoBanimentoFormatado(value) {
+  const normalized = String(value || "")
+    .trim()
+    .toLowerCase();
+
+  if (!normalized) {
+    return "";
+  }
+
+  return MOTIVO_BANIMENTO_LABELS[normalized] || normalizeAccountRestrictionReason(value);
+}
+
+function getMensagemContaBanida(user = null) {
+  if (isContaBloqueada(user)) {
+    const motivo = normalizeAccountRestrictionReason(user?.motivoBloqueio);
+    const motivoTrecho = motivo ? ` Motivo: ${motivo}.` : "";
+    const tipoBloqueio = user?.bloqueioTemporario
+      ? "temporariamente bloqueada"
+      : "bloqueada";
+
+    return `Sua conta esta ${tipoBloqueio}.${motivoTrecho} Enquanto isso, as movimentacoes ficam indisponiveis.`;
+  }
+
+  if (isContaPermanentementeBanida(user)) {
+    const motivo = getMotivoBanimentoFormatado(
+      user?.motivoBanimento || MOTIVO_BANIMENTO_FRAUDE_BONUS
+    );
+    const motivoTrecho = motivo ? ` Motivo: ${motivo}.` : "";
+
+    return `Sua conta foi banida permanentemente.${motivoTrecho} Esta acao e irreversivel e o saldo ficou congelado.`;
+  }
+
+  return "Sua conta esta bloqueada para movimentacoes no momento. Consulte o suporte para mais detalhes.";
 }
 
 function normalizeRecargaCelularOperadora(value) {
@@ -1262,14 +1396,25 @@ function montarDescricaoRecargaCelular(recarga = {}) {
     .join(" ");
 }
 
-function buildContaBanidaPayload(user, code = "ACCOUNT_BANNED") {
+function buildContaBanidaPayload(user, code = "") {
+  const statusConta = normalizeStatusConta(user?.statusConta);
+  const contaBloqueada = isContaBloqueada(user);
+  const contaBanidaPermanente = isContaPermanentementeBanida(user);
+
   return {
-    error: getMensagemContaBanida(),
-    code,
-    statusConta: STATUS_CONTA_BANIDA,
+    error: getMensagemContaBanida(user),
+    code: code || (contaBloqueada ? "ACCOUNT_BLOCKED" : "ACCOUNT_BANNED"),
+    statusConta,
     contaBanida: true,
+    contaBloqueada,
+    contaBanidaPermanente,
     contaBanidaEm: user?.contaBanidaEm || null,
-    motivoBanimento: user?.motivoBanimento || MOTIVO_BANIMENTO_FRAUDE_BONUS,
+    motivoBanimento: contaBanidaPermanente
+      ? user?.motivoBanimento || MOTIVO_BANIMENTO_FRAUDE_BONUS
+      : "",
+    contaBloqueadaEm: user?.contaBloqueadaEm || null,
+    motivoBloqueio: user?.motivoBloqueio || "",
+    bloqueioTemporario: Boolean(user?.bloqueioTemporario),
     saldo: toMoney(user?.saldo)
   };
 }
@@ -1957,6 +2102,9 @@ async function initDB() {
   );
   await ensureColumn("usuarios", "conta_banida_em", "TIMESTAMP");
   await ensureColumn("usuarios", "motivo_banimento", "TEXT DEFAULT ''");
+  await ensureColumn("usuarios", "conta_bloqueada_em", "TIMESTAMP");
+  await ensureColumn("usuarios", "motivo_bloqueio", "TEXT DEFAULT ''");
+  await ensureColumn("usuarios", "bloqueio_temporario", "BOOLEAN DEFAULT FALSE");
   await ensureColumn("usuarios", "bonus_boas_vindas", "NUMERIC DEFAULT 0");
   await ensureColumn("usuarios", "bonus_boas_vindas_concedido_em", "TIMESTAMP");
   await ensureColumn("usuarios", "indicado_por_user_id", "TEXT DEFAULT ''");
@@ -2760,9 +2908,12 @@ function mapUser(row) {
     nomeAtualizadoEm: row.nome_atualizado_em || null,
     saldoAtualizadoEm: row.saldo_atualizado_em || null,
     senhaAtualizadaEm: row.senha_atualizada_em || null,
-    statusConta: row.status_conta || STATUS_CONTA_ATIVA,
+    statusConta: normalizeStatusConta(row.status_conta),
     contaBanidaEm: row.conta_banida_em || null,
     motivoBanimento: row.motivo_banimento || "",
+    contaBloqueadaEm: row.conta_bloqueada_em || null,
+    motivoBloqueio: row.motivo_bloqueio || "",
+    bloqueioTemporario: Boolean(row.bloqueio_temporario),
     bonusBoasVindas: toMoney(row.bonus_boas_vindas),
     bonusBoasVindasConcedidoEm: row.bonus_boas_vindas_concedido_em || null,
     indicadoPorUserId: row.indicado_por_user_id || "",
@@ -2827,10 +2978,15 @@ function buildUserPublicResponse(user, extras = {}) {
     email: user.email,
     saldo: toMoney(user.saldo),
     criadoEm: user.criadoEm || null,
-    statusConta: user.statusConta || STATUS_CONTA_ATIVA,
+    statusConta: normalizeStatusConta(user.statusConta),
     contaBanida: isContaBanida(user),
+    contaBloqueada: isContaBloqueada(user),
+    contaBanidaPermanente: isContaPermanentementeBanida(user),
     contaBanidaEm: user.contaBanidaEm || null,
     motivoBanimento: user.motivoBanimento || "",
+    contaBloqueadaEm: user.contaBloqueadaEm || null,
+    motivoBloqueio: user.motivoBloqueio || "",
+    bloqueioTemporario: Boolean(user.bloqueioTemporario),
     bonusBoasVindas: toMoney(user.bonusBoasVindas),
     bonusBoasVindasConcedidoEm: user.bonusBoasVindasConcedidoEm || null,
     indicadoPorUserId: user.indicadoPorUserId || "",
@@ -3281,12 +3437,15 @@ function mapShopProduct(row) {
 function buildPublicShopCategoryResponse(category, extras = {}) {
   if (!category) return null;
 
+  const name = normalizeShopCatalogCategoryName(category.name, 120);
+  const slug = slugifyShopValue(name || category.slug, "categoria");
+
   return {
     id: category.id,
-    slug: category.slug || "",
-    name: category.name || "",
-    description: category.description || "",
-    imageUrl: category.imageUrl || "",
+    slug,
+    name,
+    description: normalizeShopCatalogText(category.description, 1000),
+    imageUrl: normalizeShopUrl(category.imageUrl),
     productCount: Math.max(0, Number(extras.productCount || 0))
   };
 }
@@ -3294,21 +3453,28 @@ function buildPublicShopCategoryResponse(category, extras = {}) {
 function buildPublicShopProductResponse(product) {
   if (!product) return null;
 
+  const categoryName = product.category
+    ? normalizeShopCatalogCategoryName(product.category.name, 120)
+    : "";
+  const categorySlug = categoryName
+    ? slugifyShopValue(categoryName, "categoria")
+    : "";
+
   return {
     id: product.id,
     categoryId: product.categoryId,
     slug: product.slug || "",
-    name: product.name || "",
-    shortDescription: product.shortDescription || "",
-    description: product.description || "",
-    imageUrl: product.imageUrl || "",
+    name: normalizeShopCatalogText(product.name, 180),
+    shortDescription: normalizeShopCatalogText(product.shortDescription, 320),
+    description: normalizeShopCatalogText(product.description, 2400),
+    imageUrl: normalizeShopUrl(product.imageUrl),
     price: toMoney(product.price),
     currency: product.currency || "BRL",
     category: product.category
       ? {
           id: product.category.id,
-          slug: product.category.slug || "",
-          name: product.category.name || ""
+          slug: categorySlug,
+          name: categoryName
         }
       : null
   };
@@ -3324,19 +3490,23 @@ async function loadShopPublicCatalogSnapshotFromDb(client = pool) {
     generatedAt: db(),
     categories,
     publicCategories: categories.map((category) => buildPublicShopCategoryResponse(category)),
-    indexedProducts: products.map((product) => ({
-      categoryId: product.categoryId,
-      categorySlug: String(product.category?.slug || "").trim().toLowerCase(),
-      searchText: [
-        product.name,
-        product.shortDescription,
-        product.description,
-        product.category?.name
-      ]
-        .join(" ")
-        .toLowerCase(),
-      publicProduct: buildPublicShopProductResponse(product)
-    }))
+    indexedProducts: products.map((product) => {
+      const publicProduct = buildPublicShopProductResponse(product);
+
+      return {
+        categoryId: product.categoryId,
+        categorySlug: String(publicProduct?.category?.slug || "").trim().toLowerCase(),
+        searchText: [
+          publicProduct?.name,
+          publicProduct?.shortDescription,
+          publicProduct?.description,
+          publicProduct?.category?.name
+        ]
+          .join(" ")
+          .toLowerCase(),
+        publicProduct
+      };
+    })
   };
 }
 
@@ -3584,29 +3754,78 @@ function buildPublicShopCatalogPayload(snapshot, options = {}) {
     filteredEntries = filteredEntries.filter((entry) => entry.searchText.includes(search));
   }
 
-  const countsByCategoryId = new Map();
+  const countsByCategorySlug = new Map();
   const publicProducts = [];
-  const productsByCategoryId = includeGrouped ? new Map() : null;
+  const productsByCategorySlug = includeGrouped ? new Map() : null;
+  const categoriesBySlug = new Map();
+  let categoryOrder = 0;
 
-  for (const entry of filteredEntries) {
-    countsByCategoryId.set(
-      entry.categoryId,
-      (countsByCategoryId.get(entry.categoryId) || 0) + 1
-    );
-    publicProducts.push(entry.publicProduct);
+  function registerCategory(category) {
+    const normalized = buildPublicShopCategoryResponse(category);
+    const slug = String(normalized?.slug || "").trim().toLowerCase();
 
-    if (productsByCategoryId) {
-      const list = productsByCategoryId.get(entry.categoryId) || [];
-      list.push(entry.publicProduct);
-      productsByCategoryId.set(entry.categoryId, list);
+    if (!normalized || !slug) {
+      return;
+    }
+
+    const current = categoriesBySlug.get(slug);
+    if (!current) {
+      categoriesBySlug.set(slug, {
+        ...normalized,
+        _order: categoryOrder++
+      });
+      return;
+    }
+
+    if (!current.description && normalized.description) {
+      current.description = normalized.description;
+    }
+    if (!current.imageUrl && normalized.imageUrl) {
+      current.imageUrl = normalized.imageUrl;
     }
   }
 
-  const publicCategories = snapshot.publicCategories.map((category) =>
-    buildPublicShopCategoryResponse(category, {
-      productCount: countsByCategoryId.get(category.id) || 0
-    })
-  );
+  for (const category of Array.isArray(snapshot.publicCategories) ? snapshot.publicCategories : []) {
+    registerCategory(category);
+  }
+
+  for (const entry of filteredEntries) {
+    const publicProduct = entry.publicProduct;
+    const normalizedCategory = publicProduct?.category
+      ? buildPublicShopCategoryResponse(publicProduct.category)
+      : null;
+    const normalizedSlug = String(normalizedCategory?.slug || entry.categorySlug || "")
+      .trim()
+      .toLowerCase();
+
+    if (normalizedCategory) {
+      registerCategory(normalizedCategory);
+    }
+
+    if (normalizedSlug) {
+      countsByCategorySlug.set(
+        normalizedSlug,
+        (countsByCategorySlug.get(normalizedSlug) || 0) + 1
+      );
+    }
+
+    publicProducts.push(publicProduct);
+
+    if (productsByCategorySlug && normalizedSlug) {
+      const list = productsByCategorySlug.get(normalizedSlug) || [];
+      list.push(publicProduct);
+      productsByCategorySlug.set(normalizedSlug, list);
+    }
+  }
+
+  const publicCategories = Array.from(categoriesBySlug.values())
+    .map((category) => ({
+      ...category,
+      productCount: countsByCategorySlug.get(category.slug) || 0
+    }))
+    .filter((category) => category.productCount > 0)
+    .sort((a, b) => a._order - b._order || a.name.localeCompare(b.name, "pt-BR"))
+    .map(({ _order, ...category }) => category);
 
   const payload = {
     generatedAt: snapshot.generatedAt,
@@ -3615,10 +3834,10 @@ function buildPublicShopCatalogPayload(snapshot, options = {}) {
     products: publicProducts
   };
 
-  if (productsByCategoryId) {
+  if (productsByCategorySlug) {
     payload.grouped = publicCategories.map((category) => ({
       ...category,
-      products: productsByCategoryId.get(category.id) || []
+      products: productsByCategorySlug.get(category.slug) || []
     }));
   }
 
@@ -4551,6 +4770,7 @@ async function saveUser(user, client = pool) {
       id, nome, email, senha, saldo, criado_em,
       nome_atualizado_em, saldo_atualizado_em, senha_atualizada_em,
       status_conta, conta_banida_em, motivo_banimento,
+      conta_bloqueada_em, motivo_bloqueio, bloqueio_temporario,
       bonus_boas_vindas, bonus_boas_vindas_concedido_em,
       indicado_por_user_id, indicado_por_email, indicacao_vinculada_em,
       indicacao_qualificada_em, indicacao_bonus_creditado_em,
@@ -4558,7 +4778,7 @@ async function saveUser(user, client = pool) {
       referral_code, pin_transacao_hash, pin_transacao_atualizado_em
     )
     VALUES (
-      $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24
+      $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27
     )
     ON CONFLICT (id) DO UPDATE SET
       nome = EXCLUDED.nome,
@@ -4572,6 +4792,9 @@ async function saveUser(user, client = pool) {
       status_conta = EXCLUDED.status_conta,
       conta_banida_em = EXCLUDED.conta_banida_em,
       motivo_banimento = EXCLUDED.motivo_banimento,
+      conta_bloqueada_em = EXCLUDED.conta_bloqueada_em,
+      motivo_bloqueio = EXCLUDED.motivo_bloqueio,
+      bloqueio_temporario = EXCLUDED.bloqueio_temporario,
       bonus_boas_vindas = EXCLUDED.bonus_boas_vindas,
       bonus_boas_vindas_concedido_em = EXCLUDED.bonus_boas_vindas_concedido_em,
       indicado_por_user_id = EXCLUDED.indicado_por_user_id,
@@ -4595,9 +4818,12 @@ async function saveUser(user, client = pool) {
       user.nomeAtualizadoEm || null,
       user.saldoAtualizadoEm || null,
       user.senhaAtualizadaEm || null,
-      user.statusConta || STATUS_CONTA_ATIVA,
+      normalizeStatusConta(user.statusConta),
       user.contaBanidaEm || null,
       user.motivoBanimento || "",
+      user.contaBloqueadaEm || null,
+      normalizeAccountRestrictionReason(user.motivoBloqueio),
+      Boolean(user.bloqueioTemporario),
       toMoney(user.bonusBoasVindas),
       user.bonusBoasVindasConcedidoEm || null,
       user.indicadoPorUserId || "",
@@ -5419,9 +5645,12 @@ async function saveShopCategory(category, client = pool) {
     id: String(category.id || buildId("shopcat")).trim(),
     sourceKey: normalizeShopCategorySourceKey(category.sourceKey, category.source),
     source: normalizeShopSource(category.source),
-    slug: slugifyShopValue(category.slug || category.name, "categoria"),
-    name: normalizeShopText(category.name, 120),
-    description: normalizeShopText(category.description, 1000),
+    slug: slugifyShopValue(
+      normalizeShopCatalogCategoryName(category.name, 120) || category.slug,
+      "categoria"
+    ),
+    name: normalizeShopCatalogCategoryName(category.name, 120),
+    description: normalizeShopCatalogText(category.description, 1000),
     imageUrl: normalizeShopUrl(category.imageUrl),
     active: category.active !== false,
     sortOrder: Number(category.sortOrder || 0),
@@ -5471,12 +5700,15 @@ async function saveShopProduct(product, client = pool) {
     categoryId: String(product.categoryId || "").trim(),
     sourceKey: normalizeShopProductSourceKey(product.sourceKey, product.source),
     source: normalizeShopSource(product.source),
-    externalId: normalizeShopText(product.externalId, 120),
+    externalId: normalizeShopCatalogText(product.externalId, 120),
     externalUrl: normalizeShopUrl(product.externalUrl),
-    slug: slugifyShopValue(product.slug || product.name, "produto"),
-    name: normalizeShopText(product.name, 180),
-    shortDescription: normalizeShopText(product.shortDescription, 320),
-    description: normalizeShopText(product.description, 2400),
+    slug: slugifyShopValue(
+      normalizeShopCatalogText(product.slug || product.name, 180),
+      "produto"
+    ),
+    name: normalizeShopCatalogText(product.name, 180),
+    shortDescription: normalizeShopCatalogText(product.shortDescription, 320),
+    description: normalizeShopCatalogText(product.description, 2400),
     imageUrl: normalizeShopUrl(product.imageUrl),
     supplierPrice: Math.max(0, toMoney(product.supplierPrice)),
     markupPercent: normalizeShopMarkupPercent(product.markupPercent),
@@ -6000,8 +6232,10 @@ async function importShopCatalog(input = {}, client = pool) {
     const productsByCategory = new Map();
     for (const product of input.products) {
       const categoryName =
-        normalizeShopText(product?.categoryName || product?.category || "Sem categoria", 120) ||
-        "Sem categoria";
+        normalizeShopCatalogCategoryName(
+          product?.categoryName || product?.category || "Sem categoria",
+          120
+        );
       if (!productsByCategory.has(categoryName)) {
         productsByCategory.set(categoryName, []);
       }
@@ -6019,7 +6253,7 @@ async function importShopCatalog(input = {}, client = pool) {
   }
 
   for (const rawCategory of groupedCategories) {
-    const categoryName = normalizeShopText(
+    const categoryName = normalizeShopCatalogText(
       rawCategory.name || rawCategory.title || rawCategory.categoryName,
       120
     );
@@ -6050,7 +6284,7 @@ async function importShopCatalog(input = {}, client = pool) {
     importedCategoryIds.add(savedCategory.id);
 
     for (const rawProduct of Array.isArray(rawCategory.products) ? rawCategory.products : []) {
-      const productName = normalizeShopText(
+      const productName = normalizeShopCatalogText(
         rawProduct?.name || rawProduct?.title || rawProduct?.produto,
         180
       );
@@ -6071,7 +6305,7 @@ async function importShopCatalog(input = {}, client = pool) {
         continue;
       }
 
-      const externalId = normalizeShopText(
+      const externalId = normalizeShopCatalogText(
         rawProduct?.externalId || rawProduct?.id || rawProduct?.sku,
         120
       );
@@ -6482,10 +6716,15 @@ function buildAdminUserResponse(user, context = null) {
     email: user.email,
     saldo: toMoney(user.saldo),
     criadoEm: user.criadoEm || null,
-    statusConta: user.statusConta || STATUS_CONTA_ATIVA,
+    statusConta: normalizeStatusConta(user.statusConta),
     contaBanida: isContaBanida(user),
+    contaBloqueada: isContaBloqueada(user),
+    contaBanidaPermanente: isContaPermanentementeBanida(user),
     contaBanidaEm: user.contaBanidaEm || null,
     motivoBanimento: user.motivoBanimento || "",
+    contaBloqueadaEm: user.contaBloqueadaEm || null,
+    motivoBloqueio: user.motivoBloqueio || "",
+    bloqueioTemporario: Boolean(user.bloqueioTemporario),
     bonusBoasVindas: toMoney(user.bonusBoasVindas),
     bonusBoasVindasConcedidoEm: user.bonusBoasVindasConcedidoEm || null,
     indicadoPorUserId: user.indicadoPorUserId || "",
@@ -7310,9 +7549,55 @@ async function banirContaPorFraudeBonus(userId, client = pool) {
   user.statusConta = STATUS_CONTA_BANIDA;
   user.contaBanidaEm = db();
   user.motivoBanimento = MOTIVO_BANIMENTO_FRAUDE_BONUS;
+  user.contaBloqueadaEm = null;
+  user.motivoBloqueio = "";
+  user.bloqueioTemporario = false;
 
   await saveUser(user, client);
 
+  return user;
+}
+
+async function atualizarBloqueioManualConta(
+  userId,
+  { bloqueada, motivoBloqueio = "", bloqueioTemporario = false } = {},
+  client = pool
+) {
+  const user =
+    client === pool ? await getUserById(userId, client) : await getUserByIdForUpdate(userId, client);
+
+  if (!user) {
+    throw new Error("Usuario nao encontrado");
+  }
+
+  if (!bloqueada) {
+    if (isContaPermanentementeBanida(user)) {
+      throw new Error("Conta banida permanentemente nao pode ser desbloqueada por este painel.");
+    }
+
+    user.statusConta = STATUS_CONTA_ATIVA;
+    user.contaBloqueadaEm = null;
+    user.motivoBloqueio = "";
+    user.bloqueioTemporario = false;
+    await saveUser(user, client);
+    return user;
+  }
+
+  if (isContaPermanentementeBanida(user)) {
+    throw new Error("Conta ja esta banida permanentemente.");
+  }
+
+  const motivoNormalizado = normalizeAccountRestrictionReason(motivoBloqueio);
+
+  if (!motivoNormalizado) {
+    throw new Error("Informe o motivo do bloqueio.");
+  }
+
+  user.statusConta = STATUS_CONTA_BLOQUEADA;
+  user.contaBloqueadaEm = db();
+  user.motivoBloqueio = motivoNormalizado;
+  user.bloqueioTemporario = Boolean(bloqueioTemporario);
+  await saveUser(user, client);
   return user;
 }
 
@@ -7994,7 +8279,7 @@ app.post("/admin/shop/catalog/import-kaiross", authAdmin, async (req, res) => {
     payload.deactivateMissing = deactivateMissing;
     const kairossCategoriesFetched = new Set(
       provider.products
-        .map((item) => normalizeShopText(item?.categoria, 120) || "Sem categoria")
+        .map((item) => normalizeShopCatalogCategoryName(item?.categoria, 120))
         .filter(Boolean)
     ).size;
 
@@ -8340,6 +8625,9 @@ app.post("/register", async (req, res) => {
         statusConta: STATUS_CONTA_ATIVA,
         contaBanidaEm: null,
         motivoBanimento: "",
+        contaBloqueadaEm: null,
+        motivoBloqueio: "",
+        bloqueioTemporario: false,
         bonusBoasVindas: 0,
         bonusBoasVindasConcedidoEm: null,
         indicadoPorUserId: indicador?.id || "",
@@ -12564,6 +12852,112 @@ app.post("/admin/reset-password", authAdmin, async (req, res) => {
   } catch (error) {
     console.error(error);
     res.status(500).json({ error: "Erro ao redefinir senha" });
+  }
+});
+
+app.post("/admin/bloquear-usuario", authAdmin, async (req, res) => {
+  try {
+    const { userId, motivoBloqueio, bloqueioTemporario } = req.body;
+
+    if (!userId) {
+      return res.status(400).json({ error: "userId e obrigatorio" });
+    }
+
+    if (!normalizeAccountRestrictionReason(motivoBloqueio)) {
+      return res.status(400).json({ error: "Motivo do bloqueio e obrigatorio" });
+    }
+
+    const result = await runInTransaction(async (client) => {
+      const usuarioAntes = await getUserByIdForUpdate(userId, client);
+
+      if (!usuarioAntes) {
+        throw new Error("Usuario nao encontrado");
+      }
+
+      const usuario = await atualizarBloqueioManualConta(
+        userId,
+        {
+          bloqueada: true,
+          motivoBloqueio,
+          bloqueioTemporario
+        },
+        client
+      );
+
+      await createAuditLog(client, {
+        adminId: req.admin.sub,
+        action: "manual_account_block",
+        targetType: "usuario",
+        targetId: usuario.id,
+        details: {
+          previousStatus: normalizeStatusConta(usuarioAntes.statusConta),
+          motivoBloqueio: usuario.motivoBloqueio,
+          bloqueioTemporario: Boolean(usuario.bloqueioTemporario)
+        },
+        ipAddress: getRequestIp(req)
+      });
+
+      const context = await getAdminUserContext(usuario, client);
+      return buildAdminUserResponse(usuario, context);
+    });
+
+    res.json({
+      message: "Conta bloqueada com sucesso",
+      user: result
+    });
+  } catch (error) {
+    console.error(error);
+    res.status(400).json({ error: error.message || "Erro ao bloquear usuario" });
+  }
+});
+
+app.post("/admin/desbloquear-usuario", authAdmin, async (req, res) => {
+  try {
+    const { userId } = req.body;
+
+    if (!userId) {
+      return res.status(400).json({ error: "userId e obrigatorio" });
+    }
+
+    const result = await runInTransaction(async (client) => {
+      const usuarioAntes = await getUserByIdForUpdate(userId, client);
+
+      if (!usuarioAntes) {
+        throw new Error("Usuario nao encontrado");
+      }
+
+      const usuario = await atualizarBloqueioManualConta(
+        userId,
+        {
+          bloqueada: false
+        },
+        client
+      );
+
+      await createAuditLog(client, {
+        adminId: req.admin.sub,
+        action: "manual_account_unblock",
+        targetType: "usuario",
+        targetId: usuario.id,
+        details: {
+          previousStatus: normalizeStatusConta(usuarioAntes.statusConta),
+          motivoBloqueioAnterior: usuarioAntes.motivoBloqueio || "",
+          bloqueioTemporarioAnterior: Boolean(usuarioAntes.bloqueioTemporario)
+        },
+        ipAddress: getRequestIp(req)
+      });
+
+      const context = await getAdminUserContext(usuario, client);
+      return buildAdminUserResponse(usuario, context);
+    });
+
+    res.json({
+      message: "Conta desbloqueada com sucesso",
+      user: result
+    });
+  } catch (error) {
+    console.error(error);
+    res.status(400).json({ error: error.message || "Erro ao desbloquear usuario" });
   }
 });
 
