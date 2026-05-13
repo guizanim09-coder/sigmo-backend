@@ -192,6 +192,10 @@ const KAIROSS_TIMEOUT_MS = Math.max(
   3000,
   Number(process.env.KAIROSS_TIMEOUT_MS || 20000)
 );
+const SHOP_EMPTY_CATALOG_RECOVERY_MIN_INTERVAL_MS = Math.max(
+  30000,
+  Number(process.env.SHOP_EMPTY_CATALOG_RECOVERY_MIN_INTERVAL_MS || 300000)
+);
 const KAIROSS_LOGIN_PATH = "/api/auth/login";
 const KAIROSS_PRODUCTS_PATH = "/api/produtos";
 const KAIROSS_VITRINE_PATH = "/vitrine-de-produtos";
@@ -307,6 +311,15 @@ const shopPublicCatalogCache = {
   expiresAtMs: 0,
   staleUntilMs: 0,
   version: 0
+};
+const SHOP_CATALOG_SEED_FILE = path.join(__dirname, "shop_catalog_seed.json");
+const shopCatalogRecoveryState = {
+  activePromise: null,
+  lastAttemptMs: 0,
+  lastSuccessAtMs: 0,
+  lastSuccessSource: "",
+  lastFailureAtMs: 0,
+  lastFailureMessage: ""
 };
 
 const BACKUPS_DIR = BACKUP_DIR
@@ -3389,6 +3402,156 @@ function invalidateShopPublicCatalogSnapshotCache(options = {}) {
       console.error("[shop-cache] erro ao preaquecer snapshot publico", error);
     });
   });
+}
+
+function hasShopSnapshotProducts(snapshot) {
+  return Array.isArray(snapshot?.indexedProducts) && snapshot.indexedProducts.length > 0;
+}
+
+function hasKairossSeedFile() {
+  return fs.existsSync(SHOP_CATALOG_SEED_FILE);
+}
+
+function readKairossSeedFile() {
+  if (!hasKairossSeedFile()) {
+    return null;
+  }
+
+  try {
+    const raw = fs.readFileSync(SHOP_CATALOG_SEED_FILE, "utf8").replace(/^\uFEFF/, "");
+    const parsed = JSON.parse(raw);
+    const products = Array.isArray(parsed)
+      ? parsed
+      : Array.isArray(parsed?.products)
+        ? parsed.products
+        : Array.isArray(parsed?.products?.value)
+          ? parsed.products.value
+          : Array.isArray(parsed?.value)
+            ? parsed.value
+        : [];
+
+    if (!products.length) {
+      return null;
+    }
+
+    return {
+      exportedAt: parsed?.exportedAt || null,
+      baseUrl: normalizeHttpBaseUrl(
+        parsed?.baseUrl || KAIROSS_BASE_URL,
+        "https://app.kaiross.com.br"
+      ),
+      products
+    };
+  } catch (error) {
+    console.error("[shop-recovery] erro ao ler seed local da Kaiross", error);
+    return null;
+  }
+}
+
+async function importShopCatalogFromKairossProducts(products, options = {}) {
+  const payload = buildKairossShopImportPayload(products, {
+    source: SHOP_PRODUCT_SOURCE_DEFAULT,
+    markupPercent:
+      options.markupPercent === undefined
+        ? SHOP_DEFAULT_MARKUP_PERCENTUAL
+        : options.markupPercent,
+    baseUrl: options.baseUrl || KAIROSS_BASE_URL
+  });
+
+  payload.deactivateMissing = options.deactivateMissing === true;
+  return importShopCatalog(payload, options.client || pool);
+}
+
+async function recoverShopCatalogIfEmpty(reason = "unknown") {
+  const now = Date.now();
+
+  if (
+    shopCatalogRecoveryState.lastAttemptMs > 0 &&
+    now - shopCatalogRecoveryState.lastAttemptMs < SHOP_EMPTY_CATALOG_RECOVERY_MIN_INTERVAL_MS &&
+    !shopCatalogRecoveryState.activePromise
+  ) {
+    return null;
+  }
+
+  if (shopCatalogRecoveryState.activePromise) {
+    return shopCatalogRecoveryState.activePromise;
+  }
+
+  shopCatalogRecoveryState.lastAttemptMs = now;
+  shopCatalogRecoveryState.activePromise = (async () => {
+    const activeProducts = await listShopProducts({ activeOnly: true });
+
+    if (activeProducts.length > 0) {
+      return null;
+    }
+
+    let summary = null;
+    let source = "";
+
+    if (KAIROSS_EMAIL && KAIROSS_PASSWORD) {
+      try {
+        const provider = await fetchKairossProducts();
+        summary = await runInTransaction(async (client) =>
+          importShopCatalogFromKairossProducts(provider.products, {
+            client,
+            baseUrl: provider.baseUrl,
+            deactivateMissing: true
+          })
+        );
+        source = "kaiross";
+      } catch (error) {
+        console.error(`[shop-recovery] falha ao sincronizar Kaiross (${reason})`, error);
+      }
+    }
+
+    if (!summary) {
+      const seed = readKairossSeedFile();
+
+      if (seed?.products?.length) {
+        summary = await runInTransaction(async (client) =>
+          importShopCatalogFromKairossProducts(seed.products, {
+            client,
+            baseUrl: seed.baseUrl,
+            deactivateMissing: false
+          })
+        );
+        source = "seed";
+      }
+    }
+
+    if (!summary) {
+      return null;
+    }
+
+    invalidateShopPublicCatalogSnapshotCache({ prewarm: false });
+    const snapshot = await refreshShopPublicCatalogSnapshotCache(true);
+
+    shopCatalogRecoveryState.lastSuccessAtMs = Date.now();
+    shopCatalogRecoveryState.lastSuccessSource = source;
+    shopCatalogRecoveryState.lastFailureAtMs = 0;
+    shopCatalogRecoveryState.lastFailureMessage = "";
+
+    console.log(
+      `[shop-recovery] catalogo recuperado via ${source} (${reason}) com ${summary.productsImported} produtos`
+    );
+
+    return {
+      source,
+      summary,
+      snapshot
+    };
+  })()
+    .catch((error) => {
+      shopCatalogRecoveryState.lastFailureAtMs = Date.now();
+      shopCatalogRecoveryState.lastFailureMessage = String(error?.message || error || "");
+      console.error(`[shop-recovery] erro ao recuperar catalogo (${reason})`, error);
+      return null;
+    })
+    .finally(() => {
+      shopCatalogRecoveryState.activePromise = null;
+    });
+
+  return shopCatalogRecoveryState.activePromise;
 }
 
 function buildPublicShopCatalogPayload(snapshot, options = {}) {
@@ -7549,7 +7712,19 @@ app.get("/public/shop/catalog", publicShopCatalogLimiter, async (req, res) => {
     const includeGrouped =
       String(req.query.grouped || "").trim() === "1" ||
       String(req.query.includeGrouped || "").trim() === "1";
-    const { snapshot, cacheStatus } = await getShopPublicCatalogSnapshotCached();
+    let { snapshot, cacheStatus } = await getShopPublicCatalogSnapshotCached();
+    let recoverySource = "none";
+
+    if (!hasShopSnapshotProducts(snapshot)) {
+      const recovered = await recoverShopCatalogIfEmpty("public_catalog_request");
+
+      if (recovered?.snapshot && hasShopSnapshotProducts(recovered.snapshot)) {
+        snapshot = recovered.snapshot;
+        cacheStatus = "recovered";
+        recoverySource = recovered.source || "unknown";
+      }
+    }
+
     const payload = buildPublicShopCatalogPayload(snapshot, {
       categorySlug,
       search,
@@ -7561,6 +7736,7 @@ app.get("/public/shop/catalog", publicShopCatalogLimiter, async (req, res) => {
       `public, max-age=${SHOP_PUBLIC_CATALOG_MAX_AGE_SECONDS}, stale-while-revalidate=${SHOP_PUBLIC_CATALOG_STALE_WHILE_REVALIDATE_SECONDS}`
     );
     res.set("X-Shop-Catalog-Cache", cacheStatus);
+    res.set("X-Shop-Catalog-Recovery", recoverySource);
     res.json(payload);
   } catch (error) {
     console.error(error);
@@ -13338,9 +13514,17 @@ app.post("/deposito/confirmar-bot", authBot, async (req, res) => {
 initDB()
   .then(() => {
     startBackupScheduler();
-    refreshShopPublicCatalogSnapshotCache(true).catch((error) => {
-      console.error("[shop-cache] erro ao aquecer snapshot publico", error);
-    });
+    refreshShopPublicCatalogSnapshotCache(true)
+      .then((snapshot) => {
+        if (!hasShopSnapshotProducts(snapshot)) {
+          recoverShopCatalogIfEmpty("startup").catch((error) => {
+            console.error("[shop-recovery] erro no bootstrap do catalogo", error);
+          });
+        }
+      })
+      .catch((error) => {
+        console.error("[shop-cache] erro ao aquecer snapshot publico", error);
+      });
     app.listen(PORT, () => {
       console.log(`Servidor rodando na porta ${PORT}`);
     });
