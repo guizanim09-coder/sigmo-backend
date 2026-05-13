@@ -128,6 +128,7 @@ const INVESTMENT_RESERVE_STATUS_CLOSED = "closed";
 const SHOP_DEFAULT_MARKUP_PERCENTUAL = Number(
   process.env.SHOP_DEFAULT_MARKUP_PERCENTUAL || 110
 );
+const SHOP_SLUG_MAX_LENGTH = 72;
 const SHOP_ORDER_STATUS_PENDING = "pendente";
 const SHOP_ORDER_STATUS_APPROVED = "aprovado";
 const SHOP_ORDER_STATUS_REFUSED = "recusado";
@@ -733,16 +734,31 @@ function normalizeShopText(value, maxLength = 500) {
     .slice(0, Math.max(0, Number(maxLength || 0) || 0));
 }
 
-function slugifyShopValue(value, fallback = "item") {
+function slugifyShopValue(value, fallback = "item", maxLength = SHOP_SLUG_MAX_LENGTH) {
+  const safeMaxLength = Math.max(1, Number(maxLength || SHOP_SLUG_MAX_LENGTH) || SHOP_SLUG_MAX_LENGTH);
   const normalized = String(value || "")
     .normalize("NFD")
     .replace(/[\u0300-\u036f]/g, "")
     .toLowerCase()
     .replace(/[^a-z0-9]+/g, "-")
     .replace(/^-+|-+$/g, "")
-    .slice(0, 72);
+    .slice(0, safeMaxLength);
 
   return normalized || fallback;
+}
+
+function buildShopUniqueSlug(value, uniqueKey, fallback = "item") {
+  const normalizedUniqueKey = String(uniqueKey || "").trim();
+
+  if (!normalizedUniqueKey) {
+    return slugifyShopValue(value, fallback);
+  }
+
+  const hashSuffix = crypto.createHash("md5").update(normalizedUniqueKey).digest("hex").slice(0, 8);
+  const baseMaxLength = Math.max(1, SHOP_SLUG_MAX_LENGTH - hashSuffix.length - 1);
+  const baseSlug = slugifyShopValue(value, fallback, baseMaxLength);
+
+  return `${baseSlug}-${hashSuffix}`;
 }
 
 function normalizeShopUrl(value) {
@@ -6067,12 +6083,11 @@ async function importShopCatalog(input = {}, client = pool) {
           `${source}:product:${externalId || slugifyShopValue(productName, "produto")}:${slugifyShopValue(categoryName, "categoria")}`,
         source
       );
-      const hashSuffix = crypto
-        .createHash("md5")
-        .update(sourceKey)
-        .digest("hex")
-        .slice(0, 8);
-      const productSlug = `${slugifyShopValue(rawProduct?.slug || productName, "produto")}-${hashSuffix}`;
+      const productSlug = buildShopUniqueSlug(
+        rawProduct?.slug || productName,
+        sourceKey,
+        "produto"
+      );
       const markupPercent = normalizeShopMarkupPercent(
         rawProduct?.markupPercent === undefined ? defaultMarkupPercent : rawProduct?.markupPercent
       );
